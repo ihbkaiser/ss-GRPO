@@ -1,7 +1,7 @@
 
-# GRPO Speculative Decoding Project
+# FastGRPO
 
-This project implements an **adaptive speculative decoding framework** for Group Relative Policy Optimization (GRPO) that dynamically adjusts drafting and verification strategies based on real-time concurrency levels. The framework addresses the prohibitively slow training process of GRPO by maximizing acceleration of the generation phase while maintaining reasoning capabilities.
+[FastGRPO](https://arxiv.org/abs/2509.21792) is an **adaptive speculative decoding framework** for Group Relative Policy Optimization (GRPO) that dynamically adjusts drafting and verification strategies based on real-time concurrency levels. The framework addresses the prohibitively slow training process of GRPO by maximizing acceleration of the generation phase while maintaining reasoning capabilities.
 
 ## 📋 Overview
 
@@ -134,3 +134,18 @@ The speculative_generate function is the core function of our project. The follo
 | `statistical_time` | bool | `True` | Whether to collect timing statistics |
 | `return_all_draft_input` | bool | `False` | Whether to return all draft inputs |
 | `max_length` | int | `2048` | Maximum length of generated sequences |
+
+
+## Reference
+
+```
+@misc{zhang2025fastgrpoacceleratingpolicyoptimization,
+      title={FastGRPO: Accelerating Policy Optimization via Concurrency-aware Speculative Decoding and Online Draft Learning}, 
+      author={Yizhou Zhang and Ning Lv and Teng Wang and Jisheng Dang},
+      year={2025},
+      eprint={2509.21792},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.21792}, 
+}
+```
