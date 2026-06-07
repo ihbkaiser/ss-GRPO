@@ -41,7 +41,16 @@ class DataCollator:
         }
 
 info = {"amc-23" : "math" , "gsm8k" : "math" , "math-500" : "math" , "simplelr_qwen_level3to5" : "math" ,
-        "simplelr_abel_level3to5" : "math" , "DAPO-math" : "math"}
+        "simplelr_abel_level3to5" : "math" , "simplelr_abel_level3to5_smoke" : "math" , "DAPO-math" : "math"}
+
+
+def _load_simplelr_parquet(path):
+    ds = pd.read_parquet(path)
+    ds = pd.DataFrame({
+        'question': ds['prompt'].apply(lambda x: x[0]['content']),
+        'answer': ds['reward_model'].apply(lambda y: f"\\boxed{{{y['ground_truth']}}}")
+    })
+    return ds.to_dict(orient='records')
 
 def get_test_QAs(option,tokenizer=None):
     
@@ -67,12 +76,10 @@ def get_test_QAs(option,tokenizer=None):
         QAs = ds.to_dict(orient='records')
     elif option == "simplelr_abel_level3to5":
         data_path = f"./data/simplelr_abel_level3to5/test.parquet"
-        ds = pd.read_parquet(data_path)
-        ds = pd.DataFrame({
-        'question': ds['prompt'].apply(lambda x: x[0]['content']),
-        'answer': ds['reward_model'].apply(lambda y: f"\\boxed{{{y['ground_truth']}}}")
-        })
-        QAs = ds.to_dict(orient='records')
+        QAs = _load_simplelr_parquet(data_path)
+    elif option == "simplelr_abel_level3to5_smoke":
+        data_path = f"./data/simplelr_abel_level3to5_smoke/test.parquet"
+        QAs = _load_simplelr_parquet(data_path)
     elif option == 'DAPO-math':
         dataset = datasets.load_dataset(r"./data/DAPO-Math-17k-Processed",split='train')
         QAs = [{'question' : item['prompt'] , 'answer' : f"\\boxed{{{item['reward_model']['ground_truth']}}}" }for item in dataset]
@@ -96,12 +103,10 @@ def get_train_QAs(option,tokenizer=None):
         QAs = ds.to_dict(orient='records')
     elif option == "simplelr_abel_level3to5":
         data_path = f"./data/simplelr_abel_level3to5/train.parquet"
-        ds = pd.read_parquet(data_path)
-        ds = pd.DataFrame({
-        'question': ds['prompt'].apply(lambda x: x[0]['content']),
-        'answer': ds['reward_model'].apply(lambda y: f"\\boxed{{{y['ground_truth']}}}")
-        })
-        QAs = ds.to_dict(orient='records')
+        QAs = _load_simplelr_parquet(data_path)
+    elif option == "simplelr_abel_level3to5_smoke":
+        data_path = f"./data/simplelr_abel_level3to5_smoke/train.parquet"
+        QAs = _load_simplelr_parquet(data_path)
     elif option == 'DAPO-math':
         dataset = datasets.load_dataset(f"./data/DAPO-Math-17k-Processed",split='train')
         QAs = [{'question' : item['prompt'] , 'answer' : f"\\boxed{{{item['reward_model']['ground_truth']}}}" }for item in dataset]

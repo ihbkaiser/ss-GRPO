@@ -25,6 +25,7 @@ import signal
 import sys
 import torch
 import argparse
+from copy import deepcopy
 
 
 def handle_signal(signum, frame):
@@ -43,12 +44,14 @@ parser = argparse.ArgumentParser(description="Training configuration")
 parser.add_argument('--model_dir',type=str,) 
 parser.add_argument('--version_name', type=str,help='Version name for saving checkpoints')
 parser.add_argument('--model_type',type=str,default='qwen2')
+parser.add_argument('--draft_num_hidden_layers', type=int, default=1)
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--num_epochs', type=int, default=10)
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--accumulation_steps', type=int, default=16)
 parser.add_argument('--warmup_ratio', type=float, default=0.05)
 parser.add_argument('--sample_num', type=int, default=200)
+parser.add_argument('--max_length', type=int, default=4096)
 parser.add_argument('--log_dir',type=str,required=True)
 parser.add_argument('--saved_model_dir',type=str,required=True)
 parser.add_argument('--dataset_dir',type=str,required=True)
@@ -62,6 +65,7 @@ lr = args.lr
 accumulation_steps = args.accumulation_steps
 warmup_ratio = args.warmup_ratio
 sample_num = args.sample_num
+max_length = args.max_length
 log_dir=args.log_dir
 saved_model_dir=args.saved_model_dir
 dataset_dir = args.dataset_dir
@@ -81,13 +85,15 @@ print(dataset)
 
 config=AutoConfig.from_pretrained(model_dir)
 model_type=args.model_type
+draft_num_hidden_layers=args.draft_num_hidden_layers
 target_model = AutoModelForCausalLM.from_pretrained(
     model_dir, torch_dtype='auto',config=config)
 target_model.eval()
 
-config.rope_scaling=None
-config.num_hidden_layers=1
-model=Model(config, target_model=target_model).cuda()
+draft_config=deepcopy(config)
+draft_config.rope_scaling=None
+draft_config.num_hidden_layers=draft_num_hidden_layers
+model=Model(draft_config, target_model=target_model).cuda()
 tokenizer = AutoTokenizer.from_pretrained(model_dir, padding_side = "right")
 
 count=0
@@ -179,7 +185,7 @@ class DataCollator:
         }
 
 
-datacollator=DataCollator(tokenizer)
+datacollator=DataCollator(tokenizer, max_length=max_length)
 dataloader=DataLoader(dataset,collate_fn=datacollator,num_workers=4,persistent_workers=True,batch_size=batch_size,shuffle=True,drop_last=False)
 
 

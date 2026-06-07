@@ -47,6 +47,7 @@ parser.add_argument('--target_lr', type=float, default=1e-6, help='Learning rate
 parser.add_argument('--draft_lr', type=float, default=1e-4, help='Learning rate for draft model')
 parser.add_argument('--is_train_draft', type=lambda x: x.lower() == 'true', default=True, help='Whether to train the draft model (True/False)')
 parser.add_argument('--model_type', type=str, default='Qwen2___5-Math-7B', help='Version name for saving checkpoints')
+parser.add_argument('--draft_num_hidden_layers', type=int, default=1)
 parser.add_argument('--train_option',type=str,default="simplelr_abel_level3to5")
 parser.add_argument('--load_lora_path',type=str,default="")
 parser.add_argument('--batch_size',type=int,default=4)
@@ -85,6 +86,7 @@ target_lr = args.target_lr
 draft_lr = args.draft_lr
 is_train_draft = args.is_train_draft
 model_type = args.model_type
+draft_num_hidden_layers = args.draft_num_hidden_layers
 model_dir = args.model_dir
 adapter_path = args.adapter_path
 temperature = args.temperature
@@ -117,6 +119,7 @@ print(f"LR: target={target_lr}, draft={draft_lr} | "
 print(f"Gen: temp={temperature}, top_p={top_p}"
       f"beta={beta}, epsilon={epsilon}")
 print(f"Draft: train={is_train_draft}")
+print(f"Draft layers: {draft_num_hidden_layers}")
 print(f"Iteration: grpo_iter={grpo_iteration_num}, sample={sample_num}, "
       f"repeat_gen={repeated_generate_nums}")
 print("=" * 60)
@@ -127,9 +130,10 @@ target_model = AutoModelForCausalLM.from_pretrained(
     model_dir, torch_dtype='auto',config=config).cuda()
 target_model.eval()
 
-config.rope_scaling=None
-config.num_hidden_layers=1
-model=Model(config,target_model=target_model)
+draft_config=deepcopy(config)
+draft_config.rope_scaling=None
+draft_config.num_hidden_layers=draft_num_hidden_layers
+model=Model(draft_config,target_model=target_model)
 model.load_model(adapter_path)
 print(adapter_path)
 model=model.cuda()
@@ -839,5 +843,4 @@ for epoch in range(num_epochs):
 
 model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
 model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')   
-
 

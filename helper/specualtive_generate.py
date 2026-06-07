@@ -34,6 +34,29 @@ total_draft_time=0
 total_check_time=0
 
 
+def _cache_layer_count(cache):
+    if hasattr(cache, "key_cache"):
+        return len(cache.key_cache)
+    return len(cache.layers)
+
+
+def _get_cache_layer(cache, layer_idx):
+    if hasattr(cache, "key_cache"):
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+    layer = cache.layers[layer_idx]
+    return layer.keys, layer.values
+
+
+def _set_cache_layer(cache, layer_idx, key, value):
+    if hasattr(cache, "key_cache"):
+        cache.key_cache[layer_idx] = key
+        cache.value_cache[layer_idx] = value
+    else:
+        cache.layers[layer_idx].keys = key
+        cache.layers[layer_idx].values = value
+        cache.layers[layer_idx].is_initialized = True
+
+
 def sampling(
     logits, 
     top_k=None, 
@@ -362,14 +385,14 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_values,
+                past_key_values=past_key_values,
                 output_attentions=False,
                 use_cache=True,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
 
-            hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs[0] if isinstance(layer_outputs, (tuple, list)) else layer_outputs
 
         hidden_states = model.model.norm(hidden_states)
 
@@ -832,14 +855,15 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
 
                 chosen_index=[chosen_index[_] for _ in range(bsz) if _ != delete_idx]
                 
-                for kv_idx in range(len(target_past_key_values.key_cache)):
-                    key = target_past_key_values.key_cache[kv_idx]
-                    value = target_past_key_values.value_cache[kv_idx]
+                for kv_idx in range(_cache_layer_count(target_past_key_values)):
+                    key, value = _get_cache_layer(target_past_key_values, kv_idx)
                     
-                    target_past_key_values.key_cache[kv_idx]=torch.concat(
-                        [key[:delete_idx], key[delete_idx+1:]], dim=0)
-                    target_past_key_values.value_cache[kv_idx]=torch.concat(
-                        [value[:delete_idx], value[delete_idx+1:]], dim=0)
+                    _set_cache_layer(
+                        target_past_key_values,
+                        kv_idx,
+                        torch.concat([key[:delete_idx], key[delete_idx+1:]], dim=0),
+                        torch.concat([value[:delete_idx], value[delete_idx+1:]], dim=0),
+                    )
                 
                 new_past_key_values=[]
                 for cur_past_key_values in draft_past_key_values:
@@ -922,8 +946,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             chosen_index=[[x-prefix_length for x in item[prefix_length:]] for item in chosen_index]
             chosen_index=torch.tensor(chosen_index,device=device)
             
-            target_past_key_tensor=torch.stack(target_past_key_values.key_cache, dim=0)
-            target_past_value_tensor=torch.stack(target_past_key_values.value_cache, dim=0)
+            target_cache_layers = [_get_cache_layer(target_past_key_values, idx_L) for idx_L in range(_cache_layer_count(target_past_key_values))]
+            target_past_key_tensor=torch.stack([layer[0] for layer in target_cache_layers], dim=0)
+            target_past_value_tensor=torch.stack([layer[1] for layer in target_cache_layers], dim=0)
             
             L, B, H, T, D = target_past_key_tensor.shape
             index_expanded = chosen_index.unsqueeze(1).unsqueeze(-1).unsqueeze(0) # shape: (1, B, 1, S, 1)
@@ -942,8 +967,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
             new_value=torch.concat([prefix_value,suffix_value],dim=-2)
         
             for idx_L in range(L):
-                target_past_key_values.key_cache[idx_L] = new_key[idx_L]
-                target_past_key_values.value_cache[idx_L] = new_value[idx_L]
+                _set_cache_layer(target_past_key_values, idx_L, new_key[idx_L], new_value[idx_L])
                 
         draft_attention_mask=get_attention_mask(draft_past_key_values[0][0].shape[-2], max_acc_length,
                                                 model.dtype, bsz, padding_positions=padding_positions_tensor)

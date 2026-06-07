@@ -1,11 +1,13 @@
-transformers==4.49.0
+transformers>=4.51.0,<5
 torch==2.8.0
 peft==0.17.1
 datasets==4.0.0
 nest-asyncio==1.6.0
 safetensors==0.6.2
+accelerate
 numpy
 pandas
+pyarrow
 latex2sympy2_extended
 math_verify
 asyncio
