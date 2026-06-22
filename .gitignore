@@ -1,0 +1,10 @@
+runs/
+outputs/
+logs/
+data/
+__pycache__/
+*.py[cod]
+*.pth
+*.pkl
+.venv/
+.hf_cache/
