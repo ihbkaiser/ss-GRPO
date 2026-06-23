@@ -24,6 +24,12 @@ import argparse
 from statistics import mean , stdev
 import pickle
 from tqdm.auto import tqdm
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="equations=True in NormalizationConfig is deprecated.*",
+)
 
 
 def format_duration(seconds):
@@ -765,7 +771,7 @@ for epoch in epoch_bar:
                         ref_logits=batch_ref_logps[j]
                         
                     model.target_model.enable_adapter_layers()
-                    outputs=model.target_model(cur_input_ids,cur_attention_mask)
+                    target_outputs=model.target_model(cur_input_ids,cur_attention_mask)
                     
                     if grpo_iteration==0:
                         old_logits=None
@@ -773,7 +779,7 @@ for epoch in epoch_bar:
                         old_logits=batch_old_logps[j]
                         
                     loss,abs_loss1,loss2,old_logits,ref_logits=compute_target_loss(
-                        outputs.logits,ref_logits,old_logits,
+                        target_outputs.logits,ref_logits,old_logits,
                         cur_input_ids,cur_loss_mask,cur_rewards,
                         epsilon,beta,grpo_iteration)
                         
@@ -819,7 +825,7 @@ for epoch in epoch_bar:
                 ref_logits=batch_ref_logps[j]
                 
             model.target_model.enable_adapter_layers()
-            outputs=model.target_model(cur_input_ids,cur_attention_mask)
+            target_outputs=model.target_model(cur_input_ids,cur_attention_mask)
             
             if grpo_iteration==0:
                 old_logits=None
@@ -827,7 +833,7 @@ for epoch in epoch_bar:
                 old_logits=batch_old_logps[j]
                 
             loss,abs_loss1,loss2,old_logits,ref_logits=compute_target_loss(
-                outputs.logits,ref_logits,old_logits,
+                target_outputs.logits,ref_logits,old_logits,
                 cur_input_ids,cur_loss_mask,cur_rewards,
                 epsilon,beta,grpo_iteration)
                 
