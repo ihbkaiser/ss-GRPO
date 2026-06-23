@@ -23,6 +23,16 @@ from datetime import datetime
 import argparse 
 from statistics import mean , stdev
 import pickle
+from tqdm.auto import tqdm
+
+
+def format_duration(seconds):
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.2f}m"
+    return f"{seconds / 3600:.2f}h"
 
 def handle_signal(signum, frame):
     print("Received signal, cleaning up...")
@@ -507,7 +517,8 @@ class TrainDataCollator:
 dataloader=DataLoader(QAs,collate_fn=TrainDataCollator(tokenizer=tokenizer),num_workers=4,
                     persistent_workers=True,batch_size=batch_size,shuffle=True,drop_last=False)
 
-for epoch in range(num_epochs):
+epoch_bar = tqdm(range(num_epochs), desc="Epoch", dynamic_ncols=True)
+for epoch in epoch_bar:
     
     batch_data['ignore_due_correct']=0
     batch_data['ignore_due_incorrect']=0
@@ -515,13 +526,28 @@ for epoch in range(num_epochs):
     batch_data['length_range'] = []
     batch_data['length_cv'] = []
     
-    for i,batch in enumerate(dataloader):
+    batch_bar = tqdm(
+        enumerate(dataloader),
+        total=len(dataloader),
+        desc=f"Epoch {epoch + 1}/{num_epochs}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    for i,batch in batch_bar:
+        batch_time_start = time.time()
         
         if batch['input_ids'].shape[-1]>=max_length:
+            batch_bar.set_postfix(
+                skip="max_length",
+                input_len=batch['input_ids'].shape[-1],
+                used=used_items,
+                refresh=False,
+            )
             batch=[]
             continue
         
         if None in batch['answers']:
+            batch_bar.set_postfix(skip="none_answer", used=used_items, refresh=False)
             batch=[]
             continue
         
@@ -545,13 +571,22 @@ for epoch in range(num_epochs):
         length_cv = length_stdev / mean(token_ids_length) 
         length_ave = mean(token_ids_length) 
         batch_data['generate_length_list'].extend(token_ids_length)
+        batch_bar.set_postfix(
+            phase="generated",
+            gen=format_duration(outputs['total_time_cost']),
+            mean_len=f"{length_ave:.1f}",
+            acc=f"{outputs['total_acc_length'] / max(outputs['total_decoded_token_num'], 1):.3f}",
+            used=used_items,
+            refresh=False,
+        )
         
         if is_train_draft:
             torch.cuda.synchronize()
             draft_train_time_start=time.time()
             draft_loss1,draft_loss2=training_draft_model(model,outputs,attention_mask)
             torch.cuda.synchronize()
-            batch_data['draft_train_time_cost']+=time.time()-draft_train_time_start
+            draft_train_elapsed=time.time()-draft_train_time_start
+            batch_data['draft_train_time_cost']+=draft_train_elapsed
             batch_data['last_draft_loss1'].append(draft_loss1)
             batch_data['last_draft_loss2'].append(draft_loss2)
             draft_accumulated_step += 1
@@ -559,6 +594,15 @@ for epoch in range(num_epochs):
                 optimizer_draft.step() 
                 optimizer_draft.zero_grad(set_to_none=True)
                 draft_step += 1
+            batch_bar.set_postfix(
+                phase="draft_train",
+                gen=format_duration(outputs['total_time_cost']),
+                draft=format_duration(draft_train_elapsed),
+                dloss1=f"{draft_loss1:.4f}",
+                dloss2=f"{draft_loss2:.4f}",
+                used=used_items,
+                refresh=False,
+            )
     
         if draft_step % 1024 == 0 and step > 0 and is_train_draft:
             with open(f"{saved_statistics_dir}/{step}.pkl","wb") as f:
@@ -625,6 +669,13 @@ for epoch in range(num_epochs):
         batch=[]
 
         if len(batch_data['messages']) == 0:
+            batch_bar.set_postfix(
+                phase="no_reward_variance",
+                gen=format_duration(outputs['total_time_cost']),
+                ignored=batch_data['ignore_due_correct'] + batch_data['ignore_due_incorrect'],
+                used=used_items,
+                refresh=False,
+            )
             continue 
         
         text=tokenizer.apply_chat_template(batch_data['messages'],tokenize=False,add_generation_prompt=False)
@@ -654,7 +705,13 @@ for epoch in range(num_epochs):
         batch_old_logps=[]
         batch_ref_logps=[]
         
-        for grpo_iteration in range(grpo_iteration_num):
+        grpo_bar = tqdm(
+            range(grpo_iteration_num),
+            desc="GRPO",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        for grpo_iteration in grpo_bar:
             torch.cuda.synchronize()
             train_time_start=time.time()
             
@@ -787,8 +844,9 @@ for epoch in range(num_epochs):
             optimizer_target.zero_grad(set_to_none=True)
             
             torch.cuda.synchronize()
-            batch_data['last_train_time_cost'].append(time.time()-train_time_start)
-            batch_data['train_time_cost']+=(time.time()-train_time_start)
+            train_time_elapsed=time.time()-train_time_start
+            batch_data['last_train_time_cost'].append(train_time_elapsed)
+            batch_data['train_time_cost']+=train_time_elapsed
             batch_data['last_mean_rewards'].append(sum(batch_data['rewards'])/len(batch_data['rewards']))
             batch_data['mean_rewards']+=sum(batch_data['rewards'])/len(batch_data['rewards'])
             
@@ -829,6 +887,23 @@ for epoch in range(num_epochs):
                 f.write(json.dumps(avg_logs) + '\n')
                 
             torch.cuda.empty_cache()
+            grpo_bar.set_postfix(
+                step=step,
+                train=format_duration(train_time_elapsed),
+                reward=avg_logs[f"last_{sample_num}_mean_rewards"],
+                refresh=False,
+            )
+            batch_bar.set_postfix(
+                phase="target_train",
+                step=step,
+                used=used_items,
+                gen=format_duration(outputs['total_time_cost']),
+                train=format_duration(train_time_elapsed),
+                batch=format_duration(time.time() - batch_time_start),
+                reward=avg_logs[f"last_{sample_num}_mean_rewards"],
+                ignored=batch_data['ignore_due_correct'] + batch_data['ignore_due_incorrect'],
+                refresh=False,
+            )
             
         batch_data['messages'].clear()
         batch_data['rewards'].clear()
@@ -839,8 +914,15 @@ for epoch in range(num_epochs):
         if step%500==0 and step!=0:
             model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
             model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
+    epoch_bar.set_postfix(
+        step=step,
+        used=used_items,
+        elapsed=format_duration(time.time() - start_time),
+        gen=format_duration(batch_data['generate_time_cost']),
+        train=format_duration(batch_data['train_time_cost']),
+        refresh=False,
+    )
             
 
 model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
 model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')   
-
