@@ -28,7 +28,6 @@ def accuracy_reward_func(completions, solution, **kwargs):
                             nits=False,
                             malformed_operators=False,
                             basic_latex=True,
-                            equations=True,
                             boxed="all",
                             units=True,
                         ),
