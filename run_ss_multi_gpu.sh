@@ -8,7 +8,7 @@ export NCCL_ASYNC_ERROR_HANDLING=1
 export TOKENIZERS_PARALLELISM=false
 
 NPROC=8
-MODEL=/mnt/hdd/nhatminh/FastGRPO-main/models/Qwen2.5-1.5B-Instruct
+MODEL=/mnt/hdd/nhatminh/FastGRPO-main/models/Qwen2.5-1.5B-Instruct #thay path di
 EXP=selfspec_mg_8gpu_autosearch
 
 torchrun --standalone --nproc_per_node=$NPROC \
