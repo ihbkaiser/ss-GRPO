@@ -24,15 +24,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from helper.get_QAs import get_train_QAs
 from helper.rewards import accuracy_reward_func, format_reward_func
-from self_speculative_grpo.generate import self_speculative_generate
-from self_speculative_grpo.search_skip_layers import (
-    build_prompt as build_search_prompt,
-    evaluate_mask as evaluate_skip_mask,
-    expected_improvement,
-    generate_candidate_pool,
-    parse_layer_set,
-    propose_initial_masks,
-)
+from self_speculative_claps.generate_cl import self_speculative_generate_clasp as self_speculative_generate
 
 
 def format_duration(seconds):
@@ -73,7 +65,7 @@ def parse_args():
     parser.add_argument("--statistical_time", type=str2bool, default=False, help="Enable exact CUDA timing. False avoids frequent cuda synchronize calls.")
     parser.add_argument("--sample_num", type=int, default=100, help="Logging window only; kept for CLI parity with FastGRPO.")
     parser.add_argument("--repeated_generate_nums", type=int, default=8)
-    parser.add_argument("--skip_layers", default="24,26,28,30,32,34")
+    parser.add_argument("--skip_layers", default="", help="Deprecated fallback static path. Empty means CLaSp/heuristic initializer controls skip paths.")
     parser.add_argument("--max_draft_tokens", type=int, default=4)
     parser.add_argument("--confidence_threshold", type=float, default=0.20)
     parser.add_argument("--verification_capacity", type=int, default=160, help="FastGRPO-style Cpeak/Nverify budget. Higher means deeper self-spec drafting when active batch is small.")
@@ -86,21 +78,38 @@ def parse_args():
     parser.add_argument("--min_confidence_threshold", type=float, default=0.15)
     parser.add_argument("--max_confidence_threshold", type=float, default=0.95)
     parser.add_argument("--threshold_ema_beta", type=float, default=0.90)
-    parser.add_argument("--auto_search_skip_layers", "--auto_search_skip_path", dest="auto_search_skip_path", type=str2bool, default=False)
-    parser.add_argument("--search_candidate_layers", default="", help="Comma/range list for auto search, e.g. '18-35'. Empty means latter half.")
-    parser.add_argument("--search_num_prompts", type=int, default=1)
-    parser.add_argument("--search_max_length", type=int, default=0, help="0 means reuse --max_length.")
-    parser.add_argument("--search_min_skip", type=int, default=2)
-    parser.add_argument("--search_max_skip", type=int, default=8)
-    parser.add_argument("--target_draft_layers", type=int, default=0,
-                        help="If >0, auto-search sets skip count so the self-spec draft keeps about this many active transformer layers.")
-    parser.add_argument("--draft_layer_tolerance", type=int, default=1,
-                        help="Allowed extra active transformer layers above target_draft_layers. target=3,tolerance=1 keeps about 3-4 active layers.")
-    parser.add_argument("--search_init_trials", type=int, default=6)
-    parser.add_argument("--search_bo_trials", type=int, default=12)
-    parser.add_argument("--search_candidate_pool", type=int, default=96)
-    parser.add_argument("--search_seed", type=int, default=13)
-    parser.add_argument("--search_json_out", default="")
+    # Batch-aware CLaSp routing. CLaSp is used as an in-context skip-path proposer,
+    # then quantized to a small codebook to avoid per-rollout path explosion.
+    parser.add_argument("--enable_clasp", type=str2bool, default=True)
+    parser.add_argument("--clasp_codebook_size", type=int, default=8)
+    parser.add_argument("--clasp_max_active_paths", type=int, default=4)
+    parser.add_argument("--clasp_min_group_size", type=int, default=24)
+    parser.add_argument("--clasp_update_interval", type=int, default=4)
+    parser.add_argument("--clasp_low_accept_trigger", type=float, default=0.62)
+    parser.add_argument("--clasp_protected_first", type=int, default=4)
+    parser.add_argument("--clasp_protected_last", type=int, default=4)
+    parser.add_argument("--clasp_candidate_layers", default="", help="Comma/range list for CLaSp candidate layers, e.g. '8-27'. Empty means all non-protected layers.")
+    parser.add_argument("--clasp_representative_rows", type=int, default=0, help="0 uses all rows. Set 8/16 to reduce CLaSp hidden-state scoring cost.")
+    parser.add_argument("--clasp_dynamic_codebook", type=str2bool, default=True)
+    parser.add_argument("--clasp_min_code_frequency", type=int, default=2)
+    parser.add_argument("--clasp_disable_when_bsz_below", type=int, default=16)
+    parser.add_argument("--clasp_skip_count", type=int, default=0, help="Exact number of transformer blocks to skip. 0 means infer from --clasp_skip_ratio.")
+    parser.add_argument("--clasp_skip_ratio", type=float, default=0.60, help="When --clasp_skip_count=0, skip about this fraction of total transformer layers. Default: 0.60.")
+    parser.add_argument("--clasp_prefill_update", type=str2bool, default=False, help="If true, run first CLaSp update from prefill hidden states. Faster to leave False for long prompts; first update then happens after round-1 verify.")
+    # Deprecated Bayesian-search arguments kept for CLI compatibility only. They are intentionally ignored.
+    parser.add_argument("--auto_search_skip_layers", "--auto_search_skip_path", dest="auto_search_skip_path", type=str2bool, default=False, help="Deprecated and ignored in CLaSp-no-Bayes version.")
+    parser.add_argument("--search_candidate_layers", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--search_num_prompts", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_max_length", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_min_skip", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_max_skip", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--target_draft_layers", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--draft_layer_tolerance", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_init_trials", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_bo_trials", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_candidate_pool", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--search_seed", type=int, default=13, help=argparse.SUPPRESS)
+    parser.add_argument("--search_json_out", default="", help=argparse.SUPPRESS)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--epsilon", type=float, default=0.1)
     parser.add_argument("--log_file", required=True)
@@ -433,14 +442,14 @@ def main():
     optimizer = torch.optim.AdamW(target_model.parameters(), lr=args.target_lr)
 
     qas = get_train_QAs(args.train_option)
+    # CLaSp-no-Bayes: do not run static Bayesian skip-layer search.
+    # The default path is deterministic middle-layer 60% skip, and CLaSp updates
+    # routing online from full-verify hidden states. Deprecated search flags are
+    # accepted only so old launch scripts do not break.
+    if args.auto_search_skip_path:
+        print("[CLaSp-no-Bayes] --auto_search_skip_path was passed but is ignored. Runtime CLaSp will choose skip paths online.", flush=True)
     search_summary = None
     search_time_cost = 0.0
-    if args.auto_search_skip_path:
-        search_summary = run_auto_skip_search(args, config, target_model, tokenizer, qas)
-        search_time_cost = float(search_summary.get("search_time_cost", 0.0))
-        args.skip_layers = search_summary["best"]["skip_layers"]
-        print(f"Auto skip-layer search selected skip_layers={args.skip_layers}", flush=True)
-        print(f"Auto skip-layer search time: {format_duration(search_time_cost)}", flush=True)
 
     loader_workers = min(4, os.cpu_count() or 1)
     dataloader = DataLoader(
@@ -454,7 +463,7 @@ def main():
     )
 
     print(datetime.now())
-    print(f"Self-spec GRPO model={args.model_dir} skip_layers={args.skip_layers}")
+    print(f"AURORA-CLaSp-Q model={args.model_dir} skip_layers_fallback={args.skip_layers!r} clasp_skip_ratio={args.clasp_skip_ratio}")
     print(f"batch={args.batch_size} repeats={args.repeated_generate_nums} max_length={args.max_length}")
     with open(args.log_file, "w", encoding="utf-8") as f:
         f.write(json.dumps({
@@ -473,10 +482,11 @@ def main():
             "epsilon": args.epsilon,
             "temperature": args.temperature,
             "top_p": args.top_p,
-            "skip_layers": args.skip_layers,
-            "auto_search_skip_path": args.auto_search_skip_path,
-            "target_draft_layers": args.target_draft_layers,
-            "draft_layer_tolerance": args.draft_layer_tolerance,
+            "skip_layers_fallback": args.skip_layers,
+            "auto_search_skip_path_ignored": args.auto_search_skip_path,
+            "clasp_no_bayes": True,
+            "clasp_skip_ratio": args.clasp_skip_ratio,
+            "clasp_prefill_update": args.clasp_prefill_update,
             "max_draft_tokens": args.max_draft_tokens,
             "confidence_threshold": args.confidence_threshold,
             "verification_capacity": args.verification_capacity,
@@ -489,26 +499,25 @@ def main():
             "min_confidence_threshold": args.min_confidence_threshold,
             "max_confidence_threshold": args.max_confidence_threshold,
             "threshold_ema_beta": args.threshold_ema_beta,
+            "enable_clasp": args.enable_clasp,
+            "clasp_codebook_size": args.clasp_codebook_size,
+            "clasp_max_active_paths": args.clasp_max_active_paths,
+            "clasp_min_group_size": args.clasp_min_group_size,
+            "clasp_update_interval": args.clasp_update_interval,
+            "clasp_low_accept_trigger": args.clasp_low_accept_trigger,
+            "clasp_protected_first": args.clasp_protected_first,
+            "clasp_protected_last": args.clasp_protected_last,
+            "clasp_candidate_layers": args.clasp_candidate_layers,
+            "clasp_representative_rows": args.clasp_representative_rows,
+            "clasp_dynamic_codebook": args.clasp_dynamic_codebook,
+            "clasp_min_code_frequency": args.clasp_min_code_frequency,
+            "clasp_disable_when_bsz_below": args.clasp_disable_when_bsz_below,
+            "clasp_skip_count": args.clasp_skip_count,
+            "clasp_skip_ratio": args.clasp_skip_ratio,
+            "clasp_prefill_update": args.clasp_prefill_update,
         }) + "\n")
-    if search_summary is not None:
-        with open(args.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "phase": "auto_skip_search",
-                "search_time_cost": search_time_cost,
-                "search_time_min": search_time_cost / 60.0,
-                "selected_skip_layers": args.skip_layers,
-                "best_tokens_per_second": search_summary["best"].get("tokens_per_second", 0.0),
-                "best_average_accept_length": search_summary["best"].get("average_accept_length", 0.0),
-                "best_draft_acceptance_rate": search_summary["best"].get("draft_acceptance_rate", 0.0),
-                "search_trials": len(search_summary.get("trials", [])),
-                "target_draft_layers": args.target_draft_layers,
-                "draft_layer_tolerance": args.draft_layer_tolerance,
-                "effective_search_min_skip": search_summary.get("effective_search_min_skip"),
-                "effective_search_max_skip": search_summary.get("effective_search_max_skip"),
-                "effective_active_layers_min": search_summary.get("effective_active_layers_min"),
-                "effective_active_layers_max": search_summary.get("effective_active_layers_max"),
-                "search_json_out": args.search_json_out,
-            }) + "\n")
+    # No offline skip-search phase in this version.
+
 
     used_items = 0
     used_items_at_last_update = 0
@@ -572,6 +581,22 @@ def main():
                     min_confidence_threshold=args.min_confidence_threshold,
                     max_confidence_threshold=args.max_confidence_threshold,
                     threshold_ema_beta=args.threshold_ema_beta,
+                    enable_clasp=args.enable_clasp,
+                    clasp_codebook_size=args.clasp_codebook_size,
+                    clasp_max_active_paths=args.clasp_max_active_paths,
+                    clasp_min_group_size=args.clasp_min_group_size,
+                    clasp_update_interval=args.clasp_update_interval,
+                    clasp_low_accept_trigger=args.clasp_low_accept_trigger,
+                    clasp_protected_first=args.clasp_protected_first,
+                    clasp_protected_last=args.clasp_protected_last,
+                    clasp_candidate_layers=args.clasp_candidate_layers,
+                    clasp_representative_rows=args.clasp_representative_rows,
+                    clasp_dynamic_codebook=args.clasp_dynamic_codebook,
+                    clasp_min_code_frequency=args.clasp_min_code_frequency,
+                    clasp_disable_when_bsz_below=args.clasp_disable_when_bsz_below,
+                    clasp_skip_count=args.clasp_skip_count,
+                    clasp_skip_ratio=args.clasp_skip_ratio,
+                    clasp_prefill_update=args.clasp_prefill_update,
                 )
             generate_wall_time = time.time() - generate_wall_start
 
@@ -611,6 +636,8 @@ def main():
                 draft=f'{outputs.get("average_draft_steps", 0.0):.2f}',
                 thr=f'{outputs.get("average_confidence_threshold", args.confidence_threshold):.3f}',
                 active=f'{outputs.get("average_active_batch_size", 0.0):.1f}',
+                paths=f'{outputs.get("clasp_average_active_paths", 0.0):.1f}',
+                cupd=outputs.get("clasp_update_count", 0),
                 drop=outputs.get("cache_tokens_dropped", 0),
                 reward=f"{mean_reward:.3f}",
                 pending=f"{pending_used_items}/{required_used_items}",
@@ -625,6 +652,18 @@ def main():
                 "pending_used_items": pending_used_items,
                 "generate_time_cost": generate_wall_time,
                 "generate_internal_time_cost": outputs.get("total_time_cost", generate_wall_time),
+                "target_time_cost": outputs.get("target_time_cost", 0.0),
+                "draft_time_cost": outputs.get("draft_time_cost", 0.0),
+                "prefill_time_cost": outputs.get("prefill_time_cost", 0.0),
+                "post_time_cost": outputs.get("post_time_cost", 0.0),
+                "check_time_cost": outputs.get("check_time_cost", 0.0),
+                "timing_accounted_time_cost": (
+                    outputs.get("target_time_cost", 0.0)
+                    + outputs.get("draft_time_cost", 0.0)
+                    + outputs.get("prefill_time_cost", 0.0)
+                    + outputs.get("post_time_cost", 0.0)
+                    + outputs.get("clasp_time_cost", 0.0)
+                ),
                 "search_time_cost": search_time_cost,
                 "total_wall_time_cost": time.time() - start_time,
                 "total_generate_time_cost": total_generate_time,
@@ -645,6 +684,22 @@ def main():
                 "max_confidence_threshold_seen": outputs.get("max_confidence_threshold_seen", args.confidence_threshold),
                 "target_accept_rate": outputs.get("target_accept_rate", args.target_accept_rate),
                 "cache_tokens_dropped": outputs.get("cache_tokens_dropped", 0),
+                "clasp_enabled": outputs.get("clasp_enabled", args.enable_clasp),
+                "clasp_update_count": outputs.get("clasp_update_count", 0),
+                "clasp_time_cost": outputs.get("clasp_time_cost", 0.0),
+                "clasp_route_calls": outputs.get("clasp_route_calls", 0),
+                "clasp_average_codebook_size": outputs.get("clasp_average_codebook_size", 0.0),
+                "clasp_average_active_paths": outputs.get("clasp_average_active_paths", 0.0),
+                "clasp_min_active_paths": outputs.get("clasp_min_active_paths", 0),
+                "clasp_max_active_paths": outputs.get("clasp_max_active_paths", 0),
+                "clasp_average_merged_rows": outputs.get("clasp_average_merged_rows", 0.0),
+                "clasp_average_route_entropy": outputs.get("clasp_average_route_entropy", 0.0),
+                "clasp_average_skip_layers": outputs.get("clasp_average_skip_layers", 0.0),
+                "clasp_mean_layer_similarity": outputs.get("clasp_mean_layer_similarity", 0.0),
+                "clasp_skip_count": outputs.get("clasp_skip_count", 0),
+                "clasp_skip_ratio_config": outputs.get("clasp_skip_ratio_config", args.clasp_skip_ratio),
+                "clasp_prefill_update": outputs.get("clasp_prefill_update", args.clasp_prefill_update),
+                "clasp_codebook_final_size": outputs.get("clasp_codebook_final_size", 0),
                 "mean_reward": mean_reward,
                 "used_time_min": round((time.time() - start_time) / 60, 3),
             }
@@ -772,7 +827,15 @@ def main():
         "total_train_time_cost": total_train_time,
         "search_time_cost": search_time_cost,
         "used_items": used_items,
-        "skip_layers": args.skip_layers,
+        "skip_layers_fallback": args.skip_layers,
+        "clasp_no_bayes": True,
+        "clasp_skip_ratio": args.clasp_skip_ratio,
+        "clasp_prefill_update": args.clasp_prefill_update,
+        "enable_clasp": args.enable_clasp,
+        "clasp_codebook_size": args.clasp_codebook_size,
+        "clasp_max_active_paths": args.clasp_max_active_paths,
+        "clasp_min_group_size": args.clasp_min_group_size,
+        "clasp_update_interval": args.clasp_update_interval,
         "saved_model_dir": os.path.join(args.saved_model_dir, "step0"),
     }
     with open(args.log_file, "a", encoding="utf-8") as f:

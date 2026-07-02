@@ -13,6 +13,17 @@ from helper.get_QAs import get_train_QAs
 from self_speculative_grpo.generate import self_speculative_generate
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Bayesian search for Draft & Verify self-speculative skip layers.")
     parser.add_argument("--model_dir", default="Qwen/Qwen3-4B")
@@ -22,6 +33,16 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=160)
     parser.add_argument("--max_draft_tokens", type=int, default=3)
     parser.add_argument("--confidence_threshold", type=float, default=0.0)
+    parser.add_argument("--verification_capacity", type=int, default=160)
+    parser.add_argument("--max_verification_num", type=int, default=160)
+    parser.add_argument("--min_draft_tokens", "--min_draft_token_length", dest="min_draft_tokens", type=int, default=1)
+    parser.add_argument("--draft_token_length_c", type=float, default=0.75)
+    parser.add_argument("--dynamic_confidence_threshold", type=str2bool, default=True)
+    parser.add_argument("--target_accept_rate", type=float, default=0.70)
+    parser.add_argument("--threshold_lr", type=float, default=0.05)
+    parser.add_argument("--min_confidence_threshold", type=float, default=0.05)
+    parser.add_argument("--max_confidence_threshold", type=float, default=0.90)
+    parser.add_argument("--threshold_ema_beta", type=float, default=0.90)
     parser.add_argument("--min_skip", type=int, default=2)
     parser.add_argument("--max_skip", type=int, default=8)
     parser.add_argument("--init_trials", type=int, default=6)
@@ -189,6 +210,11 @@ def evaluate_mask(model, tokenizer, prompts, mask, candidate_layers, args):
     total_tokens = 0
     total_accept = 0.0
     total_steps = 0
+    total_proposed_draft_tokens = 0
+    total_accepted_draft_tokens = 0
+    total_active_batch_size = 0.0
+    total_verify_rounds = 0
+    total_avg_threshold = 0.0
     for prompt in prompts:
         inputs = {key: value.cuda() for key, value in prompt.items()}
         torch.cuda.synchronize()
@@ -208,12 +234,28 @@ def evaluate_mask(model, tokenizer, prompts, mask, candidate_layers, args):
                 repeated_generate_nums=1,
                 max_length=args.max_length,
                 statistical_time=False,
+                verification_capacity=getattr(args, "verification_capacity", 160),
+                max_verification_num=getattr(args, "max_verification_num", 160),
+                min_draft_tokens=getattr(args, "min_draft_tokens", 1),
+                draft_token_length_c=getattr(args, "draft_token_length_c", 0.75),
+                dynamic_confidence_threshold=getattr(args, "dynamic_confidence_threshold", True),
+                target_accept_rate=getattr(args, "target_accept_rate", 0.70),
+                threshold_lr=getattr(args, "threshold_lr", 0.05),
+                min_confidence_threshold=getattr(args, "min_confidence_threshold", 0.05),
+                max_confidence_threshold=getattr(args, "max_confidence_threshold", 0.90),
+                threshold_ema_beta=getattr(args, "threshold_ema_beta", 0.90),
             )
         torch.cuda.synchronize()
         total_seconds += time.time() - start
         total_tokens += sum(len(seq) for seq in outputs["generated_token_ids"])
         total_accept += outputs["total_acc_length"]
         total_steps += outputs["total_decoded_token_num"]
+        total_proposed_draft_tokens += outputs.get("total_proposed_draft_tokens", 0)
+        total_accepted_draft_tokens += outputs.get("total_accepted_draft_tokens", 0)
+        rounds = outputs.get("total_verify_rounds", 0)
+        total_verify_rounds += rounds
+        total_active_batch_size += outputs.get("average_active_batch_size", 0.0) * rounds
+        total_avg_threshold += outputs.get("average_confidence_threshold", 0.0) * rounds
     tokens_per_second = total_tokens / total_seconds if total_seconds else 0.0
     return {
         "skip_layers": skip_layers,
@@ -221,6 +263,14 @@ def evaluate_mask(model, tokenizer, prompts, mask, candidate_layers, args):
         "generated_tokens": total_tokens,
         "tokens_per_second": tokens_per_second,
         "average_accept_length": total_accept / total_steps if total_steps else 0.0,
+        "draft_acceptance_rate": (
+            total_accepted_draft_tokens / total_proposed_draft_tokens
+            if total_proposed_draft_tokens else 0.0
+        ),
+        "total_accepted_draft_tokens": int(total_accepted_draft_tokens),
+        "total_proposed_draft_tokens": int(total_proposed_draft_tokens),
+        "average_active_batch_size": total_active_batch_size / total_verify_rounds if total_verify_rounds else 0.0,
+        "average_confidence_threshold": total_avg_threshold / total_verify_rounds if total_verify_rounds else 0.0,
         "score": tokens_per_second,
     }
 

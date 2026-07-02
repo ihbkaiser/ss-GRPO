@@ -15,6 +15,21 @@ class SelfSpeculativeConfig:
     do_sample: bool = True
     temperature: float = 1.0
     top_p: float = 0.95
+    # FastGRPO-style concurrency-aware control.  For self-speculative decoding
+    # there is no tree branching, so Nverify is converted into a draft depth.
+    verification_capacity: int = 160
+    max_verification_num: int = 160
+    min_draft_tokens: int = 1
+    draft_token_length_c: float = 0.75
+    # Dynamic threshold control. This is an AURORA/self-spec threshold controller
+    # driven by observed speculative acceptance; FastGRPO itself uses confidence
+    # reranking rather than a mutable threshold.
+    dynamic_confidence_threshold: bool = True
+    target_accept_rate: float = 0.70
+    threshold_lr: float = 0.05
+    min_confidence_threshold: float = 0.05
+    max_confidence_threshold: float = 0.90
+    threshold_ema_beta: float = 0.90
 
 
 def parse_skip_layers(value: str | Iterable[int] | None) -> frozenset[int]:
@@ -42,6 +57,16 @@ def self_speculative_generate(
     repeated_generate_nums: int | None = None,
     max_length: int = 2048,
     statistical_time: bool = True,
+    verification_capacity: int = 160,
+    max_verification_num: int = 160,
+    min_draft_tokens: int = 1,
+    draft_token_length_c: float = 0.75,
+    dynamic_confidence_threshold: bool = True,
+    target_accept_rate: float = 0.70,
+    threshold_lr: float = 0.05,
+    min_confidence_threshold: float = 0.05,
+    max_confidence_threshold: float = 0.90,
+    threshold_ema_beta: float = 0.90,
 ):
     """Optimized batched Draft-and-Verify self-speculative decoding.
 
@@ -60,6 +85,16 @@ def self_speculative_generate(
         do_sample=bool(do_sample),
         temperature=float(temperature),
         top_p=float(top_p),
+        verification_capacity=max(1, int(verification_capacity)),
+        max_verification_num=max(1, int(max_verification_num)),
+        min_draft_tokens=max(0, int(min_draft_tokens)),
+        draft_token_length_c=max(float(draft_token_length_c), 1e-6),
+        dynamic_confidence_threshold=bool(dynamic_confidence_threshold),
+        target_accept_rate=float(target_accept_rate),
+        threshold_lr=float(threshold_lr),
+        min_confidence_threshold=float(min_confidence_threshold),
+        max_confidence_threshold=float(max_confidence_threshold),
+        threshold_ema_beta=float(threshold_ema_beta),
     )
 
     repeats = int(repeated_generate_nums or 1)
@@ -140,6 +175,20 @@ def self_speculative_generate(
             prefill_time=prefill_time,
             total_draft_steps=0,
             total_cache_tokens_dropped=0,
+            total_proposed_draft_tokens=0,
+            total_accepted_draft_tokens=0,
+            total_verify_rounds=0,
+            active_batch_size_sum=0,
+            active_batch_size_min=0,
+            active_batch_size_max=0,
+            verification_num_sum=0,
+            draft_steps_sum=0,
+            final_confidence_threshold=float(confidence_threshold),
+            average_confidence_threshold=float(confidence_threshold),
+            min_confidence_threshold_seen=float(confidence_threshold),
+            max_confidence_threshold_seen=float(confidence_threshold),
+            dynamic_confidence_threshold=bool(dynamic_confidence_threshold),
+            target_accept_rate=float(target_accept_rate),
         )
 
     input_ids = input_ids[keep]
@@ -155,6 +204,31 @@ def self_speculative_generate(
     adaptive_accept_ema = None
     total_draft_steps = 0
     total_cache_tokens_dropped = 0
+    total_proposed_draft_tokens = 0
+    total_accepted_draft_tokens = 0
+    total_verify_rounds = 0
+    active_batch_size_sum = 0
+    active_batch_size_min = initial_bsz
+    active_batch_size_max = initial_bsz
+    verification_num_sum = 0
+    draft_steps_sum = 0
+
+    if config.dynamic_confidence_threshold:
+        current_confidence_threshold = _clamp(
+            max(config.confidence_threshold, config.min_confidence_threshold),
+            config.min_confidence_threshold,
+            config.max_confidence_threshold,
+        )
+    else:
+        current_confidence_threshold = _clamp(
+            config.confidence_threshold,
+            0.0,
+            config.max_confidence_threshold,
+        )
+    threshold_ema = None
+    threshold_sum = 0.0
+    threshold_min_seen = current_confidence_threshold
+    threshold_max_seen = current_confidence_threshold
 
     while current_token.numel() > 0:
         cur_bsz = int(current_token.shape[0])
@@ -163,15 +237,24 @@ def self_speculative_generate(
         if max_remaining <= 0:
             break
 
-        draft_steps = min(
-            _adaptive_draft_steps(
-                max_draft_tokens=config.max_draft_tokens,
-                active_count=cur_bsz,
-                initial_batch_size=initial_bsz,
-                accept_ema=adaptive_accept_ema,
-            ),
-            max_remaining,
+        draft_steps, verification_num = _concurrency_aware_draft_steps(
+            active_batch_size=cur_bsz,
+            verification_capacity=config.verification_capacity,
+            max_draft_tokens=config.max_draft_tokens,
+            max_verification_num=config.max_verification_num,
+            min_draft_tokens=config.min_draft_tokens,
+            draft_token_length_c=config.draft_token_length_c,
         )
+        draft_steps = min(draft_steps, max_remaining)
+        total_verify_rounds += 1
+        active_batch_size_sum += cur_bsz
+        active_batch_size_min = min(active_batch_size_min, cur_bsz)
+        active_batch_size_max = max(active_batch_size_max, cur_bsz)
+        verification_num_sum += verification_num
+        draft_steps_sum += draft_steps
+        threshold_sum += current_confidence_threshold
+        threshold_min_seen = min(threshold_min_seen, current_confidence_threshold)
+        threshold_max_seen = max(threshold_max_seen, current_confidence_threshold)
 
         draft_tokens = []
         draft_probs_per_step = []
@@ -215,7 +298,7 @@ def self_speculative_generate(
             draft_valid_masks.append(valid_for_step)
 
             confidence = probs.gather(1, sampled.unsqueeze(1)).squeeze(1)
-            draft_active = valid_for_step & (confidence >= config.confidence_threshold) & (sampled != eos_token_id)
+            draft_active = valid_for_step & (confidence >= current_confidence_threshold) & (sampled != eos_token_id)
             draft_input = sampled.unsqueeze(1)
 
         actual_draft_steps = len(draft_tokens)
@@ -227,6 +310,8 @@ def self_speculative_generate(
         else:
             draft_token_matrix = torch.empty((cur_bsz, 0), dtype=torch.long, device=device)
             draft_valid_matrix = torch.empty((cur_bsz, 0), dtype=torch.bool, device=device)
+        round_proposed_draft_tokens = int(draft_valid_matrix.sum().item()) if actual_draft_steps > 0 else 0
+        total_proposed_draft_tokens += round_proposed_draft_tokens
 
         verify_input = torch.cat([current_token.unsqueeze(1), draft_token_matrix], dim=1)
         verify_attention_mask = torch.cat(
@@ -293,6 +378,7 @@ def self_speculative_generate(
         finished_rows = torch.zeros(cur_bsz, dtype=torch.bool, device=device)
         cache_lengths = [1] * cur_bsz  # current_token is always cached by verify forward.
         accepted_lengths_for_metric = []
+        round_accepted_draft_tokens = 0
 
         # This loop now only handles prefix logic over at most a few draft tokens;
         # it performs no full-vocab operations.
@@ -341,9 +427,32 @@ def self_speculative_generate(
 
             next_current[row] = int(accepted_ids[-1])
             cache_lengths[row] = 1 + accepted_draft_prefix
+            round_accepted_draft_tokens += accepted_draft_prefix
 
             if accepted_ids[-1] == eos_token_id or prompt_lengths[row] + generated_lengths[row] >= max_length:
                 finished_rows[row] = True
+
+        total_accepted_draft_tokens += round_accepted_draft_tokens
+        if round_proposed_draft_tokens > 0:
+            current_draft_accept_rate = round_accepted_draft_tokens / max(round_proposed_draft_tokens, 1)
+            adaptive_accept_ema = (
+                current_draft_accept_rate
+                if adaptive_accept_ema is None
+                else 0.85 * adaptive_accept_ema + 0.15 * current_draft_accept_rate
+            )
+            if config.dynamic_confidence_threshold:
+                threshold_ema = (
+                    current_draft_accept_rate
+                    if threshold_ema is None
+                    else config.threshold_ema_beta * threshold_ema + (1.0 - config.threshold_ema_beta) * current_draft_accept_rate
+                )
+                # Below target: raise threshold to draft fewer but safer tokens.
+                # Above target: lower threshold to recover speed.
+                current_confidence_threshold = _clamp(
+                    current_confidence_threshold + config.threshold_lr * (config.target_accept_rate - threshold_ema),
+                    config.min_confidence_threshold,
+                    config.max_confidence_threshold,
+                )
 
         max_cache_extension = max(cache_lengths) if cache_lengths else 1
         target_cache = _crop_cache(target_cache, cache_past_len + max_cache_extension)
@@ -352,14 +461,6 @@ def self_speculative_generate(
             cache_valid_extension[row, :cache_len] = 1
         total_cache_tokens_dropped += max(0, verify_input.shape[1] - max_cache_extension)
         full_attention_mask = torch.cat([full_attention_mask, cache_valid_extension], dim=1)
-
-        if accepted_lengths_for_metric:
-            current_step_accept = sum(accepted_lengths_for_metric) / len(accepted_lengths_for_metric)
-            adaptive_accept_ema = (
-                current_step_accept
-                if adaptive_accept_ema is None
-                else 0.85 * adaptive_accept_ema + 0.15 * current_step_accept
-            )
 
         keep = (~finished_rows).nonzero(as_tuple=False).flatten()
         if keep.numel() == 0:
@@ -387,6 +488,20 @@ def self_speculative_generate(
         prefill_time=prefill_time,
         total_draft_steps=total_draft_steps,
         total_cache_tokens_dropped=total_cache_tokens_dropped,
+        total_proposed_draft_tokens=total_proposed_draft_tokens,
+        total_accepted_draft_tokens=total_accepted_draft_tokens,
+        total_verify_rounds=total_verify_rounds,
+        active_batch_size_sum=active_batch_size_sum,
+        active_batch_size_min=active_batch_size_min if total_verify_rounds else 0,
+        active_batch_size_max=active_batch_size_max if total_verify_rounds else 0,
+        verification_num_sum=verification_num_sum,
+        draft_steps_sum=draft_steps_sum,
+        final_confidence_threshold=current_confidence_threshold,
+        average_confidence_threshold=threshold_sum / total_verify_rounds if total_verify_rounds else current_confidence_threshold,
+        min_confidence_threshold_seen=threshold_min_seen,
+        max_confidence_threshold_seen=threshold_max_seen,
+        dynamic_confidence_threshold=config.dynamic_confidence_threshold,
+        target_accept_rate=config.target_accept_rate,
     )
 
 
@@ -401,6 +516,20 @@ def _final_result(
     prefill_time,
     total_draft_steps,
     total_cache_tokens_dropped,
+    total_proposed_draft_tokens=0,
+    total_accepted_draft_tokens=0,
+    total_verify_rounds=0,
+    active_batch_size_sum=0,
+    active_batch_size_min=0,
+    active_batch_size_max=0,
+    verification_num_sum=0,
+    draft_steps_sum=0,
+    final_confidence_threshold=0.0,
+    average_confidence_threshold=0.0,
+    min_confidence_threshold_seen=0.0,
+    max_confidence_threshold_seen=0.0,
+    dynamic_confidence_threshold=False,
+    target_accept_rate=0.0,
 ):
     total_time = time.time() - start_time
     generated_token_ids = [seq for seq in generated]
@@ -419,6 +548,24 @@ def _final_result(
         "average_accept_length": total_acc_length / total_decoded_token_num if total_decoded_token_num else 0.0,
         "average_draft_steps": total_draft_steps / total_decoded_token_num if total_decoded_token_num else 0.0,
         "cache_tokens_dropped": total_cache_tokens_dropped,
+        "total_proposed_draft_tokens": int(total_proposed_draft_tokens),
+        "total_accepted_draft_tokens": int(total_accepted_draft_tokens),
+        "draft_acceptance_rate": (
+            total_accepted_draft_tokens / total_proposed_draft_tokens
+            if total_proposed_draft_tokens else 0.0
+        ),
+        "total_verify_rounds": int(total_verify_rounds),
+        "average_active_batch_size": active_batch_size_sum / total_verify_rounds if total_verify_rounds else 0.0,
+        "min_active_batch_size": int(active_batch_size_min),
+        "max_active_batch_size": int(active_batch_size_max),
+        "average_verification_num": verification_num_sum / total_verify_rounds if total_verify_rounds else 0.0,
+        "average_selected_draft_steps": draft_steps_sum / total_verify_rounds if total_verify_rounds else 0.0,
+        "final_confidence_threshold": float(final_confidence_threshold),
+        "average_confidence_threshold": float(average_confidence_threshold),
+        "min_confidence_threshold_seen": float(min_confidence_threshold_seen),
+        "max_confidence_threshold_seen": float(max_confidence_threshold_seen),
+        "dynamic_confidence_threshold": bool(dynamic_confidence_threshold),
+        "target_accept_rate": float(target_accept_rate),
     }
 
 
@@ -454,44 +601,44 @@ def _select_cache_batch(cache, indices):
         return cache
     raise TypeError(f"Unsupported cache type for batch select: {type(cache)}")
 
-def _adaptive_draft_steps(max_draft_tokens, active_count, initial_batch_size, accept_ema):
-    """Choose draft depth for batched self-speculative decoding.
+def _clamp(value, lower, upper):
+    lower = float(lower)
+    upper = float(upper)
+    if upper < lower:
+        lower, upper = upper, lower
+    return max(lower, min(float(value), upper))
 
-    Self-spec drafting is not a separate 1-layer model; it is the same model
-    with skipped layers, so draft overhead is high at large effective batch size.
-    This heuristic keeps draft depth shallow while concurrency is high, then
-    allows deeper drafting as active concurrency falls or observed acceptance
-    improves. It preserves the user-specified max_draft_tokens as a hard cap.
+
+def _concurrency_aware_draft_steps(
+    active_batch_size,
+    verification_capacity,
+    max_draft_tokens,
+    max_verification_num,
+    min_draft_tokens,
+    draft_token_length_c,
+):
+    """FastGRPO-style concurrency-aware depth for self-speculative decoding.
+
+    FastGRPO sets Nverify ~= Cpeak / B, then derives draft depth from
+    log2(Nverify / alpha).  This self-speculative implementation has a linear
+    draft path instead of an EAGLE-style tree, so the computed Nverify is used
+    only to choose the number of sequential draft tokens.
     """
     max_draft_tokens = int(max_draft_tokens)
     if max_draft_tokens <= 0:
-        return 0
+        return 0, 1
 
-    active_count = max(1, int(active_count))
-    initial_batch_size = max(1, int(initial_batch_size))
-    concurrency_ratio = active_count / initial_batch_size
+    active_batch_size = max(1, int(active_batch_size))
+    verification_capacity = max(1, int(verification_capacity))
+    max_verification_num = max(1, int(max_verification_num))
+    draft_token_length_c = max(float(draft_token_length_c), 1e-6)
+    min_draft_tokens = max(0, int(min_draft_tokens))
 
-    # Concurrency-aware cap: high concurrency is compute-bound, so keep draft
-    # depth shallow. As sequences finish, the cap gradually relaxes.
-    if concurrency_ratio >= 0.75:
-        concurrency_cap = 2
-    elif concurrency_ratio >= 0.50:
-        concurrency_cap = 3
-    elif concurrency_ratio >= 0.25:
-        concurrency_cap = 4
-    else:
-        concurrency_cap = max_draft_tokens
-
-    # Acceptance-aware cap: if accepted length is low, drafting far beyond the
-    # observed accepted prefix wastes self-spec compute. Add one token of slack
-    # so the algorithm can still discover improved acceptance.
-    if accept_ema is None:
-        acceptance_cap = max_draft_tokens
-    else:
-        acceptance_cap = max(1, int(round(float(accept_ema) + 1.0)))
-
-    return max(1, min(max_draft_tokens, concurrency_cap, acceptance_cap))
-
+    verification_num = min(max(1, verification_capacity // active_batch_size), max_verification_num)
+    raw_depth = int(torch.floor(torch.log2(torch.tensor(max(verification_num / draft_token_length_c, 1.0)))).item())
+    draft_steps = max(min_draft_tokens, raw_depth)
+    draft_steps = min(max_draft_tokens, max(1, draft_steps))
+    return draft_steps, verification_num
 
 def _crop_cache(cache, max_length):
     """Crop a DynamicCache or legacy key/value cache in-place and return it."""
@@ -528,6 +675,21 @@ def _empty_result(start_time):
         "average_accept_length": 0.0,
         "average_draft_steps": 0.0,
         "cache_tokens_dropped": 0,
+        "total_proposed_draft_tokens": 0,
+        "total_accepted_draft_tokens": 0,
+        "draft_acceptance_rate": 0.0,
+        "total_verify_rounds": 0,
+        "average_active_batch_size": 0.0,
+        "min_active_batch_size": 0,
+        "max_active_batch_size": 0,
+        "average_verification_num": 0.0,
+        "average_selected_draft_steps": 0.0,
+        "final_confidence_threshold": 0.0,
+        "average_confidence_threshold": 0.0,
+        "min_confidence_threshold_seen": 0.0,
+        "max_confidence_threshold_seen": 0.0,
+        "dynamic_confidence_threshold": False,
+        "target_accept_rate": 0.0,
     }
 
 
