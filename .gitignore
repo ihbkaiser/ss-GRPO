@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv/
+hf_cache/
+.hf_cache/
+logs/
+runs/
+data/
+models/
+outputs/
+!outputs/qwen25_1.5b_inst_simplerl/fastgrpo_target/step333/README.md
