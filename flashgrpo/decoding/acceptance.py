@@ -91,3 +91,68 @@ def exact_accept_path(
         accepted_nodes.append(match)
         parent = match
     return accepted_tokens, accepted_nodes, parent
+
+
+@torch.no_grad()
+def exact_accept_paths_batch(
+    trees,
+    tree_logits: torch.Tensor,
+    *,
+    do_sample: bool,
+    temperature: float,
+    top_p: float | None,
+    top_k: int | None,
+) -> tuple[list[list[int]], list[list[int]], list[int]]:
+    """Batched equivalent of :func:`exact_accept_path`.
+
+    Target samples at the same tree depth are drawn in one CUDA operation.
+    Candidate lookup remains on CPU because ``CandidateTree`` is a compact
+    Python structure. The accepted distribution is unchanged: every token is
+    still sampled solely from the target policy at its current parent node.
+    """
+
+    batch_size = len(trees)
+    accepted_tokens = [[int(tree.tokens[0])] for tree in trees]
+    accepted_nodes = [[0] for _ in trees]
+    parent_nodes = [0 for _ in trees]
+    active_rows = [row for row, tree in enumerate(trees) if tree.children.get(0)]
+
+    while active_rows:
+        row_index = torch.as_tensor(active_rows, dtype=torch.long, device=tree_logits.device)
+        parent_index = torch.as_tensor(
+            [parent_nodes[row] for row in active_rows],
+            dtype=torch.long,
+            device=tree_logits.device,
+        )
+        parent_logits = tree_logits[row_index, parent_index]
+        sampled = sample_from_logits(
+            parent_logits,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        ).detach().cpu().tolist()
+
+        next_active: list[int] = []
+        for row, token in zip(active_rows, sampled):
+            tree = trees[row]
+            match = next(
+                (
+                    child
+                    for child in tree.children.get(parent_nodes[row], [])
+                    if int(tree.tokens[child]) == int(token)
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            accepted_tokens[row].append(int(token))
+            accepted_nodes[row].append(int(match))
+            parent_nodes[row] = int(match)
+            if tree.children.get(int(match)):
+                next_active.append(row)
+        active_rows = next_active
+
+    if len(accepted_tokens) != batch_size:
+        raise RuntimeError("Batched acceptance produced an invalid batch size")
+    return accepted_tokens, accepted_nodes, parent_nodes

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, stdev
@@ -19,7 +20,7 @@ from flashgrpo.decoding.flash_medusa_decoder import FlashMedusaConfig, FlashMedu
 from flashgrpo.models.medusa_heads import MedusaHeads
 from flashgrpo.models.qwen_flashgrpo_wrapper import autocast_dtype, unwrap_causal_lm
 from flashgrpo.training.online_medusa_trainer import OnlineMedusaConfig, OnlineMedusaTrainer
-from flashgrpo.training.reflex_aux import ReliabilityTracker
+from flashgrpo.training.reflex_aux import AuxiliaryHeadRefresher, ReliabilityDecision, ReliabilityTracker
 from flashgrpo.utils.config import save_resolved_config
 from flashgrpo.utils.gpu_monitor import GpuMonitor
 from flashgrpo.utils.metrics import MetricsLogger
@@ -46,6 +47,17 @@ def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.d
     if name == "fp32":
         return torch.float32
     return default
+
+
+def _resolve_attn_implementation(requested: str | None) -> str:
+    requested = str(requested or "eager")
+    if requested == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        print(
+            "Warning: model.attn_implementation=flash_attention_2 was requested, "
+            "but flash_attn is not installed in this environment. Falling back to sdpa."
+        )
+        return "sdpa"
+    return requested
 
 
 class TrainDataCollator:
@@ -230,7 +242,8 @@ def build_medusa_update_batch(prompt_input_ids, prompt_attention_mask, generated
 
 @dataclass
 class Accumulator:
-    messages: list
+    token_ids: list
+    prompt_lens: list
     rewards: list
     std_rewards: list
     used_items: int = 0
@@ -307,8 +320,86 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "check_time_cost": sum(float(row.get("check_time_cost", 0.0) or 0.0) for row in rows),
         "reflex_metrics": reflex_metrics,
         "reflex_head_metrics": reflex_metrics.get("per_head", {}),
+        "reflex_aux_records": _merge_reflex_aux_records([row.get("reflex_aux_records", {}) for row in rows]),
     }
     return out
+
+
+def _merge_reflex_aux_records(rows: list[dict]) -> dict:
+    rows = [row for row in rows if row and row.get("hidden") is not None and int(row["hidden"].shape[0]) > 0]
+    if not rows:
+        return {}
+    max_prev = max((int(row.get("prev_tokens", torch.empty(0, 0)).shape[1]) for row in rows), default=0)
+    merged = {
+        "hidden": torch.cat([row["hidden"] for row in rows], dim=0),
+        "fast_state": torch.cat([row["fast_state"] for row in rows], dim=0),
+        "labels": torch.cat([row["labels"] for row in rows], dim=0),
+        "horizons": torch.cat([row["horizons"] for row in rows], dim=0),
+        "prev_lens": torch.cat([row["prev_lens"] for row in rows], dim=0),
+        "reflex_scale": torch.cat(
+            [row.get("reflex_scale", torch.ones((int(row["hidden"].shape[0]),), dtype=torch.float32)) for row in rows],
+            dim=0,
+        ),
+        "target_logsumexp": torch.cat(
+            [row.get("target_logsumexp", torch.zeros((int(row["hidden"].shape[0]),), dtype=torch.float32)) for row in rows],
+            dim=0,
+        ),
+        "old_logsumexp": torch.cat(
+            [row.get("old_logsumexp", torch.zeros((int(row["hidden"].shape[0]),), dtype=torch.float32)) for row in rows],
+            dim=0,
+        ),
+        "has_sparse_teacher": torch.cat(
+            [row.get("has_sparse_teacher", torch.zeros((int(row["hidden"].shape[0]),), dtype=torch.bool)) for row in rows],
+            dim=0,
+        ),
+    }
+    prev_chunks = []
+    for row in rows:
+        prev = row.get("prev_tokens")
+        if prev is None:
+            prev = torch.full((int(row["hidden"].shape[0]), 0), -1, dtype=torch.long)
+        if int(prev.shape[1]) < max_prev:
+            pad = torch.full((int(prev.shape[0]), max_prev - int(prev.shape[1])), -1, dtype=torch.long)
+            prev = torch.cat([prev, pad], dim=1)
+        prev_chunks.append(prev)
+    merged["prev_tokens"] = torch.cat(prev_chunks, dim=0) if prev_chunks else torch.empty((0, max_prev), dtype=torch.long)
+    for prefix, id_dtype, value_dtype in (
+        ("target", torch.int32, torch.float16),
+        ("old", torch.int32, torch.float16),
+    ):
+        id_key = f"{prefix}_top_ids"
+        value_key = f"{prefix}_top_logits"
+        width = max((int(row.get(id_key, torch.empty(0, 0)).shape[1]) for row in rows), default=0)
+        id_chunks = []
+        value_chunks = []
+        for row in rows:
+            count = int(row["hidden"].shape[0])
+            ids = row.get(id_key, torch.full((count, 0), -1, dtype=id_dtype))
+            values = row.get(value_key, torch.zeros((count, 0), dtype=value_dtype))
+            if int(ids.shape[1]) < width:
+                ids = torch.cat([ids, torch.full((count, width - int(ids.shape[1])), -1, dtype=id_dtype)], dim=1)
+                values = torch.cat([values, torch.zeros((count, width - int(values.shape[1])), dtype=value_dtype)], dim=1)
+            id_chunks.append(ids)
+            value_chunks.append(values)
+        merged[id_key] = torch.cat(id_chunks, dim=0)
+        merged[value_key] = torch.cat(value_chunks, dim=0)
+    return merged
+
+
+def _merge_reflex_record_batches(batches: list[dict], max_records: int) -> dict:
+    valid = [batch for batch in batches if batch and torch.is_tensor(batch.get("hidden"))]
+    if not valid:
+        return {}
+    # Prefixes and sparse teacher supports can have different widths across
+    # rollout batches. The auxiliary merger pads those fields before concat.
+    merged = _merge_reflex_aux_records(valid)
+    total = int(merged.get("hidden", torch.empty(0)).shape[0])
+    limit = max(0, int(max_records))
+    if limit > 0 and total > limit:
+        # Keep recent records; they best match the current policy/head pair.
+        start = total - limit
+        merged = {key: value[start:].contiguous() for key, value in merged.items()}
+    return merged
 
 
 def _merge_reflex_metrics(rows: list[dict]) -> dict:
@@ -318,37 +409,76 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
     per_head: dict[str, dict] = {}
     total_updates = sum(int(row.get("num_reflex_updates", 0) or 0) for row in rows)
     feedback_weight = total_updates if total_updates > 0 else 1
-    feedback_mean = sum(float(row.get("feedback_norm_mean", 0.0) or 0.0) * int(row.get("num_reflex_updates", 0) or 0) for row in rows) / max(feedback_weight, 1)
-    feedback_p95 = max(float(row.get("feedback_norm_p95", 0.0) or 0.0) for row in rows)
-    fast_norm_mean = sum(float(row.get("fast_state_norm_mean", 0.0) or 0.0) for row in rows) / max(len(rows), 1)
-    fast_norm_p95 = max(float(row.get("fast_state_norm_p95", 0.0) or 0.0) for row in rows)
+    feedback_mean = sum(float(row.get("feedback_rms_mean", row.get("feedback_norm_mean", 0.0)) or 0.0) * int(row.get("num_reflex_updates", 0) or 0) for row in rows) / max(feedback_weight, 1)
+    feedback_p95 = max(float(row.get("feedback_rms_p95", row.get("feedback_norm_p95", 0.0)) or 0.0) for row in rows)
+    fast_norm_mean = sum(float(row.get("fast_state_rms_mean", row.get("fast_state_norm_mean", 0.0)) or 0.0) for row in rows) / max(len(rows), 1)
+    fast_norm_p95 = max(float(row.get("fast_state_rms_p95", row.get("fast_state_norm_p95", 0.0)) or 0.0) for row in rows)
     for row in rows:
         for head, metrics in (row.get("per_head") or {}).items():
-            out = per_head.setdefault(str(head), {"mature": 0, "accepted": 0, "ce_sum": 0.0})
+            out = per_head.setdefault(
+                str(head),
+                {"mature": 0, "accepted": 0, "ce_sum": 0.0, "tv_sum": 0.0, "gated": 0.0, "depth_buckets": {}},
+            )
             mature = int(metrics.get("mature", 0) or 0)
             out["mature"] += mature
             out["accepted"] += int(metrics.get("accepted", 0) or 0)
             out["ce_sum"] += float(metrics.get("mature_ce", 0.0) or 0.0) * mature
+            out["tv_sum"] += float(metrics.get("sparse_tv", 0.0) or 0.0) * mature
+            out["gated"] += float(metrics.get("nonzero_gate_fraction", 0.0) or 0.0) * mature
+            for bucket, values in (metrics.get("depth_buckets") or {}).items():
+                count = int(values.get("mature", 0) or 0)
+                bucket_out = out["depth_buckets"].setdefault(
+                    str(bucket),
+                    {"mature": 0, "accepted": 0.0, "tv_sum": 0.0},
+                )
+                bucket_out["mature"] += count
+                bucket_out["accepted"] += float(values.get("acceptance_rate", 0.0) or 0.0) * count
+                bucket_out["tv_sum"] += float(values.get("sparse_tv", 0.0) or 0.0) * count
     for head, metrics in per_head.items():
         mature = int(metrics.pop("mature", 0))
         accepted = int(metrics.pop("accepted", 0))
         ce_sum = float(metrics.pop("ce_sum", 0.0))
+        tv_sum = float(metrics.pop("tv_sum", 0.0))
+        gated = float(metrics.pop("gated", 0.0))
+        raw_buckets = metrics.pop("depth_buckets", {})
         acc = accepted / max(mature, 1)
+        buckets = {
+            bucket: {
+                "mature": int(values["mature"]),
+                "acceptance_rate": float(values["accepted"]) / max(int(values["mature"]), 1),
+                "sparse_tv": float(values["tv_sum"]) / max(int(values["mature"]), 1),
+            }
+            for bucket, values in raw_buckets.items()
+        }
         per_head[head] = {
             "mature": mature,
             "accepted": accepted,
             "acceptance_rate": acc,
             "rejection_rate": 1.0 - acc if mature else 0.0,
             "mature_ce": ce_sum / max(mature, 1),
+            "sparse_tv": tv_sum / max(mature, 1),
+            "nonzero_gate_fraction": gated / max(mature, 1),
+            "depth_buckets": buckets,
         }
+    feedback_collection_rounds = sum(int(row.get("feedback_collection_rounds", 0) or 0) for row in rows)
     return {
         "enabled": any(bool(row.get("enabled", False)) for row in rows),
+        "feedback_enabled": any(bool(row.get("feedback_enabled", False)) for row in rows),
+        "proposal_injection_enabled": any(bool(row.get("proposal_injection_enabled", False)) for row in rows),
         "num_reflex_updates": int(total_updates),
+        "feedback_rms_mean": feedback_mean,
+        "feedback_rms_p95": feedback_p95,
         "feedback_norm_mean": feedback_mean,
         "feedback_norm_p95": feedback_p95,
+        "fast_state_rms_mean": fast_norm_mean,
+        "fast_state_rms_p95": fast_norm_p95,
         "fast_state_norm_mean": fast_norm_mean,
         "fast_state_norm_p95": fast_norm_p95,
+        "effective_feedback_updates_mean": sum(float(row.get("effective_feedback_updates_mean", 0.0) or 0.0) for row in rows) / max(len(rows), 1),
+        "nonzero_gate_fraction": sum(float(row.get("nonzero_gate_fraction", 0.0) or 0.0) for row in rows) / max(len(rows), 1),
+        "feedback_collection_rounds": feedback_collection_rounds,
         "pending_prediction_records": sum(int(row.get("pending_prediction_records", 0) or 0) for row in rows),
+        "numerical_reset_count": sum(int(row.get("numerical_reset_count", 0) or 0) for row in rows),
         "per_head": per_head,
     }
 
@@ -364,6 +494,7 @@ def generate_with_oom_retry(
     generation_step: int,
     enabled: bool,
     max_splits: int,
+    collect_reflex_aux_cache: bool = False,
     split_depth: int = 0,
 ) -> dict:
     try:
@@ -374,6 +505,7 @@ def generate_with_oom_retry(
             max_length=max_length,
             statistical_time=statistical_time,
             generation_step=generation_step,
+            collect_reflex_aux_cache=collect_reflex_aux_cache,
         )
     except RuntimeError as exc:
         if (not enabled) or (not _is_cuda_oom(exc)) or input_ids.shape[0] <= 1 or split_depth >= max_splits:
@@ -400,6 +532,7 @@ def generate_with_oom_retry(
                     generation_step=generation_step,
                     enabled=enabled,
                     max_splits=max_splits,
+                    collect_reflex_aux_cache=collect_reflex_aux_cache,
                     split_depth=split_depth + 1,
                 )
             )
@@ -415,6 +548,7 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
     fg = config.get("flashgrpo", {})
     gen = config.get("generation", {})
     reflex = config.get("reflex", {})
+    aux = config.get("aux_update", {})
     return FlashMedusaConfig(
         num_medusa_heads=int(fg.get("num_medusa_heads", 3)),
         tree_mode=fg.get("tree_mode", "concurrency_aware"),
@@ -443,12 +577,48 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         adaptive_confidence_high=float(fg.get("adaptive_confidence_high", 0.45)),
         adaptive_min_topk_by_depth=tuple(fg.get("adaptive_min_topk_by_depth", [1, 1, 1])),
         reflex_enabled=bool(reflex.get("enabled", False)),
+        reflex_state_space=str(reflex.get("state_space", "projected")),
         reflex_fast_state_dim=int(reflex.get("fast_state_dim", 128)),
         reflex_beta=float(reflex.get("beta", 0.95)),
         reflex_eta=float(reflex.get("eta", 0.1)),
-        reflex_top_m_feedback=int(reflex.get("top_m_feedback", 64)),
-        reflex_feedback_clip_norm=float(reflex.get("feedback_clip_norm", 8.0)),
+        reflex_top_m_feedback=int(reflex.get("proposal_topk", reflex.get("top_m_feedback", 64))),
+        reflex_feedback_stride=int(reflex.get("feedback_stride", 1)),
+        reflex_feedback_stride_min=int(reflex.get("feedback_stride_min", 1)),
+        reflex_target_topk=int(reflex.get("target_topk", 32)),
+        reflex_feedback_union_cap=int(reflex.get("feedback_union_cap", 96)),
+        reflex_tv_gate_low=float(reflex.get("tv_gate_low", 0.05)),
+        reflex_tv_gate_high=float(reflex.get("tv_gate_high", 0.20)),
+        reflex_horizon_weight_decay=float(reflex.get("horizon_weight_decay", 0.85)),
+        reflex_half_life_tokens=float(reflex.get("half_life_tokens", 48.0)),
+        reflex_feedback_variance_beta=float(reflex.get("feedback_variance_beta", 0.99)),
+        reflex_feedback_rms_clip=float(reflex.get("feedback_rms_clip", 3.0)),
+        reflex_state_rms_clip=float(reflex.get("state_rms_clip", 2.0)),
+        reflex_numerical_reset_rms=float(reflex.get("numerical_reset_rms", 2.5)),
+        reflex_relative_rms_delta_base=float(reflex.get("relative_rms_delta_base", 0.01)),
+        reflex_warmup_effective_updates=float(reflex.get("warmup_effective_updates", 16.0)),
+        reflex_magnitude_gate_floor=float(reflex.get("magnitude_gate_floor", 0.25)),
+        reflex_guard_calibration_rollouts=int(reflex.get("guard_calibration_rollouts", 20)),
+        reflex_guard_aal_drop_fraction=float(reflex.get("guard_aal_drop_fraction", 0.05)),
+        reflex_guard_patience=int(reflex.get("guard_patience", 2)),
+        reflex_guard_disable_rollouts=int(reflex.get("guard_disable_rollouts", 50)),
+        reflex_feedback_clip_norm=float(reflex.get("feedback_clip_norm", 2.0)),
+        reflex_hidden_feedback_clip_norm=float(reflex.get("hidden_feedback_clip_norm", 0.0)),
         reflex_fast_state_clip_norm=float(reflex.get("fast_state_clip_norm", 8.0)),
+        reflex_correction_clip_norm=float(reflex.get("correction_clip_norm", 1.0)),
+        reflex_normalize_correction=bool(reflex.get("normalize_correction", True)),
+        reflex_feedback_ce_gate=bool(reflex.get("feedback_ce_gate", True)),
+        reflex_feedback_ce_tau=float(reflex.get("feedback_ce_tau", 4.0)),
+        reflex_feedback_ce_threshold=float(reflex.get("feedback_ce_threshold", 0.4)),
+        reflex_normalize_feedback=bool(reflex.get("normalize_feedback", True)),
+        reflex_feedback_enabled=bool(reflex.get("feedback_enabled", False)),
+        reflex_proposal_injection_enabled=bool(reflex.get("proposal_injection_enabled", False)),
+        reflex_proposal_injection_scale=float(reflex.get("proposal_injection_scale", 0.0)),
+        reflex_proposal_injection_after=int(reflex.get("proposal_injection_after", 0)),
+        reflex_proposal_injection_warmup=int(reflex.get("proposal_injection_warmup", 0)),
+        reflex_aux_cache_enabled=bool(aux.get("reflex_cache_enabled", False)),
+        reflex_aux_cache_max_records=int(aux.get("max_cached_records", fg.get("medusa_max_tokens_per_update", 8192))),
+        reflex_aux_cache_stride=int(aux.get("cache_stride", 1)),
+        reflex_aux_store_fast_state=bool(aux.get("update_fast_state_injections", False)),
     )
 
 
@@ -469,6 +639,21 @@ def maybe_empty_cuda_cache(config: dict[str, Any], *, force: bool = False) -> bo
     return False
 
 
+def _aux_refresh_allowed_for_generation_step(config: dict[str, Any], generation_step: int) -> tuple[bool, str]:
+    aux_cfg = config.get("aux_update", {})
+    if not bool(aux_cfg.get("defer_until_reflex_warmup_complete", False)):
+        return True, ""
+    reflex_cfg = config.get("reflex", {})
+    if not bool(reflex_cfg.get("enabled", False)) or not bool(reflex_cfg.get("proposal_injection_enabled", False)):
+        return True, ""
+    after = int(reflex_cfg.get("proposal_injection_after", 0))
+    warmup = int(reflex_cfg.get("proposal_injection_warmup", 0))
+    ready_step = after + max(0, warmup)
+    if int(generation_step) < ready_step:
+        return False, f"reflex_warmup_until_step_{ready_step}"
+    return True, ""
+
+
 def run_training(config: dict[str, Any]) -> None:
     seed_everything(int(config.get("seed", 42)))
     run_name = str(config.get("run_name", "flashgrpo_run"))
@@ -481,7 +666,8 @@ def run_training(config: dict[str, Any]) -> None:
     )
 
     model_dir = str(config["model"]["model_dir"])
-    attn_impl = _get(config, "model.attn_implementation", "eager")
+    attn_impl_requested = str(_get(config, "model.attn_implementation", "eager"))
+    attn_impl = _resolve_attn_implementation(attn_impl_requested)
     hf_config = AutoConfig.from_pretrained(model_dir)
     target_model = AutoModelForCausalLM.from_pretrained(
         model_dir,
@@ -512,7 +698,13 @@ def run_training(config: dict[str, Any]) -> None:
     fg = config.get("flashgrpo", {})
     reflex_cfg = config.get("reflex", {})
     reflex_enabled = bool(reflex_cfg.get("enabled", False))
-    reflex_fast_state_dim = int(reflex_cfg.get("fast_state_dim", 128)) if reflex_enabled else 0
+    reflex_state_space = str(reflex_cfg.get("state_space", "projected"))
+    reflex_fast_state_dim = (
+        int(hf_config.hidden_size)
+        if reflex_enabled and reflex_state_space == "hidden"
+        else int(reflex_cfg.get("fast_state_dim", 128)) if reflex_enabled else 0
+    )
+    medusa_reflex_fast_state_dim = 0 if reflex_state_space == "hidden" else reflex_fast_state_dim
     medusa_dtype = _dtype_from_name(str(fg.get("head_dtype", "fp32")), default=torch.float32)
     medusa_heads = MedusaHeads(
         hidden_size=hf_config.hidden_size,
@@ -524,8 +716,8 @@ def run_training(config: dict[str, Any]) -> None:
         medusa_loss_decay=float(fg.get("medusa_loss_decay", 0.8)),
         chain_bottleneck_ratio=int(fg.get("chain_bottleneck_ratio", 8)),
         chain_gate_init=float(fg.get("chain_gate_init", -3.0)),
-        reflex_fast_state_dim=reflex_fast_state_dim,
-        reflex_init_scale=float(reflex_cfg.get("init_scale", 0.25)),
+        reflex_fast_state_dim=medusa_reflex_fast_state_dim,
+        reflex_init_scale=float(reflex_cfg.get("init_scale", 0.0)),
     ).cuda()
     medusa_checkpoint = str(
         fg.get("medusa_heads_checkpoint", "")
@@ -534,6 +726,7 @@ def run_training(config: dict[str, Any]) -> None:
     )
     require_pretrained_heads = bool(fg.get("require_pretrained_heads", False))
     allow_random_init = bool(fg.get("allow_random_init", not require_pretrained_heads))
+    loaded_reflex_up = False
     if medusa_checkpoint:
         medusa_heads = MedusaHeads.from_pretrained(
             medusa_checkpoint,
@@ -542,8 +735,8 @@ def run_training(config: dict[str, Any]) -> None:
             lm_head=base.lm_head,
             chain_bottleneck_ratio=int(fg.get("chain_bottleneck_ratio", 8)),
             chain_gate_init=float(fg.get("chain_gate_init", -3.0)),
-            reflex_fast_state_dim=reflex_fast_state_dim,
-            reflex_init_scale=float(reflex_cfg.get("init_scale", 0.25)),
+            reflex_fast_state_dim=medusa_reflex_fast_state_dim,
+            reflex_init_scale=float(reflex_cfg.get("init_scale", 0.0)),
         ).cuda()
         print(f"Loaded MEDUSA heads from {medusa_checkpoint}")
     elif require_pretrained_heads and not allow_random_init:
@@ -553,12 +746,34 @@ def run_training(config: dict[str, Any]) -> None:
         )
     elif not medusa_checkpoint:
         print("Warning: MEDUSA heads are randomly initialized.")
+    loaded_keys = getattr(medusa_heads, "_loaded_compatible_keys", set())
+    loaded_reflex_up = any(str(key).startswith("reflex_up.") for key in loaded_keys)
+    reflex_injection_enabled = bool(reflex_enabled and reflex_cfg.get("proposal_injection_enabled", False))
+    if reflex_injection_enabled and reflex_state_space != "hidden":
+        allow_random_reflex = bool(reflex_cfg.get("allow_random_reflex", False))
+        if (not medusa_checkpoint or not loaded_reflex_up) and not allow_random_reflex:
+            raise RuntimeError(
+                "Reflex proposal injection is enabled, but the loaded auxiliary checkpoint does not contain "
+                "compatible reflex_up.* weights. This would run with randomly initialized/zero Reflex correction. "
+                "Pretrain Reflex first, pass that checkpoint via flashgrpo.medusa_heads_checkpoint or "
+                "aux_head_checkpoint, or disable reflex.proposal_injection_enabled for a Medusa-only baseline."
+            )
+        if getattr(medusa_heads, "reflex_up", None):
+            with torch.no_grad():
+                reflex_up_abs_sum = sum(float(up.weight.detach().float().abs().sum().cpu()) for up in medusa_heads.reflex_up)
+            if reflex_up_abs_sum <= 0.0:
+                raise RuntimeError(
+                    "Reflex proposal injection is enabled but all reflex_up weights are zero. "
+                    "Run flashgrpo/scripts/pretrain_medusa_heads.py with the Reflex warm-start config first, "
+                    "or disable reflex.proposal_injection_enabled for a baseline run."
+                )
 
     target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=float(_get(config, "training.target_lr", 1e-6)))
     medusa_optimizer = torch.optim.AdamW(
         medusa_heads.parameters(),
         lr=float(fg.get("medusa_lr", 5e-4)),
         weight_decay=float(fg.get("medusa_weight_decay", 0.0)),
+        eps=float(fg.get("medusa_adam_eps", 1e-6)),
     )
     medusa_trainer = OnlineMedusaTrainer(
         target_model,
@@ -576,16 +791,28 @@ def run_training(config: dict[str, Any]) -> None:
             chain_loss_weight=float(fg.get("chain_loss_weight", 0.0)),
             chain_loss_max_depth=int(fg.get("chain_loss_max_depth", int(fg.get("num_medusa_heads", 3)))),
             chain_bootstrap_from_medusa=bool(fg.get("chain_bootstrap_from_medusa", True)),
+            reflex_record_microbatch_size=int(config.get("aux_update", {}).get("reflex_record_microbatch_size", 256)),
+            reflex_correction_clip_norm=float(reflex_cfg.get("correction_clip_norm", 1.0)),
+            reflex_normalize_correction=bool(reflex_cfg.get("normalize_correction", True)),
+            rollback_nonfinite_update=bool(config.get("aux_update", {}).get("rollback_nonfinite_update", True)),
+            refresh_distill_weight=float(config.get("aux_update", {}).get("distill_weight", 0.7)),
+            refresh_hard_token_weight=float(config.get("aux_update", {}).get("hard_token_weight", 0.3)),
+            refresh_proximal_weight=float(config.get("aux_update", {}).get("proximal_kl_weight", 0.1)),
         ),
     )
     aux_cfg = config.get("aux_update", {})
+    default_aux_mode = "reliability_triggered" if reflex_enabled else "always"
     aux_tracker = ReliabilityTracker(
-        mode=str(aux_cfg.get("mode", "reliability_triggered")),
-        interval=int(aux_cfg.get("interval", max(1, int(fg.get("medusa_train_every", 1))))),
-        reject_weight=float(aux_cfg.get("reject_weight", 1.0)),
-        drift_threshold=float(aux_cfg.get("drift_threshold", 8.0)),
-        ema_beta=float(aux_cfg.get("ema_beta", 0.9)),
-        min_mature_records=int(aux_cfg.get("min_mature_records", 64)),
+        mode=str(aux_cfg.get("mode", default_aux_mode)),
+        calibration_iterations=int(aux_cfg.get("calibration_iterations", 20)),
+        check_interval=int(aux_cfg.get("check_interval", aux_cfg.get("interval", 20))),
+        min_records_per_head=int(aux_cfg.get("min_records_per_head", aux_cfg.get("min_mature_records", 1024))),
+        trigger_z_high=float(aux_cfg.get("trigger_z_high", aux_cfg.get("drift_threshold", 2.5))),
+        acceptance_drop_min=float(aux_cfg.get("acceptance_drop_min", 0.05)),
+        patience=int(aux_cfg.get("patience", 2)),
+        cooldown_iterations=int(aux_cfg.get("cooldown_iterations", 50)),
+        max_heads_per_event=int(aux_cfg.get("max_heads_per_event", 2)),
+        mad_floor=float(aux_cfg.get("mad_floor", 0.01)),
     )
     decoder = FlashMedusaDecoder(target_model, medusa_heads, tokenizer, _make_flash_config(config))
 
@@ -632,7 +859,16 @@ def run_training(config: dict[str, Any]) -> None:
     saved_medusa_dir = Path(_get(config, "training.saved_medusa_dir", f"outputs/{run_name}/flashgrpo_medusa"))
     saved_model_dir.mkdir(parents=True, exist_ok=True)
     saved_medusa_dir.mkdir(parents=True, exist_ok=True)
-
+    checkpoint_cfg = config.get("checkpoint", {})
+    aux_refresher = AuxiliaryHeadRefresher.from_config(
+        medusa_heads=medusa_heads,
+        trainer=medusa_trainer,
+        optimizer=medusa_optimizer,
+        save_dir=saved_medusa_dir,
+        aux_cfg=aux_cfg,
+        checkpoint_cfg=checkpoint_cfg,
+        fallback_steps=int(fg.get("medusa_update_steps_per_iter", 1)),
+    )
     logger.log({
         "phase": "run_config",
         "run_name": run_name,
@@ -645,15 +881,34 @@ def run_training(config: dict[str, Any]) -> None:
         "start_rollout_count": start_rollout_count,
         "baseline_source": "not_available",
         "method": "flashgrpo",
+        "attn_implementation_requested": attn_impl_requested,
+        "attn_implementation_resolved": attn_impl,
+        "medusa_head_dtype": str(medusa_dtype).replace("torch.", ""),
         "reflex_enabled": bool(reflex_enabled),
+        "reflex_state_space": reflex_state_space,
         "reflex_fast_state_dim": int(reflex_fast_state_dim),
+        "reflex_feedback_enabled": bool(reflex_cfg.get("feedback_enabled", False)),
+        "reflex_proposal_injection_enabled": bool(reflex_cfg.get("proposal_injection_enabled", False)),
+        "reflex_proposal_injection_scale": float(reflex_cfg.get("proposal_injection_scale", 0.0)),
+        "reflex_proposal_injection_warmup": int(reflex_cfg.get("proposal_injection_warmup", 0)),
+        "reflex_feedback_ce_gate": bool(reflex_cfg.get("feedback_ce_gate", True)),
         "aux_head_checkpoint": medusa_checkpoint,
-        "aux_update_mode": str(aux_cfg.get("mode", "reliability_triggered")),
-        "aux_update_interval": int(aux_cfg.get("interval", max(1, int(fg.get("medusa_train_every", 1))))),
+        "aux_checkpoint_has_reflex_up": bool(loaded_reflex_up),
+        "aux_update_mode": str(aux_cfg.get("mode", default_aux_mode)),
+        "aux_calibration_iterations": int(aux_cfg.get("calibration_iterations", 20)),
+        "aux_update_interval": int(aux_cfg.get("check_interval", aux_cfg.get("interval", 20))),
+        "aux_update_steps": aux_refresher.config.steps,
+        "aux_update_before_policy_step": True,
+        "aux_update_defer_until_reflex_warmup_complete": bool(aux_cfg.get("defer_until_reflex_warmup_complete", False)),
+        "medusa_lr": float(fg.get("medusa_lr", 5e-4)),
+        "medusa_adam_eps": float(fg.get("medusa_adam_eps", 1e-6)),
+        "save_aux_every_grpo_iters": int(checkpoint_cfg.get("save_aux_every_grpo_iters", 0)),
+        "save_aux_on_triggered_update": bool(checkpoint_cfg.get("save_aux_on_triggered_update", False)),
     })
 
     acc = Accumulator(
-        messages=[],
+        token_ids=[],
+        prompt_lens=[],
         rewards=[],
         std_rewards=[],
         used_items=start_used_items,
@@ -665,7 +920,14 @@ def run_training(config: dict[str, Any]) -> None:
     total_train_time = 0.0
     total_head_update_time = 0.0
     total_rollout_tokens = 0
+    total_accepted_length = 0
+    total_decoded_steps = 0
+    total_accepted_medusa_tokens = 0
+    total_proposed_medusa_tokens = 0
+    total_verify_rounds = 0
     rollout_count = start_rollout_count
+    required_used_items = max(1, batch_size * accumulation_steps)
+    pending_aux_record_batches: list[dict] = []
     start_time = time.time()
 
     epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Epoch", dynamic_ncols=True)
@@ -690,8 +952,17 @@ def run_training(config: dict[str, Any]) -> None:
                 continue
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
-            messages = batch["messages"]
             answers = batch["answers"]
+            online_aux_enabled = bool(fg.get("online_medusa", True))
+            generation_step_for_batch = int(rollout_count)
+            next_grpo_step = acc.used_items // required_used_items + 1
+            aux_refresh_allowed, aux_refresh_skip_reason = _aux_refresh_allowed_for_generation_step(config, generation_step_for_batch)
+            collect_reflex_aux_cache = bool(
+                online_aux_enabled
+                and aux_refresher.config.reflex_cache_enabled
+                and aux_refresh_allowed
+                and aux_tracker.should_evaluate(next_grpo_step)
+            )
 
             target_model.eval()
             medusa_heads.eval()
@@ -704,9 +975,10 @@ def run_training(config: dict[str, Any]) -> None:
                         repeated_generate_nums=repeated_generate_nums,
                         max_length=max_length,
                         statistical_time=statistical_time,
-                        generation_step=rollout_count,
+                        generation_step=generation_step_for_batch,
                         enabled=generation_oom_split_retry,
                         max_splits=generation_oom_max_splits,
+                        collect_reflex_aux_cache=collect_reflex_aux_cache,
                     )
             except RuntimeError as exc:
                 if _is_cuda_oom(exc) and bool(_get(config, "training.save_on_exception", True)):
@@ -730,40 +1002,33 @@ def run_training(config: dict[str, Any]) -> None:
             medusa_heads.train()
             total_generate_time += outputs["total_time_cost"]
             total_rollout_tokens += sum(len(x) for x in outputs["generated_token_ids"])
+            total_accepted_length += int(outputs.get("total_acc_length", 0))
+            total_decoded_steps += int(outputs.get("total_decoded_token_num", 0))
+            total_accepted_medusa_tokens += int(outputs.get("total_accepted_medusa_tokens", 0))
+            total_proposed_medusa_tokens += int(outputs.get("total_proposed_medusa_tokens", 0))
+            total_verify_rounds += int(outputs.get("total_verify_rounds", 0))
             decoded_sequences = [tokenizer.decode(x, skip_special_tokens=True) for x in outputs["generated_token_ids"]]
+            prompt_ids_cpu = input_ids.detach().cpu()
+            prompt_mask_cpu = attention_mask.detach().cpu().bool()
+            prompt_token_rows = [
+                prompt_ids_cpu[row][prompt_mask_cpu[row]].tolist()
+                for row in range(prompt_ids_cpu.shape[0])
+            ]
             token_lengths = [len(item) for item in outputs["generated_token_ids"]]
             length_stdev = stdev(token_lengths) if len(token_lengths) > 1 else 0.0
             length_mean = mean(token_lengths) if token_lengths else 0.0
 
-            head_stats = {"medusa_loss": 0.0, "head_update_time": 0.0, "head_update_tokens": 0}
-            aux_decision = aux_tracker.update(outputs.get("reflex_metrics", {}), rollout_count)
-            if bool(fg.get("online_medusa", True)) and aux_decision.triggered:
-                pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-                head_ids, head_mask, head_loss_mask = build_medusa_update_batch(
-                    input_ids.detach().cpu(),
-                    attention_mask.detach().cpu(),
-                    outputs["generated_token_ids"],
-                    repeated_generate_nums,
-                    int(pad_id or 0),
-                )
-                repeat_head_updates = max(1, int(fg.get("medusa_update_steps_per_iter", 1)))
-                merged_head_stats: dict[str, float] = {}
-                for _ in range(repeat_head_updates):
-                    head_stats = medusa_trainer.update(head_ids, head_mask, head_loss_mask)
-                    for key, value in head_stats.items():
-                        if isinstance(value, (int, float)):
-                            merged_head_stats[key] = merged_head_stats.get(key, 0.0) + float(value)
-                head_stats = {
-                    key: value / repeat_head_updates
-                    for key, value in merged_head_stats.items()
-                    if key not in {"head_update_time", "head_update_tokens"}
-                }
-                head_stats["head_update_time"] = merged_head_stats.get("head_update_time", 0.0)
-                head_stats["head_update_tokens"] = merged_head_stats.get("head_update_tokens", 0.0)
-                if head_stats["head_update_time"] > 0:
-                    head_stats["head_update_tokens_per_sec"] = head_stats["head_update_tokens"] / head_stats["head_update_time"]
-                total_head_update_time += head_stats.get("head_update_time", 0.0)
-                maybe_empty_cuda_cache(config)
+            head_stats = {"medusa_loss": 0.0, "head_update_time": 0.0, "head_update_tokens": 0, "aux_update_deferred": False}
+            aux_tracker.observe(outputs.get("reflex_metrics", {}))
+            reflex_records = outputs.get("reflex_aux_records", {})
+            if collect_reflex_aux_cache and reflex_records.get("hidden") is not None:
+                pending_aux_record_batches.append(reflex_records)
+            aux_decision = ReliabilityDecision(
+                evaluated=False,
+                triggered=False,
+                reason=aux_refresh_skip_reason or "await_grpo_boundary",
+                head_metrics=(outputs.get("reflex_metrics", {}) or {}).get("per_head", {}),
+            )
             head_stats["aux_update_evaluated"] = bool(aux_decision.evaluated)
             head_stats["aux_update_triggered"] = bool(aux_decision.triggered)
             head_stats["aux_update_reason"] = aux_decision.reason
@@ -772,13 +1037,11 @@ def run_training(config: dict[str, Any]) -> None:
 
             for prompt_idx in range(len(answers)):
                 decoded_for_prompt = []
-                new_messages = []
                 ground_truth = answers[prompt_idx]
                 for repeat_idx in range(repeated_generate_nums):
                     seq_idx = prompt_idx * repeated_generate_nums + repeat_idx
                     decoded = decoded_sequences[seq_idx]
                     decoded_for_prompt.append(decoded)
-                    new_messages.append(messages[prompt_idx] + [{"role": "assistant", "content": decoded}])
                 format_rewards = format_reward_func(decoded_for_prompt)
                 answer_rewards = accuracy_reward_func(decoded_for_prompt, [ground_truth] * repeated_generate_nums)
                 rewards = np.array([0.2 * f + a for f, a in zip(format_rewards, answer_rewards)])
@@ -789,7 +1052,11 @@ def run_training(config: dict[str, Any]) -> None:
                         ignored_incorrect += 1
                     continue
                 std_rewards = (rewards - rewards.mean()) / rewards.std()
-                acc.messages += new_messages
+                prompt_tokens = prompt_token_rows[prompt_idx]
+                for repeat_idx in range(repeated_generate_nums):
+                    seq_idx = prompt_idx * repeated_generate_nums + repeat_idx
+                    acc.token_ids.append(prompt_tokens + [int(token) for token in outputs["generated_token_ids"][seq_idx]])
+                    acc.prompt_lens.append(len(prompt_tokens))
                 acc.rewards += rewards.tolist()
                 acc.std_rewards += std_rewards.tolist()
                 acc.used_items += 1
@@ -831,6 +1098,11 @@ def run_training(config: dict[str, Any]) -> None:
                 "aux_update_reason": head_stats.get("aux_update_reason", ""),
                 "aux_triggered_heads": head_stats.get("aux_triggered_heads", []),
                 "aux_drift_scores": head_stats.get("aux_drift_scores", {}),
+                "aux_update_deferred": head_stats.get("aux_update_deferred", False),
+                "aux_pending_jobs": 0,
+                "aux_pending_jobs_dropped": head_stats.get("aux_pending_jobs_dropped", 0),
+                "reflex_aux_cache_collected": bool(collect_reflex_aux_cache),
+                "reflex_aux_cached_records": int((outputs.get("reflex_aux_records", {}).get("hidden").shape[0]) if outputs.get("reflex_aux_records", {}).get("hidden") is not None else 0),
                 "reflex": outputs.get("reflex_metrics", {}),
                 "mean_response_length": length_mean,
                 "response_length_variance": float(np.var(token_lengths)) if token_lengths else 0.0,
@@ -860,24 +1132,59 @@ def run_training(config: dict[str, Any]) -> None:
                 refresh=False,
             )
 
-            if not acc.messages:
+            if not acc.token_ids:
                 continue
             pending = acc.used_items - acc.used_items_at_last_update
-            required = max(1, batch_size * accumulation_steps)
+            required = required_used_items
             if pending < required:
                 continue
 
-            texts = tokenizer.apply_chat_template(acc.messages, tokenize=False, add_generation_prompt=False)
-            tokenized = tokenizer(texts, padding=False)
-            loss_mask = []
-            for message, ids in zip(acc.messages, tokenized.input_ids):
-                prompt_text = tokenizer.apply_chat_template(message[:-1], tokenize=False, add_generation_prompt=True)
-                prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=False))
-                loss_mask.append([0] * max(prompt_len - 1, 0) + [1] * max(len(ids) - prompt_len + 1, 0))
-
-            sorted_pairs = sorted(zip(tokenized.input_ids, tokenized.attention_mask, loss_mask, acc.std_rewards), key=lambda x: len(x[0]))
-            all_input_ids, all_attention_mask, all_loss_mask, all_rewards = map(list, zip(*sorted_pairs))
             step = acc.used_items // required
+            aux_decision = aux_tracker.update(None, step)
+            merged_reflex_records = _merge_reflex_record_batches(
+                pending_aux_record_batches,
+                aux_refresher.config.max_cached_records,
+            )
+            pending_aux_record_batches.clear()
+            boundary_aux_stats: dict[str, Any] = {
+                "phase": "auxiliary_decision",
+                "epoch": epoch + 1,
+                "step": step,
+                "rollout_count": rollout_count,
+                "aux_update_evaluated": bool(aux_decision.evaluated),
+                "aux_update_triggered": bool(aux_decision.triggered),
+                "aux_update_reason": aux_decision.reason,
+                "aux_triggered_heads": list(aux_decision.triggered_heads),
+                "aux_drift_scores": dict(aux_decision.drift_scores),
+            }
+            if online_aux_enabled and aux_decision.triggered:
+                refresh_start = time.time()
+                refresh_stats = aux_refresher.maybe_update(
+                    decision=aux_decision,
+                    head_ids=None,
+                    head_mask=None,
+                    head_loss_mask=None,
+                    enabled=True,
+                    grpo_step=step,
+                    rollout_count=rollout_count,
+                    reflex_records=merged_reflex_records,
+                    tracker_state=aux_tracker.state_dict(),
+                )
+                boundary_aux_stats.update(refresh_stats)
+                boundary_aux_stats["phase"] = "auxiliary_update"
+                refresh_wall_time = time.time() - refresh_start
+                boundary_aux_stats["aux_update_wall_time"] = refresh_wall_time
+                total_head_update_time += refresh_wall_time
+                maybe_empty_cuda_cache(config)
+            logger.log(boundary_aux_stats)
+
+            all_attention = [[1] * len(ids) for ids in acc.token_ids]
+            loss_mask = [
+                [0] * max(prompt_len - 1, 0) + [1] * max(len(ids) - prompt_len + 1, 0)
+                for ids, prompt_len in zip(acc.token_ids, acc.prompt_lens)
+            ]
+            sorted_pairs = sorted(zip(acc.token_ids, all_attention, loss_mask, acc.std_rewards), key=lambda x: len(x[0]))
+            all_input_ids, all_attention_mask, all_loss_mask, all_rewards = map(list, zip(*sorted_pairs))
             batch_old_logps.clear()
             batch_ref_logps.clear()
 
@@ -923,7 +1230,7 @@ def run_training(config: dict[str, Any]) -> None:
                         old_logps=old_logps,
                         ref_logps=ref_logps,
                         chunk_size=logps_chunk_size,
-                        loss_scale=1.0 / max(len(acc.messages), 1),
+                        loss_scale=1.0 / max(len(acc.token_ids), 1),
                     )
                     if grpo_iteration == 0:
                         batch_old_logps.append(old_logps)
@@ -978,15 +1285,37 @@ def run_training(config: dict[str, Any]) -> None:
                 logger.log(grpo_log)
                 grpo_bar.set_postfix(step=step, train=format_duration(train_elapsed), reward=f"{grpo_log['mean_reward']:.3f}", refresh=False)
 
+            aux_periodic_path = aux_refresher.maybe_save_periodic(
+                grpo_step=step,
+                rollout_count=rollout_count,
+                tracker_state=aux_tracker.state_dict(),
+            )
+            if aux_periodic_path:
+                logger.log({
+                    "phase": "auxiliary_checkpoint",
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "rollout_count": rollout_count,
+                    "path": aux_periodic_path,
+                    "reason": "periodic",
+                })
+
             acc.used_items_at_last_update = acc.used_items
-            acc.messages.clear()
+            acc.token_ids.clear()
+            acc.prompt_lens.clear()
             acc.rewards.clear()
             acc.std_rewards.clear()
             batch_old_logps.clear()
             batch_ref_logps.clear()
             if save_steps > 0 and step > 0 and step % save_steps == 0:
                 target_model.save_pretrained(saved_model_dir / f"step{step}")
-                medusa_heads.save_pretrained(saved_medusa_dir / f"step{step}")
+                aux_refresher.save_aux_checkpoint(
+                    f"step{step}",
+                    grpo_step=step,
+                    rollout_count=rollout_count,
+                    decision=None,
+                    tracker_state=aux_tracker.state_dict(),
+                )
 
         epoch_bar.set_postfix(
             used=acc.used_items,
@@ -999,7 +1328,13 @@ def run_training(config: dict[str, Any]) -> None:
 
     final_step = max(0, acc.used_items // max(1, batch_size * accumulation_steps))
     target_model.save_pretrained(saved_model_dir / f"step{final_step}")
-    medusa_heads.save_pretrained(saved_medusa_dir / f"step{final_step}")
+    aux_refresher.save_aux_checkpoint(
+        f"step{final_step}",
+        grpo_step=final_step,
+        rollout_count=rollout_count,
+        decision=None,
+        tracker_state=aux_tracker.state_dict(),
+    )
     summary = {
         "run_name": run_name,
         "final_step": final_step,
@@ -1007,6 +1342,13 @@ def run_training(config: dict[str, Any]) -> None:
         "total_generate_time_s": total_generate_time,
         "total_train_time_s": total_train_time,
         "total_head_update_time_s": total_head_update_time,
+        "total_wall_time_s": time.time() - start_time,
+        "total_rollout_tokens": int(total_rollout_tokens),
+        "generation_tokens_per_s": total_rollout_tokens / max(total_generate_time, 1e-9),
+        "average_accept_length": total_accepted_length / max(total_decoded_steps, 1),
+        "medusa_acceptance_rate": total_accepted_medusa_tokens / max(total_proposed_medusa_tokens, 1),
+        "total_verify_rounds": int(total_verify_rounds),
+        "rollout_batches": int(rollout_count - start_rollout_count),
         "metrics_jsonl": str(logger.jsonl_path),
         "metrics_csv": str(logger.csv_path),
         "saved_model_dir": str(saved_model_dir / f"step{final_step}"),

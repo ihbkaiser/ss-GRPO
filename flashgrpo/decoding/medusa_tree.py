@@ -163,8 +163,49 @@ def build_dense_tree(root_token: int, medusa_logits: list[torch.Tensor], plan: T
 
 
 def build_batch_trees(root_tokens: torch.Tensor, medusa_logits: list[torch.Tensor], plan: TreePlan) -> list[CandidateTree]:
-    trees = []
-    for batch_idx in range(root_tokens.shape[0]):
-        per_head_logits = [head_logits[batch_idx] for head_logits in medusa_logits[: plan.active_heads]]
-        trees.append(build_dense_tree(int(root_tokens[batch_idx].item()), per_head_logits, plan))
+    """Build standard MEDUSA trees with one top-k launch per depth.
+
+    The previous implementation launched ``topk`` and synchronized CUDA once
+    per sequence and depth. Standard MEDUSA heads are independent of the tree
+    parent, so their top-k candidates can be extracted for the whole batch at
+    once and the small tree structures can then be assembled on CPU.
+    """
+
+    batch_size = int(root_tokens.shape[0])
+    root_cpu = root_tokens.detach().cpu().tolist()
+    candidates: list[tuple[list[list[int]], list[list[float]]]] = []
+    for depth_idx, requested_k in enumerate(plan.topk_by_depth[: plan.active_heads]):
+        if depth_idx >= len(medusa_logits):
+            break
+        logits = medusa_logits[depth_idx]
+        k = min(max(0, int(requested_k)), int(logits.shape[-1]))
+        if k <= 0:
+            break
+        values, indices = torch.topk(logits.float(), k=k, dim=-1)
+        candidates.append((indices.detach().cpu().tolist(), values.detach().cpu().tolist()))
+
+    trees: list[CandidateTree] = []
+    for row in range(batch_size):
+        tokens = [int(root_cpu[row])]
+        parents = [-1]
+        depths = [1]
+        scores = [0.0]
+        current_parents = [0]
+        for depth_idx, (token_rows, score_rows) in enumerate(candidates):
+            next_parents: list[int] = []
+            for parent in current_parents:
+                for token, score in zip(token_rows[row], score_rows[row]):
+                    tokens.append(int(token))
+                    parents.append(int(parent))
+                    depths.append(depth_idx + 2)
+                    scores.append(float(score))
+                    next_parents.append(len(tokens) - 1)
+                    if len(tokens) >= plan.node_budget_per_seq:
+                        break
+                if len(tokens) >= plan.node_budget_per_seq:
+                    break
+            current_parents = next_parents
+            if not current_parents or len(tokens) >= plan.node_budget_per_seq:
+                break
+        trees.append(CandidateTree(tokens=tokens, parents=parents, depths=depths, scores=scores))
     return trees
