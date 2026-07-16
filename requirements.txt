@@ -1,15 +1,45 @@
+# B200 / FlashGRPO runtime.
+#
+# This repository is often run on an internal/offline B200 image that already
+# ships CUDA, torch, torchvision, torchaudio, vLLM, and sometimes flash-attn.
+# Do not force pip to reach download.pytorch.org from this file.
+#
+# Recommended install on the B200 machine:
+#   python -m pip install "setuptools>=77.0.3,<81.0.0" wheel packaging ninja
+#   python -m pip install -r requirements.txt
+#
+# Torch / CUDA:
+#   Use the torch build already provided by the B200 image, for example
+#   torch==2.11.0+cu130. Installing torch from public PyTorch URLs will fail in
+#   offline/internal-mirror environments and may downgrade a working image.
+#
+# FlashAttention 2:
+#   Optional but recommended for speed. If it is already installed, the code
+#   will use it. If it is missing, FlashGRPO falls back to SDPA. Install from
+#   your internal wheel mirror if available, matching the preinstalled torch/CUDA
+#   build, e.g. flash_attn-*.whl for cp312/cu130/torch2.11.
+
 transformers==4.49.0
-torch==2.8.0
 peft==0.17.1
-datasets==4.0.0
-nest-asyncio==1.6.0
-safetensors==0.6.2
-numpy
-pandas
-latex2sympy2_extended
-math_verify
-asyncio
-tqdm
-pathlib
-datetime
-statistics
+accelerate>=1.2.0
+datasets>=4.0.0
+safetensors>=0.6.2
+tokenizers>=0.21.0
+sentencepiece>=0.2.0
+protobuf>=5.28.0
+huggingface-hub>=0.30.0
+
+nvidia-ml-py>=12.560.30
+
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+pyyaml>=6.0.2
+tqdm>=4.66.0
+packaging>=24.0
+ninja>=1.11.1
+
+latex2sympy2-extended>=1.10.0
+math-verify>=0.7.0
+antlr4-python3-runtime>=4.13.2
+sympy>=1.13.0

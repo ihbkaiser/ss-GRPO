@@ -2,7 +2,7 @@ inherits: reflexgrpo_optimized_qwen25_1p5b_simplelrabel3to5.yaml
 
 method: reflexgrpo_optimized_b200
 run_name: reflexgrpo_optimized_b200_qwen25_1p5b_simplelrabel3to5
-aux_head_checkpoint: outputs/flashgrpo_pretrained_extractkv/medusa_heads/step50
+aux_head_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_1p5b
 
 model:
   dtype: bf16
@@ -22,6 +22,7 @@ training:
   saved_medusa_dir: outputs/reflexgrpo_optimized_b200_qwen25_1p5b_simplelrabel3to5/medusa_heads
 
 flashgrpo:
+  medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_1p5b
   # B200 can carry a wider speculative tree. With batch_size=16 and
   # repeated_generate_nums=8, active concurrency starts around 128.
   cpeak_nodes: 768

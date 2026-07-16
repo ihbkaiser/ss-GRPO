@@ -13,5 +13,13 @@ logs/
 runs/
 data/
 models/
+!flashgrpo/models/
+!flashgrpo/models/**
+flashgrpo/models/__pycache__/
+flashgrpo/models/**/*.pyc
+!flashgrpo_b200/models/
+!flashgrpo_b200/models/**
+flashgrpo_b200/models/__pycache__/
+flashgrpo_b200/models/**/*.pyc
 outputs/
 !outputs/qwen25_1.5b_inst_simplerl/fastgrpo_target/step333/README.md
