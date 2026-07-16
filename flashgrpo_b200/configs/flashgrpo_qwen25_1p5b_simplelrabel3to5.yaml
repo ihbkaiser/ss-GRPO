@@ -16,8 +16,8 @@ generation:
   temperature: 1.0
   top_p: 0.95
   top_k:
-  max_prompt_length: 4096
-  max_length: 2048
+  max_prompt_length: 2048
+  max_length: 4096
   repeated_generate_nums: 8
 
 training:

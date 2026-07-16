@@ -8,7 +8,10 @@ model:
   model_dir: models/Qwen2.5-7B-Instruct
   model_type: qwen2
   dtype: bf16
-  attn_implementation: flash_attention_2
+  # MEDUSA verification uses an arbitrary 4D ancestor mask. PyTorch SDPA can
+  # fuse this path on B200; HF FlashAttention-2 only supports causal/padding
+  # masks and otherwise falls back or rejects the tree mask.
+  attn_implementation: sdpa
 
 training:
   saved_model_dir: outputs/reflexgrpo_b200_qwen25_7b/target_lora
@@ -16,6 +19,31 @@ training:
 
 flashgrpo:
   medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b
+  # Throughput-first query budget. At the initial B_cur=64 this gives one
+  # MEDUSA continuation per sequence (128 target query rows total); deeper
+  # heads turn on automatically as concurrency falls. A larger fixed budget
+  # raised raw AAL but spent more target FLOPs per accepted output token.
+  cpeak_nodes: 128
+  auto_tune_cpeak_enabled: true
+  auto_tune_cpeak_candidates: [128, 192, 256, 384, 512, 768]
+  auto_tune_cpeak_trials_per_candidate: 3
+  auto_tune_cpeak_start_rollout: 0
+  max_tree_nodes_per_seq: 10
+  adaptive_depth_weight_decay: 0.5
+  # Keep a BF16 read-only rollout copy while the auxiliary optimizer retains
+  # FP32 master weights. It is synchronized only after a committed refresh.
+  inference_head_mirror: true
+  inference_head_dtype: bf16
+  head_inference_autocast: false
+  project_internal_tree_logits_only: true
+  inplace_kv_compaction: true
+
+reflex:
+  # B200 target verification is fast enough that CPU/GPU feedback hand-offs
+  # become visible. Sampling every eighth round retains online Reflex updates
+  # while avoiding redundant top-32 distribution reconstruction.
+  feedback_stride: 8
+  feedback_stride_min: 8
 
 logging:
   log_dir: logs/flashgrpo_b200/reflexgrpo_b200_qwen25_7b

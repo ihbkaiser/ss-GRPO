@@ -311,6 +311,18 @@ class ReflexStateManager:
             return self.effective_updates.new_zeros((0,))
         return self.effective_updates.index_select(0, ids)
 
+    def get_state_and_effective_updates(
+        self,
+        sequence_ids: Iterable[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ids = self._ids(sequence_ids)
+        if ids.numel() == 0:
+            return (
+                self.states.new_zeros((0, self.fast_state_dim)),
+                self.effective_updates.new_zeros((0,)),
+            )
+        return self.states.index_select(0, ids), self.effective_updates.index_select(0, ids)
+
     @torch.no_grad()
     def advance_token(
         self,
@@ -318,6 +330,8 @@ class ReflexStateManager:
         feedback: torch.Tensor,
         has_feedback: torch.Tensor,
         effective_mass: torch.Tensor,
+        *,
+        feedback_present: bool | None = None,
     ) -> torch.Tensor:
         """Apply exactly one decay/update for one actual token per sequence."""
 
@@ -326,6 +340,15 @@ class ReflexStateManager:
             return self.states.new_zeros((0,))
         if feedback.shape != (ids.numel(), self.fast_state_dim):
             raise ValueError("Feedback must be [num_sequences, hidden_size]")
+
+        if feedback_present is False:
+            # Exact no-feedback recurrence. Avoid variance normalization,
+            # clipping, and several tiny kernels for positions where no cached
+            # prediction matures; multiplying a finite clipped state by rho
+            # cannot violate the numerical bounds.
+            current = self.states.index_select(0, ids)
+            self.states.index_copy_(0, ids, float(self.rho) * current)
+            return self.states.new_zeros((ids.numel(),))
 
         feedback = torch.nan_to_num(
             feedback.to(device=self.states.device, dtype=torch.float32),

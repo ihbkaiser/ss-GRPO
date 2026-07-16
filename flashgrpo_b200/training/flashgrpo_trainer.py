@@ -6,7 +6,7 @@ import time
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean, stdev
+from statistics import mean, median, stdev
 from typing import Any
 
 import numpy as np
@@ -50,15 +50,53 @@ def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.d
     return default
 
 
-def _resolve_attn_implementation(requested: str | None) -> str:
+def _resolve_attn_implementation(requested: str | None, model_config=None) -> str:
     requested = str(requested or "eager")
     if requested == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        uses_sliding_window = bool(getattr(model_config, "use_sliding_window", False))
+        fallback = "eager" if uses_sliding_window else "sdpa"
         print(
             "Warning: model.attn_implementation=flash_attention_2 was requested, "
-            "but flash_attn is not installed in this environment. Falling back to sdpa."
+            f"but flash_attn is not installed in this environment. Falling back to {fallback}."
         )
-        return "sdpa"
+        return fallback
     return requested
+
+
+@torch.no_grad()
+def _sync_medusa_inference_mirror(master: MedusaHeads, mirror: MedusaHeads) -> None:
+    source = master.state_dict()
+    destination = mirror.state_dict()
+    if source.keys() != destination.keys():
+        raise RuntimeError("MEDUSA inference mirror does not match the trainable auxiliary heads")
+    for key, target in destination.items():
+        value = source[key]
+        target.copy_(value.to(device=target.device, dtype=target.dtype), non_blocking=True)
+
+
+def _build_medusa_inference_mirror(
+    master: MedusaHeads,
+    *,
+    dtype: torch.dtype,
+    lm_head,
+) -> MedusaHeads:
+    mirror = MedusaHeads(
+        hidden_size=master.hidden_size,
+        vocab_size=master.vocab_size,
+        num_heads=master.num_heads,
+        dtype=dtype,
+        tie_lm_head=master.tie_lm_head,
+        lm_head=lm_head,
+        medusa_loss_decay=master.medusa_loss_decay,
+        chain_bottleneck_ratio=master.chain_bottleneck_ratio,
+        chain_gate_init=master.chain_gate_init,
+        reflex_fast_state_dim=master.reflex_fast_state_dim,
+        reflex_init_scale=master.reflex_init_scale,
+    ).to(device=next(master.parameters()).device)
+    _sync_medusa_inference_mirror(master, mirror)
+    mirror.requires_grad_(False)
+    mirror.eval()
+    return mirror
 
 
 class TrainDataCollator:
@@ -97,6 +135,79 @@ class TrainDataCollator:
             "attention_mask": tokenized["attention_mask"],
             "messages": messages,
             "answers": answers,
+        }
+
+
+class CpeakRolloutTuner:
+    """Select a hardware-efficient tree budget from real rollout throughput."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        candidates: list[int],
+        trials_per_candidate: int,
+        start_rollout: int,
+        default_cpeak: int,
+    ):
+        unique = []
+        for value in candidates:
+            value = max(1, int(value))
+            if value not in unique:
+                unique.append(value)
+        self.enabled = bool(enabled and unique)
+        self.candidates = unique or [max(1, int(default_cpeak))]
+        self.trials_per_candidate = max(1, int(trials_per_candidate))
+        self.start_rollout = max(0, int(start_rollout))
+        self.default_cpeak = max(1, int(default_cpeak))
+        self.scores: dict[int, list[float]] = {value: [] for value in self.candidates}
+        self.selected: int | None = None
+        self.resume_without_history = False
+
+    @property
+    def tuning_rollouts(self) -> int:
+        return len(self.candidates) * self.trials_per_candidate
+
+    def budget_for(self, rollout_count: int) -> tuple[int, bool]:
+        if not self.enabled:
+            return self.default_cpeak, False
+        offset = int(rollout_count) - self.start_rollout
+        if offset < 0:
+            return self.default_cpeak, False
+        if self.selected is not None:
+            return self.selected, False
+        if offset >= self.tuning_rollouts and not any(self.scores.values()):
+            # A resumed run cannot reconstruct measurements from the previous
+            # process. Keep the configured budget instead of making up a vote.
+            self.resume_without_history = True
+            self.selected = self.default_cpeak
+            return self.selected, False
+        return self.candidates[offset % len(self.candidates)], True
+
+    def observe(self, cpeak: int, *, output_tokens: int, elapsed_s: float, tuning: bool) -> bool:
+        if not self.enabled or not tuning or self.selected is not None:
+            return False
+        score = float(output_tokens) / max(float(elapsed_s), 1e-9)
+        self.scores[int(cpeak)].append(score)
+        if not all(len(values) >= self.trials_per_candidate for values in self.scores.values()):
+            return False
+        self.selected = max(
+            self.candidates,
+            key=lambda value: (median(self.scores[value]), -value),
+        )
+        return True
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "candidates": list(self.candidates),
+            "trials_per_candidate": int(self.trials_per_candidate),
+            "selected": self.selected,
+            "median_tokens_per_s": {
+                str(value): (median(scores) if scores else 0.0)
+                for value, scores in self.scores.items()
+            },
+            "resume_without_history": bool(self.resume_without_history),
         }
 
 
@@ -282,6 +393,8 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
     total_accepted = sum(int(row.get("total_accepted_medusa_tokens", row.get("total_accepted_draft_tokens", 0))) for row in rows)
     total_proposed = sum(int(row.get("total_proposed_medusa_tokens", row.get("total_proposed_draft_tokens", 0))) for row in rows)
     total_verify = sum(int(row.get("total_verify_rounds", 0)) for row in rows)
+    tree_query_rows = sum(int(row.get("tree_query_rows", 0)) for row in rows)
+    tree_lm_head_rows = sum(int(row.get("tree_lm_head_rows", 0)) for row in rows)
     total_time = sum(float(row.get("total_time_cost", 0.0) or 0.0) for row in rows)
     reflex_metrics = _merge_reflex_metrics([row.get("reflex_metrics", {}) for row in rows])
     out = {
@@ -300,6 +413,9 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "total_verify_rounds": int(total_verify),
         "average_active_batch_size": _weighted_average(rows, "average_active_batch_size", "total_verify_rounds"),
         "average_tree_nodes_per_seq": _weighted_average(rows, "average_tree_nodes_per_seq", "total_verify_rounds"),
+        "tree_query_rows": int(tree_query_rows),
+        "tree_lm_head_rows": int(tree_lm_head_rows),
+        "tree_lm_head_row_ratio": tree_lm_head_rows / max(tree_query_rows, 1),
         "accept_length_histogram": _merge_int_dicts(rows, "accept_length_histogram"),
         "medusa_accept_by_depth": _merge_int_dicts(rows, "medusa_accept_by_depth"),
         "medusa_proposed_by_depth": _merge_int_dicts(rows, "medusa_proposed_by_depth"),
@@ -577,6 +693,10 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         adaptive_confidence_low=float(fg.get("adaptive_confidence_low", 0.15)),
         adaptive_confidence_high=float(fg.get("adaptive_confidence_high", 0.45)),
         adaptive_min_topk_by_depth=tuple(fg.get("adaptive_min_topk_by_depth", [1, 1, 1])),
+        adaptive_depth_weight_decay=float(fg.get("adaptive_depth_weight_decay", 0.5)),
+        head_inference_autocast=bool(fg.get("head_inference_autocast", True)),
+        project_internal_tree_logits_only=bool(fg.get("project_internal_tree_logits_only", True)),
+        inplace_kv_compaction=bool(fg.get("inplace_kv_compaction", True)),
         reflex_enabled=bool(reflex.get("enabled", False)),
         reflex_state_space=str(reflex.get("state_space", "projected")),
         reflex_fast_state_dim=int(reflex.get("fast_state_dim", 128)),
@@ -668,14 +788,14 @@ def run_training(config: dict[str, Any]) -> None:
 
     model_dir = str(config["model"]["model_dir"])
     attn_impl_requested = str(_get(config, "model.attn_implementation", "eager"))
-    attn_impl = _resolve_attn_implementation(attn_impl_requested)
+    hf_config = AutoConfig.from_pretrained(model_dir)
+    attn_impl = _resolve_attn_implementation(attn_impl_requested, hf_config)
     model_dtype_name = str(_get(config, "model.dtype", "auto")).lower()
     model_torch_dtype = (
         _dtype_from_name(model_dtype_name)
         if model_dtype_name in {"fp16", "bf16", "fp32"}
         else "auto"
     )
-    hf_config = AutoConfig.from_pretrained(model_dir)
     target_model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=model_torch_dtype,
@@ -821,7 +941,24 @@ def run_training(config: dict[str, Any]) -> None:
         max_heads_per_event=int(aux_cfg.get("max_heads_per_event", 2)),
         mad_floor=float(aux_cfg.get("mad_floor", 0.01)),
     )
-    decoder = FlashMedusaDecoder(target_model, medusa_heads, tokenizer, _make_flash_config(config))
+    inference_mirror_enabled = bool(fg.get("inference_head_mirror", False))
+    inference_medusa_dtype = _dtype_from_name(
+        str(fg.get("inference_head_dtype", model_dtype_name)),
+        default=autocast_dtype(base),
+    )
+    inference_medusa_heads = medusa_heads
+    if inference_mirror_enabled:
+        inference_medusa_heads = _build_medusa_inference_mirror(
+            medusa_heads,
+            dtype=inference_medusa_dtype,
+            lm_head=base.lm_head,
+        )
+        print(
+            "Using a read-only MEDUSA inference mirror "
+            f"({str(inference_medusa_dtype).replace('torch.', '')}); auxiliary master remains "
+            f"{str(medusa_dtype).replace('torch.', '')}."
+        )
+    decoder = FlashMedusaDecoder(target_model, inference_medusa_heads, tokenizer, _make_flash_config(config))
 
     qas = get_train_QAs(str(_get(config, "data.train_option", "simplelr_abel_level3to5")))
     # Keep FastGRPO semantics: sample_num is a logging window, not a dataset
@@ -849,6 +986,16 @@ def run_training(config: dict[str, Any]) -> None:
     start_rollout_count = int(_get(config, "training.start_rollout_count", 0))
     if start_batch > 0 and start_rollout_count <= 0:
         start_rollout_count = start_batch
+    cpeak_tuner = CpeakRolloutTuner(
+        enabled=bool(fg.get("auto_tune_cpeak_enabled", False)),
+        candidates=[int(value) for value in fg.get("auto_tune_cpeak_candidates", [])],
+        trials_per_candidate=int(fg.get("auto_tune_cpeak_trials_per_candidate", 3)),
+        start_rollout=int(fg.get("auto_tune_cpeak_start_rollout", 0)),
+        default_cpeak=int(fg.get("cpeak_nodes", 64)),
+    )
+    if cpeak_tuner.enabled and start_rollout_count > cpeak_tuner.start_rollout:
+        cpeak_tuner.resume_without_history = True
+        cpeak_tuner.selected = cpeak_tuner.default_cpeak
     repeated_generate_nums = int(_get(config, "generation.repeated_generate_nums", 8))
     max_length = int(_get(config, "generation.max_length", 2048))
     accumulation_steps = int(_get(config, "training.accumulation_steps", 4))
@@ -893,6 +1040,14 @@ def run_training(config: dict[str, Any]) -> None:
         "attn_implementation_requested": attn_impl_requested,
         "attn_implementation_resolved": attn_impl,
         "medusa_head_dtype": str(medusa_dtype).replace("torch.", ""),
+        "medusa_head_inference_autocast": bool(fg.get("head_inference_autocast", True)),
+        "medusa_inference_mirror": bool(inference_mirror_enabled),
+        "medusa_inference_dtype": str(inference_medusa_dtype).replace("torch.", ""),
+        "tree_cpeak_nodes": int(fg.get("cpeak_nodes", 64)),
+        "tree_cpeak_autotune": cpeak_tuner.summary(),
+        "tree_max_nodes_per_seq": int(fg.get("max_tree_nodes_per_seq", 16)),
+        "tree_project_internal_logits_only": bool(fg.get("project_internal_tree_logits_only", True)),
+        "tree_inplace_kv_compaction": bool(fg.get("inplace_kv_compaction", True)),
         "reflex_enabled": bool(reflex_enabled),
         "reflex_state_space": reflex_state_space,
         "reflex_fast_state_dim": int(reflex_fast_state_dim),
@@ -964,6 +1119,8 @@ def run_training(config: dict[str, Any]) -> None:
             answers = batch["answers"]
             online_aux_enabled = bool(fg.get("online_medusa", True))
             generation_step_for_batch = int(rollout_count)
+            cpeak_for_batch, cpeak_tuning = cpeak_tuner.budget_for(generation_step_for_batch)
+            decoder.config.cpeak_nodes = int(cpeak_for_batch)
             next_grpo_step = acc.used_items // required_used_items + 1
             aux_refresh_allowed, aux_refresh_skip_reason = _aux_refresh_allowed_for_generation_step(config, generation_step_for_batch)
             collect_reflex_aux_cache = bool(
@@ -975,6 +1132,7 @@ def run_training(config: dict[str, Any]) -> None:
 
             target_model.eval()
             medusa_heads.eval()
+            inference_medusa_heads.eval()
             try:
                 with torch.inference_mode():
                     outputs = generate_with_oom_retry(
@@ -1010,7 +1168,22 @@ def run_training(config: dict[str, Any]) -> None:
             target_model.train()
             medusa_heads.train()
             total_generate_time += outputs["total_time_cost"]
-            total_rollout_tokens += sum(len(x) for x in outputs["generated_token_ids"])
+            rollout_token_count = sum(len(x) for x in outputs["generated_token_ids"])
+            total_rollout_tokens += rollout_token_count
+            cpeak_selected_now = cpeak_tuner.observe(
+                cpeak_for_batch,
+                output_tokens=rollout_token_count,
+                elapsed_s=outputs["total_time_cost"],
+                tuning=cpeak_tuning,
+            )
+            if cpeak_selected_now:
+                decoder.config.cpeak_nodes = int(cpeak_tuner.selected)
+                decoder.reset_reflex_degradation_guard()
+                logger.log({
+                    "phase": "cpeak_autotune_complete",
+                    "rollout_count": rollout_count,
+                    "cpeak_autotune": cpeak_tuner.summary(),
+                })
             total_accepted_length += int(outputs.get("total_acc_length", 0))
             total_decoded_steps += int(outputs.get("total_decoded_token_num", 0))
             total_accepted_medusa_tokens += int(outputs.get("total_accepted_medusa_tokens", 0))
@@ -1093,6 +1266,10 @@ def run_training(config: dict[str, Any]) -> None:
                 "accepted_medusa_tokens": outputs.get("total_accepted_medusa_tokens", 0),
                 "proposed_medusa_tokens": outputs.get("total_proposed_medusa_tokens", 0),
                 "tree_nodes_per_seq": outputs["average_tree_nodes_per_seq"],
+                "cpeak_nodes": int(cpeak_for_batch),
+                "cpeak_tuning": bool(cpeak_tuning),
+                "cpeak_selected": cpeak_tuner.selected,
+                "tree_lm_head_row_ratio": outputs.get("tree_lm_head_row_ratio", 1.0),
                 "B_cur_avg": outputs["average_active_batch_size"],
                 "medusa_loss": head_stats.get("medusa_loss", 0.0),
                 "parallel_medusa_loss": head_stats.get("parallel_medusa_loss", 0.0),
@@ -1181,6 +1358,9 @@ def run_training(config: dict[str, Any]) -> None:
                 )
                 boundary_aux_stats.update(refresh_stats)
                 boundary_aux_stats["phase"] = "auxiliary_update"
+                if inference_medusa_heads is not medusa_heads and bool(refresh_stats.get("refresh_committed", False)):
+                    _sync_medusa_inference_mirror(medusa_heads, inference_medusa_heads)
+                    boundary_aux_stats["inference_mirror_synced"] = True
                 refresh_wall_time = time.time() - refresh_start
                 boundary_aux_stats["aux_update_wall_time"] = refresh_wall_time
                 total_head_update_time += refresh_wall_time
@@ -1358,6 +1538,7 @@ def run_training(config: dict[str, Any]) -> None:
         "medusa_acceptance_rate": total_accepted_medusa_tokens / max(total_proposed_medusa_tokens, 1),
         "total_verify_rounds": int(total_verify_rounds),
         "rollout_batches": int(rollout_count - start_rollout_count),
+        "cpeak_autotune": cpeak_tuner.summary(),
         "metrics_jsonl": str(logger.jsonl_path),
         "metrics_csv": str(logger.csv_path),
         "saved_model_dir": str(saved_model_dir / f"step{final_step}"),

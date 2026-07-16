@@ -23,32 +23,45 @@ def build_tree_attention_inputs(
     max_nodes = max(max(tree.node_count, 1) for tree in trees)
     past_len = full_attention_mask.shape[1]
     min_dtype = torch.finfo(dtype).min
-    input_ids = torch.full((batch, max_nodes), int(pad_token_id), dtype=torch.long, device=device)
-    position_ids = torch.zeros((batch, max_nodes), dtype=torch.long, device=device)
-    node_mask = torch.zeros((batch, max_nodes), dtype=torch.bool, device=device)
-    attn = torch.full((batch, 1, max_nodes, past_len + max_nodes), min_dtype, dtype=dtype, device=device)
+    # Build the tiny topology tensors on CPU, then issue bulk device
+    # operations. The old nested loop performed several CUDA assignments and a
+    # logical_lengths.item() synchronization for every node.
+    token_rows: list[list[int]] = []
+    depth_rows: list[list[int]] = []
+    valid_rows: list[list[bool]] = []
+    ancestor_rows: list[list[list[bool]]] = []
+    topology_cache: dict[tuple[int, ...], list[list[bool]]] = {}
+    for tree in trees:
+        valid_count = tree.node_count
+        token_rows.append([int(token) for token in tree.tokens] + [int(pad_token_id)] * (max_nodes - valid_count))
+        depth_rows.append([int(depth) for depth in tree.depths] + [1] * (max_nodes - valid_count))
+        valid_rows.append([True] * valid_count + [False] * (max_nodes - valid_count))
 
-    for batch_idx, tree in enumerate(trees):
-        valid_prefix = full_attention_mask[batch_idx].bool()
-        for node_idx, token in enumerate(tree.tokens):
-            input_ids[batch_idx, node_idx] = int(token)
-            node_mask[batch_idx, node_idx] = True
-            depth = int(tree.depths[node_idx])
-            position_ids[batch_idx, node_idx] = int(logical_lengths[batch_idx].item()) + depth - 1
-            attn[batch_idx, 0, node_idx, :past_len] = torch.where(
-                valid_prefix,
-                torch.zeros((), dtype=dtype, device=device),
-                torch.full((), min_dtype, dtype=dtype, device=device),
-            )
-            for ancestor in tree.ancestors_including_self(node_idx):
-                attn[batch_idx, 0, node_idx, past_len + ancestor] = 0
-        for node_idx in range(tree.node_count, max_nodes):
-            # Padded query rows are ignored downstream. Give them a non-empty
-            # context to avoid all -inf attention rows on strict kernels.
-            attn[batch_idx, 0, node_idx, :past_len] = torch.where(
-                valid_prefix,
-                torch.zeros((), dtype=dtype, device=device),
-                torch.full((), min_dtype, dtype=dtype, device=device),
-            )
-            attn[batch_idx, 0, node_idx, past_len + node_idx] = 0
+        topology_key = tuple(int(parent) for parent in tree.parents) + (-2, max_nodes)
+        ancestor = topology_cache.get(topology_key)
+        if ancestor is None:
+            ancestor = [[False] * max_nodes for _ in range(max_nodes)]
+            for node_idx in range(valid_count):
+                for parent_idx in tree.ancestors_including_self(node_idx):
+                    ancestor[node_idx][int(parent_idx)] = True
+            for node_idx in range(valid_count, max_nodes):
+                # Padded query rows are ignored downstream, but strict
+                # attention kernels still require one valid tree position.
+                ancestor[node_idx][node_idx] = True
+            topology_cache[topology_key] = ancestor
+        ancestor_rows.append(ancestor)
+
+    input_ids = torch.tensor(token_rows, dtype=torch.long, device=device)
+    depths = torch.tensor(depth_rows, dtype=torch.long, device=device)
+    node_mask = torch.tensor(valid_rows, dtype=torch.bool, device=device)
+    tree_allowed = torch.tensor(ancestor_rows, dtype=torch.bool, device=device).unsqueeze(1)
+    position_ids = logical_lengths.to(device=device, dtype=torch.long).unsqueeze(1) + depths - 1
+    position_ids.masked_fill_(~node_mask, 0)
+
+    prefix_allowed = full_attention_mask.to(device=device, dtype=torch.bool)[:, None, None, :].expand(
+        batch, 1, max_nodes, past_len
+    )
+    allowed = torch.cat((prefix_allowed, tree_allowed), dim=-1)
+    attn = torch.zeros((batch, 1, max_nodes, past_len + max_nodes), dtype=dtype, device=device)
+    attn.masked_fill_(~allowed, min_dtype)
     return input_ids, attn, position_ids, node_mask

@@ -9,7 +9,14 @@ import torch
 
 from flashgrpo_b200.decoding.acceptance import exact_accept_paths_batch, sample_from_logits
 from flashgrpo_b200.decoding.kv_extraction import extract_accepted_path_kv
-from flashgrpo_b200.decoding.medusa_tree import CandidateTree, TreePlan, build_batch_trees, dense_node_count, plan_tree
+from flashgrpo_b200.decoding.medusa_tree import (
+    CandidateTree,
+    TreePlan,
+    build_batch_trees,
+    dense_node_count,
+    fit_topk_to_budget,
+    plan_tree,
+)
 from flashgrpo_b200.decoding.reflex import (
     LMHeadFeedback,
     PredictionBuffer,
@@ -60,6 +67,10 @@ class FlashMedusaConfig:
     adaptive_confidence_low: float = 0.15
     adaptive_confidence_high: float = 0.45
     adaptive_min_topk_by_depth: tuple[int, ...] = (1, 1, 1)
+    adaptive_depth_weight_decay: float = 0.5
+    head_inference_autocast: bool = True
+    project_internal_tree_logits_only: bool = True
+    inplace_kv_compaction: bool = True
     reflex_enabled: bool = False
     reflex_state_space: str = "projected"
     reflex_fast_state_dim: int = 128
@@ -117,6 +128,12 @@ class FlashMedusaDecoder:
             raise ValueError(f"Unsupported cache_update_mode={config.cache_update_mode}")
         if config.proposal_mode not in {"medusa", "chain"}:
             raise ValueError(f"Unsupported proposal_mode={config.proposal_mode}")
+        self._reflex_guard_baseline = 0.0
+        self._reflex_guard_samples = 0
+        self._reflex_guard_bad_windows = 0
+        self._reflex_guard_disabled_until = -1
+
+    def reset_reflex_degradation_guard(self) -> None:
         self._reflex_guard_baseline = 0.0
         self._reflex_guard_samples = 0
         self._reflex_guard_bad_windows = 0
@@ -245,24 +262,47 @@ class FlashMedusaDecoder:
         generation_step: int,
     ) -> list[torch.Tensor]:
         max_heads = max(0, min(int(max_heads), self.medusa_heads.num_heads))
-        logits_by_head: list[torch.Tensor] = []
-        for head_idx in range(max_heads):
-            medusa_hidden = self.medusa_heads.heads[head_idx].project_hidden(last_hidden)
-            medusa_hidden = self._apply_reflex_correction(
-                medusa_hidden,
-                fast_state,
-                effective_updates,
-                head_idx,
-                generation_step,
-            )
-            output = self.medusa_heads.heads[head_idx].output
-            if output is not None:
-                logits = output(medusa_hidden)
-            else:
-                lm_dtype = getattr(lm_head.weight, "dtype", medusa_hidden.dtype)
-                logits = lm_head(medusa_hidden.to(dtype=lm_dtype))
-            logits_by_head.append(logits)
-        return logits_by_head
+        if max_heads == 0:
+            return []
+        device_type = "cuda" if last_hidden.device.type == "cuda" else last_hidden.device.type
+        with torch.amp.autocast(
+            device_type,
+            dtype=autocast_dtype(unwrap_causal_lm(self.target_model)),
+            enabled=bool(self.config.head_inference_autocast and last_hidden.device.type == "cuda"),
+        ):
+            projected: list[torch.Tensor] = []
+            for head_idx in range(max_heads):
+                medusa_hidden = self.medusa_heads.heads[head_idx].project_hidden(last_hidden)
+                projected.append(
+                    self._apply_reflex_correction(
+                        medusa_hidden,
+                        fast_state,
+                        effective_updates,
+                        head_idx,
+                        generation_step,
+                    )
+                )
+
+            # Tied heads all share the 152k-vocabulary projection. One larger
+            # GEMM has substantially lower launch overhead on B200 than one
+            # GEMM per head, while producing identical logits up to the chosen
+            # inference dtype.
+            if all(self.medusa_heads.heads[idx].output is None for idx in range(max_heads)):
+                batch = int(last_hidden.shape[0])
+                flat_hidden = torch.cat(projected, dim=0)
+                lm_dtype = getattr(lm_head.weight, "dtype", flat_hidden.dtype)
+                flat_logits = lm_head(flat_hidden.to(dtype=lm_dtype))
+                return list(flat_logits.split(batch, dim=0))
+
+            logits_by_head: list[torch.Tensor] = []
+            for head_idx, medusa_hidden in enumerate(projected):
+                output = self.medusa_heads.heads[head_idx].output
+                if output is not None:
+                    logits_by_head.append(output(medusa_hidden))
+                else:
+                    lm_dtype = getattr(lm_head.weight, "dtype", medusa_hidden.dtype)
+                    logits_by_head.append(lm_head(medusa_hidden.to(dtype=lm_dtype)))
+            return logits_by_head
 
     def _normalize_reflex_feedback(self, feedback: torch.Tensor) -> torch.Tensor:
         cfg = self.config
@@ -276,20 +316,28 @@ class FlashMedusaDecoder:
         return feedback
 
     def _confidence_from_logits(self, logits: torch.Tensor) -> float:
+        return self._confidences_from_logits([logits])[0]
+
+    def _confidences_from_logits(self, logits_by_head: list[torch.Tensor]) -> list[float]:
+        if not logits_by_head:
+            return []
         cfg = self.config
-        logits = torch.nan_to_num(logits.float(), nan=-1.0e9, posinf=1.0e9, neginf=-1.0e9)
-        if cfg.adaptive_confidence_metric == "margin":
-            values = torch.topk(logits, k=min(2, logits.shape[-1]), dim=-1).values
-            if values.shape[-1] == 1:
-                scores = values[..., 0]
+        per_head_scores: list[torch.Tensor] = []
+        for logits in logits_by_head:
+            if cfg.adaptive_confidence_metric == "margin":
+                values = torch.topk(logits, k=min(2, logits.shape[-1]), dim=-1).values
+                if values.shape[-1] == 1:
+                    score = values[..., 0]
+                else:
+                    score = values[..., 0] - values[..., 1]
             else:
-                scores = values[..., 0] - values[..., 1]
-        else:
-            top1 = torch.max(logits, dim=-1).values
-            scores = torch.exp(top1 - torch.logsumexp(logits, dim=-1))
+                top1 = torch.max(logits, dim=-1).values.float()
+                score = torch.exp(top1 - torch.logsumexp(logits, dim=-1).float())
+            per_head_scores.append(torch.nan_to_num(score.float(), nan=0.0, posinf=0.0, neginf=0.0))
+        scores = torch.stack(per_head_scores, dim=0)
         scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
         q = min(1.0, max(0.0, float(cfg.adaptive_confidence_quantile)))
-        return float(torch.quantile(scores.detach(), q).item())
+        return torch.quantile(scores.detach(), q, dim=-1).cpu().tolist()
 
     def _topk_from_confidence(self, confidence: float, base_k: int, depth_idx: int) -> int:
         cfg = self.config
@@ -326,17 +374,64 @@ class FlashMedusaDecoder:
     def _adapt_plan_from_logits(self, medusa_logits: list[torch.Tensor], plan: TreePlan) -> tuple[TreePlan, dict]:
         if not self.config.adaptive_tree_enabled or not medusa_logits or not plan.topk_by_depth:
             return plan, {}
+        head_count = min(len(plan.topk_by_depth), len(medusa_logits))
+        confidences = self._confidences_from_logits(medusa_logits[:head_count])
         adapted = []
-        confidences = []
-        for depth_idx, base_k in enumerate(plan.topk_by_depth):
-            if depth_idx >= len(medusa_logits):
-                break
-            confidence = self._confidence_from_logits(medusa_logits[depth_idx])
-            confidences.append(confidence)
+        for depth_idx, (base_k, confidence) in enumerate(zip(plan.topk_by_depth, confidences)):
             adapted.append(self._topk_from_confidence(confidence, int(base_k), depth_idx))
         if not adapted:
             return self._plan_with_topk(plan, []), {"confidence": confidences, "topk": []}
+        adapted = fit_topk_to_budget(
+            adapted,
+            plan.node_budget_per_seq,
+            min_topk_by_depth=list(self.config.adaptive_min_topk_by_depth)[: len(adapted)],
+            depth_weight_decay=float(self.config.adaptive_depth_weight_decay),
+        )
         return self._plan_with_topk(plan, adapted), {"confidence": confidences, "topk": adapted}
+
+    @staticmethod
+    def _internal_tree_logit_layout(
+        trees: list[CandidateTree],
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
+        """Map only nodes with children to packed LM-head rows."""
+
+        max_nodes = max((tree.node_count for tree in trees), default=1)
+        rows: list[int] = []
+        nodes: list[int] = []
+        slots_cpu = [[-1] * max_nodes for _ in trees]
+        for row, tree in enumerate(trees):
+            for node_idx in range(tree.node_count):
+                if not tree.children.get(node_idx):
+                    continue
+                slots_cpu[row][node_idx] = len(rows)
+                rows.append(row)
+                nodes.append(node_idx)
+        row_index = torch.tensor(rows, dtype=torch.long, device=device)
+        node_index = torch.tensor(nodes, dtype=torch.long, device=device)
+        return row_index, node_index, slots_cpu
+
+    def _project_packed_tree_logits(
+        self,
+        tree_hidden: torch.Tensor,
+        trees: list[CandidateTree],
+        lm_head,
+    ) -> tuple[torch.Tensor, list[list[int]]]:
+        row_index, node_index, slots_cpu = self._internal_tree_logit_layout(
+            trees,
+            device=tree_hidden.device,
+        )
+        hidden = tree_hidden[row_index, node_index]
+        base = unwrap_causal_lm(self.target_model)
+        device_type = "cuda" if hidden.device.type == "cuda" else hidden.device.type
+        with torch.amp.autocast(
+            device_type,
+            dtype=autocast_dtype(base),
+            enabled=(hidden.device.type == "cuda"),
+        ):
+            logits = lm_head(hidden.to(dtype=getattr(lm_head.weight, "dtype", hidden.dtype)))
+        return logits, slots_cpu
 
     def _build_chain_batch_trees(
         self,
@@ -564,6 +659,8 @@ class FlashMedusaDecoder:
         active_batch_sum = 0
         tree_node_sum = 0
         tree_sample_count = 0
+        total_tree_query_rows = 0
+        total_tree_lm_head_rows = 0
         medusa_head_time = 0.0
         tree_verify_time = 0.0
         cache_update_time = 0.0
@@ -582,13 +679,14 @@ class FlashMedusaDecoder:
         while active_original_indices:
             active_bsz = len(active_original_indices)
             remaining = max_length - logical_lens
-            if not bool((remaining > 0).any().item()):
-                break
             old_logical_lens = logical_lens.clone()
-            active_fast_state = reflex_manager.get(active_original_indices) if reflex_manager is not None else None
-            active_effective_updates = (
-                reflex_manager.get_effective_updates(active_original_indices) if reflex_manager is not None else None
-            )
+            if reflex_manager is not None:
+                active_fast_state, active_effective_updates = reflex_manager.get_state_and_effective_updates(
+                    active_original_indices
+                )
+            else:
+                active_fast_state = None
+                active_effective_updates = None
 
             root_tokens = sample_from_logits(
                 current_logits,
@@ -610,6 +708,8 @@ class FlashMedusaDecoder:
                     max_tree_nodes_per_seq=cfg.max_tree_nodes_per_seq,
                     max_tree_depth=cfg.max_tree_depth,
                     fixed_tree_topk_by_depth=list(cfg.fixed_tree_topk_by_depth),
+                    adaptive_tree_enabled=bool(cfg.adaptive_tree_enabled),
+                    adaptive_min_topk_by_depth=list(cfg.adaptive_min_topk_by_depth),
                 )
                 use_chain = cfg.proposal_mode == "chain" and int(generation_step) >= int(cfg.chain_enable_after)
                 if use_chain:
@@ -645,10 +745,6 @@ class FlashMedusaDecoder:
                             effective_updates=active_effective_updates,
                             generation_step=generation_step,
                         )
-                        medusa_logits = [
-                            torch.nan_to_num(item.float(), nan=-1.0e9, posinf=1.0e9, neginf=-1.0e9)
-                            for item in medusa_logits
-                        ]
                     if statistical_time and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     medusa_head_time += time.time() - head_start
@@ -728,6 +824,7 @@ class FlashMedusaDecoder:
                         proposed_by_depth[int(depth)] = proposed_by_depth.get(int(depth), 0) + 1
 
             tree_logits = None
+            tree_logit_slots_cpu: list[list[int]] | None = None
             tree_hidden = None
             tree_past_key_values = None
             if plan.active_heads > 0 and max(tree.node_count for tree in trees) > 1:
@@ -739,6 +836,7 @@ class FlashMedusaDecoder:
                         pad_token_id=pad_token_id,
                         dtype=autocast_dtype(base),
                     )
+                    total_tree_query_rows += int(tree_input_ids.shape[0] * tree_input_ids.shape[1])
                     if statistical_time and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     verify_start = time.time()
@@ -749,12 +847,21 @@ class FlashMedusaDecoder:
                         past_key_values,
                         tree_position_ids,
                         clone_past=cfg.clone_tree_cache,
+                        compute_logits=not bool(cfg.project_internal_tree_logits_only),
                     )
+                    tree_hidden = tree_out["hidden_states"]
+                    if cfg.project_internal_tree_logits_only:
+                        tree_logits, tree_logit_slots_cpu = self._project_packed_tree_logits(
+                            tree_hidden,
+                            trees,
+                            lm_head,
+                        )
+                    else:
+                        tree_logits = tree_out["logits"]
+                    total_tree_lm_head_rows += int(tree_logits.numel() // tree_logits.shape[-1])
                     if statistical_time and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     tree_verify_time += time.time() - verify_start
-                    tree_logits = tree_out["logits"].float()
-                    tree_hidden = tree_out["hidden_states"]
                     tree_past_key_values = tree_out["past_key_values"]
                     del tree_out
                 except RuntimeError as exc:
@@ -764,6 +871,7 @@ class FlashMedusaDecoder:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     tree_logits = None
+                    tree_logit_slots_cpu = None
 
             if tree_logits is None:
                 raw_accepted_per_row = [[int(token)] for token in root_tokens.detach().cpu().tolist()]
@@ -777,6 +885,7 @@ class FlashMedusaDecoder:
                     temperature=cfg.temperature,
                     top_p=cfg.top_p,
                     top_k=cfg.top_k,
+                    node_to_logit_cpu=tree_logit_slots_cpu,
                 )
 
             remaining_cpu = remaining.detach().cpu().tolist()
@@ -865,7 +974,10 @@ class FlashMedusaDecoder:
                             if tree_logits is None:
                                 raise RuntimeError("Accepted tree token is missing target verification logits")
                             parent_node = int(accepted_nodes_per_row[row][offset - 2])
-                            target_row = tree_logits[row, parent_node]
+                            if tree_logit_slots_cpu is None:
+                                target_row = tree_logits[row, parent_node]
+                            else:
+                                target_row = tree_logits[int(tree_logit_slots_cpu[row][parent_node])]
                         record_groups.append(records)
                         target_rows.append(target_row)
                         true_tokens.append(token)
@@ -910,6 +1022,7 @@ class FlashMedusaDecoder:
                         feedback,
                         has_feedback,
                         effective_mass,
+                        feedback_present=bool(record_groups),
                     )
                     reflex_stats.add_feedback_rms(feedback_rms, has_feedback)
             if reflex_aux_buffer is not None:
@@ -943,16 +1056,43 @@ class FlashMedusaDecoder:
                         tree_past_key_values,
                         accepted_nodes_per_row,
                         causal_lm=self.target_model,
+                        compact_in_place=bool(cfg.inplace_kv_compaction),
                     )
                     past_key_values = result.past_key_values
                     row_idx = torch.arange(active_bsz, device=device)
+                    last_nodes_cpu = [int(path[-1]) for path in accepted_nodes_per_row]
                     last_node_idx = torch.tensor(
-                        [path[-1] for path in accepted_nodes_per_row],
+                        last_nodes_cpu,
                         dtype=torch.long,
                         device=device,
                     )
                     current_hidden = tree_hidden[row_idx, last_node_idx, :]
-                    current_logits = tree_logits[row_idx, last_node_idx, :]
+                    if tree_logit_slots_cpu is None:
+                        current_logits = tree_logits[row_idx, last_node_idx, :]
+                    else:
+                        slots = [int(tree_logit_slots_cpu[row][node]) for row, node in enumerate(last_nodes_cpu)]
+                        leaf_rows = [row for row, slot in enumerate(slots) if slot < 0]
+                        reusable_slots = torch.tensor(
+                            [max(0, slot) for slot in slots],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        current_logits = tree_logits.index_select(0, reusable_slots)
+                        if leaf_rows:
+                            leaf_index = torch.tensor(leaf_rows, dtype=torch.long, device=device)
+                            leaf_hidden = current_hidden.index_select(0, leaf_index)
+                            with torch.amp.autocast(
+                                "cuda" if device.type == "cuda" else device.type,
+                                dtype=autocast_dtype(base),
+                                enabled=(device.type == "cuda"),
+                            ):
+                                leaf_logits = lm_head(
+                                    leaf_hidden.to(dtype=getattr(lm_head.weight, "dtype", leaf_hidden.dtype))
+                                )
+                            current_logits.index_copy_(0, leaf_index, leaf_logits)
+                            total_tree_lm_head_rows += len(leaf_rows)
+                            del leaf_index, leaf_hidden, leaf_logits
+                        del reusable_slots
                     extracted = True
                     kv_extraction_success_count += 1
                     del result, row_idx, last_node_idx
@@ -999,6 +1139,7 @@ class FlashMedusaDecoder:
                     current_logits = lm_head(current_hidden.to(dtype=getattr(lm_head.weight, "dtype", current_hidden.dtype)))
                 del cache_out, token_hidden, last_indices
             tree_logits = None
+            tree_logit_slots_cpu = None
             tree_hidden = None
             tree_past_key_values = None
             full_attention_mask = new_attention_mask
@@ -1062,6 +1203,9 @@ class FlashMedusaDecoder:
             "total_verify_rounds": int(total_verify_rounds),
             "average_active_batch_size": active_batch_sum / max(total_verify_rounds, 1),
             "average_tree_nodes_per_seq": tree_node_sum / max(tree_sample_count, 1),
+            "tree_query_rows": int(total_tree_query_rows),
+            "tree_lm_head_rows": int(total_tree_lm_head_rows),
+            "tree_lm_head_row_ratio": total_tree_lm_head_rows / max(total_tree_query_rows, 1),
             "accept_length_histogram": accept_hist,
             "medusa_accept_by_depth": accept_by_depth,
             "medusa_proposed_by_depth": proposed_by_depth,

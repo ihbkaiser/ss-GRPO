@@ -11,12 +11,12 @@ model:
 training:
   # Keep batch_size * accumulation_steps = 32 so each GRPO policy update is
   # comparable with the 3090/A6000 config, while each rollout is wider on B200.
-  batch_size: 16
-  accumulation_steps: 2
-  max_training_token: 8192
-  max_training_padding_gap: 1024
+  batch_size: 8
+  accumulation_steps: 4
+  max_training_token: 4096
+  max_training_padding_gap: 4096
   logps_chunk_size: 512
-  num_workers: 8
+  num_workers: 16
   persistent_workers: true
   saved_model_dir: outputs/reflexgrpo_optimized_b200_qwen25_1p5b_simplelrabel3to5/target_lora
   saved_medusa_dir: outputs/reflexgrpo_optimized_b200_qwen25_1p5b_simplelrabel3to5/medusa_heads

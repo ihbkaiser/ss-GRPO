@@ -13,13 +13,14 @@ HEADS="${HEADS:-outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b}"
 EXP="${EXP:-reflexgrpo_b200_qwen25_7b}"
 CONFIG="${CONFIG:-flashgrpo_b200/configs/reflexgrpo_optimized_b200_qwen25_7b_simplelrabel3to5.yaml}"
 
-BATCH_SIZE="${BATCH_SIZE:-16}"
-ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-2}"
-MAX_TRAINING_TOKEN="${MAX_TRAINING_TOKEN:-8192}"
-MAX_TRAINING_PADDING_GAP="${MAX_TRAINING_PADDING_GAP:-1024}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-4}"
+MAX_TRAINING_TOKEN="${MAX_TRAINING_TOKEN:-4096}"
+MAX_TRAINING_PADDING_GAP="${MAX_TRAINING_PADDING_GAP:-4096}"
 LOGPS_CHUNK_SIZE="${LOGPS_CHUNK_SIZE:-512}"
-CPEAK_NODES="${CPEAK_NODES:-768}"
-MAX_TREE_NODES_PER_SEQ="${MAX_TREE_NODES_PER_SEQ:-32}"
+CPEAK_NODES="${CPEAK_NODES:-128}"
+AUTO_TUNE_CPEAK="${AUTO_TUNE_CPEAK:-true}"
+MAX_TREE_NODES_PER_SEQ="${MAX_TREE_NODES_PER_SEQ:-10}"
 
 python flashgrpo_b200/scripts/train_flashgrpo_b200.py \
   --config "$CONFIG" \
@@ -33,6 +34,7 @@ python flashgrpo_b200/scripts/train_flashgrpo_b200.py \
   --set training.max_training_padding_gap="$MAX_TRAINING_PADDING_GAP" \
   --set training.logps_chunk_size="$LOGPS_CHUNK_SIZE" \
   --set flashgrpo.cpeak_nodes="$CPEAK_NODES" \
+  --set flashgrpo.auto_tune_cpeak_enabled="$AUTO_TUNE_CPEAK" \
   --set flashgrpo.max_tree_nodes_per_seq="$MAX_TREE_NODES_PER_SEQ" \
   --set logging.log_dir="logs/flashgrpo_b200/$EXP" \
   --set training.saved_model_dir="outputs/$EXP/target_lora" \

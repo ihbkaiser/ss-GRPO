@@ -6,7 +6,9 @@ model:
   model_dir: models/Qwen2.5-1.5B-Instruct
   model_type: qwen2
   dtype: fp16
-  attn_implementation: flash_attention_2
+  # Tree verification uses an arbitrary 4D ancestor mask. SDPA supports this
+  # mask directly; Hugging Face FlashAttention-2 does not.
+  attn_implementation: sdpa
 
 data:
   train_option: simplelr_abel_level3to5
@@ -82,6 +84,17 @@ flashgrpo:
   adaptive_confidence_low: 0.20
   adaptive_confidence_high: 0.70
   adaptive_min_topk_by_depth: [1, 1, 1]
+  adaptive_depth_weight_decay: 0.5
+  # Keep FP32 optimizer/master heads, but execute rollout proposals in the
+  # target model's FP16 autocast dtype. No persistent mirror is allocated on
+  # the 24 GB GPU.
+  head_inference_autocast: true
+  # Verify every candidate with the target transformer, but only project
+  # internal tree nodes through the 152k-vocabulary LM head. Leaf logits are
+  # never consumed by exact tree acceptance.
+  project_internal_tree_logits_only: true
+  # Reuse the verified tree KV allocation when compacting accepted paths.
+  inplace_kv_compaction: true
   typical:
     enabled: false
   medusa_training_mode: head_only

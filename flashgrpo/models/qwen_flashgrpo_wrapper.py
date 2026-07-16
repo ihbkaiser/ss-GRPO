@@ -225,6 +225,7 @@ def forward_tree(
     position_ids: torch.Tensor,
     *,
     clone_past: bool = True,
+    compute_logits: bool = True,
 ):
     tree_cache = clone_cache(past_key_values, causal_lm=causal_lm, clone_tensors=False) if clone_past else past_key_values
     return _forward_decoder(
@@ -234,4 +235,5 @@ def forward_tree(
         past_key_values=tree_cache,
         position_ids=position_ids,
         use_cache=True,
+        compute_logits=compute_logits,
     )

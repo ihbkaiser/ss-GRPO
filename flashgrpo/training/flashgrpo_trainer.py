@@ -40,6 +40,7 @@ def _get(mapping: dict[str, Any], key: str, default=None):
 
 
 def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.dtype:
+    name = str(name).lower()
     if name == "fp16":
         return torch.float16
     if name == "bf16":
@@ -49,14 +50,16 @@ def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.d
     return default
 
 
-def _resolve_attn_implementation(requested: str | None) -> str:
+def _resolve_attn_implementation(requested: str | None, model_config=None) -> str:
     requested = str(requested or "eager")
     if requested == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        uses_sliding_window = bool(getattr(model_config, "use_sliding_window", False))
+        fallback = "eager" if uses_sliding_window else "sdpa"
         print(
             "Warning: model.attn_implementation=flash_attention_2 was requested, "
-            "but flash_attn is not installed in this environment. Falling back to sdpa."
+            f"but flash_attn is not installed in this environment. Falling back to {fallback}."
         )
-        return "sdpa"
+        return fallback
     return requested
 
 
@@ -281,6 +284,8 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
     total_accepted = sum(int(row.get("total_accepted_medusa_tokens", row.get("total_accepted_draft_tokens", 0))) for row in rows)
     total_proposed = sum(int(row.get("total_proposed_medusa_tokens", row.get("total_proposed_draft_tokens", 0))) for row in rows)
     total_verify = sum(int(row.get("total_verify_rounds", 0)) for row in rows)
+    tree_query_rows = sum(int(row.get("tree_query_rows", 0)) for row in rows)
+    tree_lm_head_rows = sum(int(row.get("tree_lm_head_rows", 0)) for row in rows)
     total_time = sum(float(row.get("total_time_cost", 0.0) or 0.0) for row in rows)
     reflex_metrics = _merge_reflex_metrics([row.get("reflex_metrics", {}) for row in rows])
     out = {
@@ -299,6 +304,9 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "total_verify_rounds": int(total_verify),
         "average_active_batch_size": _weighted_average(rows, "average_active_batch_size", "total_verify_rounds"),
         "average_tree_nodes_per_seq": _weighted_average(rows, "average_tree_nodes_per_seq", "total_verify_rounds"),
+        "tree_query_rows": int(tree_query_rows),
+        "tree_lm_head_rows": int(tree_lm_head_rows),
+        "tree_lm_head_row_ratio": tree_lm_head_rows / max(tree_query_rows, 1),
         "accept_length_histogram": _merge_int_dicts(rows, "accept_length_histogram"),
         "medusa_accept_by_depth": _merge_int_dicts(rows, "medusa_accept_by_depth"),
         "medusa_proposed_by_depth": _merge_int_dicts(rows, "medusa_proposed_by_depth"),
@@ -576,6 +584,10 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         adaptive_confidence_low=float(fg.get("adaptive_confidence_low", 0.15)),
         adaptive_confidence_high=float(fg.get("adaptive_confidence_high", 0.45)),
         adaptive_min_topk_by_depth=tuple(fg.get("adaptive_min_topk_by_depth", [1, 1, 1])),
+        adaptive_depth_weight_decay=float(fg.get("adaptive_depth_weight_decay", 0.5)),
+        head_inference_autocast=bool(fg.get("head_inference_autocast", True)),
+        project_internal_tree_logits_only=bool(fg.get("project_internal_tree_logits_only", True)),
+        inplace_kv_compaction=bool(fg.get("inplace_kv_compaction", True)),
         reflex_enabled=bool(reflex.get("enabled", False)),
         reflex_state_space=str(reflex.get("state_space", "projected")),
         reflex_fast_state_dim=int(reflex.get("fast_state_dim", 128)),
@@ -667,11 +679,17 @@ def run_training(config: dict[str, Any]) -> None:
 
     model_dir = str(config["model"]["model_dir"])
     attn_impl_requested = str(_get(config, "model.attn_implementation", "eager"))
-    attn_impl = _resolve_attn_implementation(attn_impl_requested)
     hf_config = AutoConfig.from_pretrained(model_dir)
+    attn_impl = _resolve_attn_implementation(attn_impl_requested, hf_config)
+    model_dtype_name = str(_get(config, "model.dtype", "auto")).lower()
+    model_torch_dtype = (
+        _dtype_from_name(model_dtype_name)
+        if model_dtype_name in {"fp16", "bf16", "fp32"}
+        else "auto"
+    )
     target_model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        torch_dtype="auto",
+        torch_dtype=model_torch_dtype,
         config=hf_config,
         attn_implementation=attn_impl,
     ).cuda()
@@ -881,9 +899,16 @@ def run_training(config: dict[str, Any]) -> None:
         "start_rollout_count": start_rollout_count,
         "baseline_source": "not_available",
         "method": "flashgrpo",
+        "model_dtype_requested": model_dtype_name,
+        "model_torch_dtype": str(model_torch_dtype).replace("torch.", ""),
         "attn_implementation_requested": attn_impl_requested,
         "attn_implementation_resolved": attn_impl,
         "medusa_head_dtype": str(medusa_dtype).replace("torch.", ""),
+        "medusa_head_inference_autocast": bool(fg.get("head_inference_autocast", True)),
+        "tree_cpeak_nodes": int(fg.get("cpeak_nodes", 64)),
+        "tree_max_nodes_per_seq": int(fg.get("max_tree_nodes_per_seq", 16)),
+        "tree_project_internal_logits_only": bool(fg.get("project_internal_tree_logits_only", True)),
+        "tree_inplace_kv_compaction": bool(fg.get("inplace_kv_compaction", True)),
         "reflex_enabled": bool(reflex_enabled),
         "reflex_state_space": reflex_state_space,
         "reflex_fast_state_dim": int(reflex_fast_state_dim),
@@ -1084,6 +1109,7 @@ def run_training(config: dict[str, Any]) -> None:
                 "accepted_medusa_tokens": outputs.get("total_accepted_medusa_tokens", 0),
                 "proposed_medusa_tokens": outputs.get("total_proposed_medusa_tokens", 0),
                 "tree_nodes_per_seq": outputs["average_tree_nodes_per_seq"],
+                "tree_lm_head_row_ratio": outputs.get("tree_lm_head_row_ratio", 1.0),
                 "B_cur_avg": outputs["average_active_batch_size"],
                 "medusa_loss": head_stats.get("medusa_loss", 0.0),
                 "parallel_medusa_loss": head_stats.get("parallel_medusa_loss", 0.0),

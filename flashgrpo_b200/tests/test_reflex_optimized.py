@@ -9,7 +9,11 @@ from flashgrpo_b200.decoding.reflex import (
     ReflexStateManager,
 )
 from flashgrpo_b200.models.medusa_heads import MedusaHeads
-from flashgrpo_b200.training.flashgrpo_trainer import _merge_reflex_record_batches
+from flashgrpo_b200.training.flashgrpo_trainer import (
+    _build_medusa_inference_mirror,
+    _merge_reflex_record_batches,
+    _sync_medusa_inference_mirror,
+)
 from flashgrpo_b200.training.online_medusa_trainer import OnlineMedusaTrainer
 
 
@@ -180,3 +184,19 @@ def test_aux_cache_merge_pads_variable_sparse_supports():
     assert merged["old_top_ids"].shape == (4, 4)
     # The cap keeps the newest records after padding/concatenation.
     assert merged["labels"].tolist() == [1, 10, 11, 12]
+
+
+def test_bf16_inference_mirror_tracks_fp32_auxiliary_master():
+    torch.manual_seed(23)
+    master = MedusaHeads(16, 31, num_heads=2, dtype=torch.float32)
+    lm_head = torch.nn.Linear(16, 31, bias=False, dtype=torch.bfloat16)
+    mirror = _build_medusa_inference_mirror(master, dtype=torch.bfloat16, lm_head=lm_head)
+    assert not any(parameter.requires_grad for parameter in mirror.parameters())
+    for source, target in zip(master.parameters(), mirror.parameters()):
+        assert torch.equal(target, source.to(dtype=torch.bfloat16))
+
+    with torch.no_grad():
+        next(master.parameters()).add_(0.25)
+    _sync_medusa_inference_mirror(master, mirror)
+    for source, target in zip(master.parameters(), mirror.parameters()):
+        assert torch.equal(target, source.to(dtype=torch.bfloat16))

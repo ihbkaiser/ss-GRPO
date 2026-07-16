@@ -43,9 +43,10 @@ def _resolve_attn_implementation(requested: str | None) -> str:
     if requested == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
         print(
             "Warning: attn_implementation=flash_attention_2 was requested, "
-            "but flash_attn is not installed. Falling back to sdpa."
+            "but flash_attn is not installed. Falling back to eager because "
+            "Qwen sliding-window attention is not implemented for sdpa."
         )
-        return "sdpa"
+        return "eager"
     return requested
 
 
