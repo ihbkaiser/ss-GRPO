@@ -20,6 +20,14 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 cd "$WORKSPACE"
 
+if [[ "${RESUME_CHECKPOINT:-}" == "auto" ]]; then
+  if [[ -d "$FASTGRPO_CHECKPOINT_DIR" ]]; then
+    RESUME_CHECKPOINT="$(find "$FASTGRPO_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step*.pt' | sort -V | tail -n 1 || true)"
+  else
+    RESUME_CHECKPOINT=""
+  fi
+fi
+
 if [[ -z "${DRAFT_ADAPTER:-}" ]]; then
   if [[ -d "$DRAFT_SAVED_MODEL_DIR" ]]; then
     DRAFT_ADAPTER="$(find "$DRAFT_SAVED_MODEL_DIR" -maxdepth 1 -type f -name 'step*.pth' | sort -V | tail -n 1 || true)"
@@ -39,7 +47,8 @@ mkdir -p \
   "$(dirname "$FASTGRPO_LOG_FILE")" \
   "$FASTGRPO_SAVED_MODEL_DIR" \
   "$FASTGRPO_SAVED_DRAFT_MODEL_DIR" \
-  "$FASTGRPO_SAVED_STATISTICS_DIR"
+  "$FASTGRPO_SAVED_STATISTICS_DIR" \
+  "$FASTGRPO_CHECKPOINT_DIR"
 
 "$PYTHON" "$SCRIPT_DIR/grpo_speculative.py" \
   --model_dir "$MODEL" \
@@ -81,4 +90,8 @@ mkdir -p \
   --log_file "$FASTGRPO_LOG_FILE" \
   --saved_model_dir "$FASTGRPO_SAVED_MODEL_DIR" \
   --saved_draft_model_dir "$FASTGRPO_SAVED_DRAFT_MODEL_DIR" \
-  --saved_statistics_dir "$FASTGRPO_SAVED_STATISTICS_DIR"
+  --saved_statistics_dir "$FASTGRPO_SAVED_STATISTICS_DIR" \
+  --checkpoint_dir "$FASTGRPO_CHECKPOINT_DIR" \
+  --save_checkpoint_steps "$FASTGRPO_SAVE_CHECKPOINT_STEPS" \
+  --keep_last_checkpoints "$KEEP_LAST_CHECKPOINTS" \
+  --resume_checkpoint "$RESUME_CHECKPOINT"

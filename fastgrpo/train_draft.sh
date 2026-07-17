@@ -16,7 +16,15 @@ if [[ -f "$CONFIG_ENV" ]]; then
 fi
 
 cd "$WORKSPACE"
-mkdir -p "$DRAFT_LOG_DIR" "$DRAFT_SAVED_MODEL_DIR"
+if [[ "${RESUME_CHECKPOINT:-}" == "auto" ]]; then
+  if [[ -d "$DRAFT_CHECKPOINT_DIR" ]]; then
+    RESUME_CHECKPOINT="$(find "$DRAFT_CHECKPOINT_DIR" -maxdepth 1 -type f -name 'step*.pt' | sort -V | tail -n 1 || true)"
+  else
+    RESUME_CHECKPOINT=""
+  fi
+fi
+
+mkdir -p "$DRAFT_LOG_DIR" "$DRAFT_SAVED_MODEL_DIR" "$DRAFT_CHECKPOINT_DIR"
 
 "$PYTHON" "$SCRIPT_DIR/train_draft.py" \
   --model_dir "$MODEL" \
@@ -35,4 +43,8 @@ mkdir -p "$DRAFT_LOG_DIR" "$DRAFT_SAVED_MODEL_DIR"
   --persistent_workers "$PERSISTENT_WORKERS" \
   --log_dir "$DRAFT_LOG_DIR" \
   --saved_model_dir "$DRAFT_SAVED_MODEL_DIR" \
-  --dataset_dir "$DRAFT_DATASET"
+  --dataset_dir "$DRAFT_DATASET" \
+  --checkpoint_dir "$DRAFT_CHECKPOINT_DIR" \
+  --save_checkpoint_steps "$DRAFT_SAVE_CHECKPOINT_STEPS" \
+  --keep_last_checkpoints "$KEEP_LAST_CHECKPOINTS" \
+  --resume_checkpoint "$RESUME_CHECKPOINT"

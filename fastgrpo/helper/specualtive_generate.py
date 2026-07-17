@@ -420,6 +420,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     start_time=time.time()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
+    total_accepted_draft_tokens=0
+    total_proposed_draft_tokens=0
     eos_token_id = tokenizer.eos_token_id
     bsz=input_ids.shape[0]
     end_sig=[0]*bsz
@@ -691,6 +693,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         for idx_tree, tree in enumerate(target_trees):
             
             if end_sig[idx_tree]==0:
+                proposed_draft_tokens=len(trees_chosen_index[idx_tree])
                 cur_next_token=[target_next_token_tree_list[idx_tree][0]]
                 cur_acc_length=1
                 cur_chosen_index=[past_kv_len]
@@ -738,6 +741,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                         acc_length[idx_tree]=cur_idx+1
                         break
                 
+                total_proposed_draft_tokens+=int(proposed_draft_tokens)
+                total_accepted_draft_tokens+=max(int(acc_length[idx_tree])-1, 0)
                 avg_acc_length[0]=avg_acc_length[0]+acc_length[idx_tree]
                 avg_acc_length[1]+=1
                         
@@ -1084,12 +1089,20 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         filtered_generated_token_ids.append(sequence_without_padding)
         max_sequence_length=max(max_sequence_length,len(sequence_without_padding))
 
+    draft_acceptance_rate = total_accepted_draft_tokens / max(total_proposed_draft_tokens, 1)
+
     return {
         'generated_token_ids':filtered_generated_token_ids,
         'max_sequence_length':max_sequence_length,
         'total_acc_length':avg_acc_length[0],
         'total_acc':max_sequence_length/token_num,
         'total_decoded_token_num':avg_acc_length[1],
+        'total_accepted_draft_tokens':total_accepted_draft_tokens,
+        'total_proposed_draft_tokens':total_proposed_draft_tokens,
+        'total_accepted_medusa_tokens':total_accepted_draft_tokens,
+        'total_proposed_medusa_tokens':total_proposed_draft_tokens,
+        'draft_acceptance_rate':draft_acceptance_rate,
+        'medusa_acceptance_rate':draft_acceptance_rate,
         'total_time_cost':time.time()-start_time,
         'target_time_cost':total_target_time,
         'draft_time_cost':total_draft_time,

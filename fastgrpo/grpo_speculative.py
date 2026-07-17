@@ -25,6 +25,11 @@ import signal
 import torch
 from copy import deepcopy
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftType
+try:
+    from peft import get_peft_model_state_dict, set_peft_model_state_dict
+except ImportError:
+    get_peft_model_state_dict = None
+    set_peft_model_state_dict = None
 from datetime import datetime
 import argparse 
 from statistics import mean , stdev
@@ -73,6 +78,90 @@ def _as_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def _atomic_torch_save(state, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _prune_checkpoints(checkpoint_dir, keep_last):
+    keep_last = int(keep_last or 0)
+    if keep_last <= 0:
+        return
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoints = sorted(checkpoint_dir.glob("step*.pt"), key=lambda p: p.stat().st_mtime)
+    for old_path in checkpoints[:-keep_last]:
+        old_path.unlink(missing_ok=True)
+
+
+def _target_lora_state_dict(target_model):
+    if get_peft_model_state_dict is not None:
+        return get_peft_model_state_dict(target_model)
+    return target_model.state_dict()
+
+
+def _load_target_lora_state_dict(target_model, state_dict):
+    if set_peft_model_state_dict is not None:
+        set_peft_model_state_dict(target_model, state_dict)
+    else:
+        target_model.load_state_dict(state_dict, strict=False)
+
+
+def save_training_checkpoint(
+    checkpoint_dir,
+    *,
+    model,
+    optimizer_target,
+    optimizer_draft,
+    epoch,
+    next_batch,
+    step,
+    used_items,
+    draft_step,
+    draft_accumulated_step,
+    batch_data,
+    keep_last,
+):
+    checkpoint_dir = Path(checkpoint_dir)
+    state = {
+        "format": "fastgrpo_grpo_checkpoint_v1",
+        "epoch": int(epoch),
+        "next_batch": int(next_batch),
+        "step": int(step),
+        "used_items": int(used_items),
+        "draft_step": int(draft_step),
+        "draft_accumulated_step": int(draft_accumulated_step),
+        "target_lora": _target_lora_state_dict(model.target_model),
+        "draft_model": model.draft_model.state_dict(),
+        "optimizer_target": optimizer_target.state_dict(),
+        "optimizer_draft": optimizer_draft.state_dict(),
+        "batch_data": batch_data,
+        "rng_state": torch.random.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+    checkpoint_path = checkpoint_dir / f"step{int(step)}_epoch{int(epoch) + 1}_batch{int(next_batch)}.pt"
+    _atomic_torch_save(state, checkpoint_path)
+    _atomic_torch_save(state, checkpoint_dir / "latest.pt")
+    _prune_checkpoints(checkpoint_dir, keep_last)
+    print(f"Saved FastGRPO checkpoint: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_training_checkpoint(path, *, model, optimizer_target, optimizer_draft):
+    checkpoint = torch.load(path, map_location="cpu")
+    model.draft_model.load_state_dict(checkpoint["draft_model"])
+    _load_target_lora_state_dict(model.target_model, checkpoint["target_lora"])
+    optimizer_target.load_state_dict(checkpoint["optimizer_target"])
+    optimizer_draft.load_state_dict(checkpoint["optimizer_draft"])
+    if checkpoint.get("rng_state") is not None:
+        torch.random.set_rng_state(checkpoint["rng_state"])
+    if torch.cuda.is_available() and checkpoint.get("cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+    return checkpoint
 
 
 parser = argparse.ArgumentParser(description="Training configuration")
@@ -124,6 +213,10 @@ parser.add_argument('--saved_draft_model_dir', type=str, required=True,
                     help="Directory to save trained draft model checkpoints")
 parser.add_argument('--saved_statistics_dir', type=str, required=True,
                     help="Directory to save statistics of generated sequence lengths.")
+parser.add_argument('--checkpoint_dir', type=str, default='')
+parser.add_argument('--save_checkpoint_steps', type=int, default=0)
+parser.add_argument('--keep_last_checkpoints', type=int, default=3)
+parser.add_argument('--resume_checkpoint', type=str, default='')
 args = parser.parse_args()
 num_epochs=args.num_epochs
 sample_num=args.sample_num
@@ -161,6 +254,10 @@ log_file = args.log_file
 saved_model_dir = args.saved_model_dir
 saved_draft_model_dir = args.saved_draft_model_dir
 saved_statistics_dir = args.saved_statistics_dir
+checkpoint_dir = args.checkpoint_dir or os.path.join(os.path.dirname(saved_model_dir), "checkpoints")
+save_checkpoint_steps = int(args.save_checkpoint_steps or 0)
+keep_last_checkpoints = int(args.keep_last_checkpoints or 0)
+resume_checkpoint = args.resume_checkpoint
 model_torch_dtype = _dtype_from_name(args.dtype)
 attn_impl = _resolve_attn_implementation(args.attn_implementation)
 
@@ -170,6 +267,8 @@ if not os.path.exists(saved_draft_model_dir):
     os.makedirs(saved_draft_model_dir)
 if not os.path.exists(saved_statistics_dir):
     os.makedirs(saved_statistics_dir)
+if checkpoint_dir:
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
 
 print(datetime.now())
@@ -516,7 +615,8 @@ def training_draft_model(model,outputs,prompt_mask):
 optimizer_target = torch.optim.AdamW(model.target_model.parameters(), lr=target_lr)
 optimizer_draft = torch.optim.AdamW(model.draft_model.parameters(), lr=draft_lr)
 
-with open(log_file,'w',encoding='utf-8') as f:
+log_mode = "a" if resume_checkpoint else "w"
+with open(log_file, log_mode, encoding='utf-8') as f:
     pass
 
 step=0
@@ -538,6 +638,10 @@ batch_data={
     'last_acc_length':[],
     'total_decoded_token_num':0,
     'last_decoded_token_num':[],
+    'total_accepted_draft_tokens':0,
+    'total_proposed_draft_tokens':0,
+    'last_accepted_draft_tokens':[],
+    'last_proposed_draft_tokens':[],
     'prefill_time_cost':0,
     'target_time_cost':0,
     'draft_time_cost':0,
@@ -556,6 +660,32 @@ optimizer_target.zero_grad(set_to_none=True)
 optimizer_draft.zero_grad(set_to_none=True)
 start_time=time.time()
 batch=[]
+start_epoch = 0
+start_batch = 0
+last_checkpoint_step = -1
+
+if resume_checkpoint:
+    checkpoint = load_training_checkpoint(
+        resume_checkpoint,
+        model=model,
+        optimizer_target=optimizer_target,
+        optimizer_draft=optimizer_draft,
+    )
+    step = int(checkpoint.get("step", 0))
+    used_items = int(checkpoint.get("used_items", 0))
+    draft_step = int(checkpoint.get("draft_step", 0))
+    draft_accumulated_step = int(checkpoint.get("draft_accumulated_step", 0))
+    saved_batch_data = checkpoint.get("batch_data", {})
+    if isinstance(saved_batch_data, dict):
+        batch_data.update(saved_batch_data)
+    start_epoch = int(checkpoint.get("epoch", 0))
+    start_batch = int(checkpoint.get("next_batch", 0))
+    last_checkpoint_step = step
+    print(
+        f"Resumed FastGRPO checkpoint {resume_checkpoint}: "
+        f"epoch={start_epoch + 1}, next_batch={start_batch}, "
+        f"step={step}, used_items={used_items}, draft_step={draft_step}"
+    )
 
 class TrainDataCollator:
     def __init__(self, tokenizer):
@@ -599,7 +729,7 @@ dataloader=DataLoader(
     drop_last=False,
 )
 
-epoch_bar = tqdm(range(num_epochs), desc="Epoch", dynamic_ncols=True)
+epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Epoch", dynamic_ncols=True)
 for epoch in epoch_bar:
     
     batch_data['ignore_due_correct']=0
@@ -616,6 +746,9 @@ for epoch in epoch_bar:
         leave=False,
     )
     for i,batch in enumerate(batch_bar):
+        if epoch == start_epoch and i < start_batch:
+            batch_bar.set_postfix(step=step, phase="resume_skip", refresh=False)
+            continue
         
         if batch['input_ids'].shape[-1]>=max_length:
             batch=[]
@@ -720,6 +853,10 @@ for epoch in epoch_bar:
         batch_data['last_generate_time_cost'].append(outputs['total_time_cost'])
         batch_data['last_acc_length'].append(outputs['total_acc_length'])
         batch_data['last_decoded_token_num'].append(outputs['total_decoded_token_num'])
+        accepted_draft_tokens = int(outputs.get('total_accepted_draft_tokens', 0))
+        proposed_draft_tokens = int(outputs.get('total_proposed_draft_tokens', 0))
+        batch_data['last_accepted_draft_tokens'].append(accepted_draft_tokens)
+        batch_data['last_proposed_draft_tokens'].append(proposed_draft_tokens)
         batch_data['last_generate_length'].append(generate_length)
         batch_data['prefill_time_cost']+=outputs['prefill_time_cost']
         batch_data['target_time_cost']+=outputs['target_time_cost']
@@ -729,15 +866,22 @@ for epoch in epoch_bar:
         batch_data['generate_time_cost']+=outputs['total_time_cost']
         batch_data['total_acc_length']+=outputs['total_acc_length']
         batch_data['total_decoded_token_num']+=outputs['total_decoded_token_num']
+        batch_data['total_accepted_draft_tokens']+=accepted_draft_tokens
+        batch_data['total_proposed_draft_tokens']+=proposed_draft_tokens
         batch_data['generate_length']+=generate_length
         batch=[]
 
         cur_acc_length = (
             batch_data['total_acc_length'] / max(batch_data['total_decoded_token_num'], 1)
         )
+        cur_draft_acceptance_rate = (
+            batch_data['total_accepted_draft_tokens'] /
+            max(batch_data['total_proposed_draft_tokens'], 1)
+        )
         batch_bar.set_postfix(
             step=step,
             acc=f"{cur_acc_length:.3f}",
+            draft_acc=f"{cur_draft_acceptance_rate:.3f}",
             gen=f"{outputs['total_time_cost'] / 60:.2f}m",
             pending=f"{len(batch_data['messages'])}/{batch_size * accumulation_steps}",
             phase="rollout",
@@ -913,6 +1057,13 @@ for epoch in epoch_bar:
             batch_data['mean_rewards']+=sum(batch_data['rewards'])/len(batch_data['rewards'])
             
             real_sample_num=sample_num*accumulation_steps
+            last_accepted_draft_tokens=sum(batch_data['last_accepted_draft_tokens'][-real_sample_num:])
+            last_proposed_draft_tokens=sum(batch_data['last_proposed_draft_tokens'][-real_sample_num:])
+            draft_acceptance_rate=(
+                batch_data['total_accepted_draft_tokens'] /
+                max(batch_data['total_proposed_draft_tokens'], 1)
+            )
+            last_draft_acceptance_rate=last_accepted_draft_tokens / max(last_proposed_draft_tokens, 1)
             
             avg_logs = {
                 "epoch":epoch+1,
@@ -931,6 +1082,8 @@ for epoch in epoch_bar:
                 f"last_{sample_num}_generate_time_cost":round(sum(batch_data['last_generate_time_cost'][-real_sample_num:])/60,3),
                 f"last_{sample_num}_train_time_cost": round(sum(batch_data['last_train_time_cost'][-real_sample_num:]) / 60, 3),
                 f"last_{sample_num}_acc_length":round(sum(batch_data['last_acc_length'][-real_sample_num:]) / sum(batch_data['last_decoded_token_num'][-real_sample_num:]),4),
+                f"last_{sample_num}_draft_acceptance_rate":round(last_draft_acceptance_rate,4),
+                f"last_{sample_num}_medusa_acceptance_rate":round(last_draft_acceptance_rate,4),
                 f"last_{sample_num}_mean_rewards": round(sum(batch_data['last_mean_rewards'][-real_sample_num:]) / len(batch_data['last_mean_rewards'][-real_sample_num:]), 3),
                 f"last_{sample_num}_mean_length": round(sum(batch_data['last_generate_length'][-real_sample_num:]) / len(batch_data['last_generate_length'][-real_sample_num:]), 3),
                 
@@ -938,6 +1091,12 @@ for epoch in epoch_bar:
                 "ignore_due_incorrect_cur_epoch":batch_data['ignore_due_incorrect'],                                
                 "generate_time_cost":round(batch_data['generate_time_cost']/60,3),
                 "average_acc_length":round(batch_data['total_acc_length']/batch_data['total_decoded_token_num'],4),
+                "total_accepted_draft_tokens":int(batch_data['total_accepted_draft_tokens']),
+                "total_proposed_draft_tokens":int(batch_data['total_proposed_draft_tokens']),
+                "total_accepted_medusa_tokens":int(batch_data['total_accepted_draft_tokens']),
+                "total_proposed_medusa_tokens":int(batch_data['total_proposed_draft_tokens']),
+                "draft_acceptance_rate":round(draft_acceptance_rate,4),
+                "medusa_acceptance_rate":round(draft_acceptance_rate,4),
                 "prefill_time_cost":round(batch_data['prefill_time_cost']/60,3),
                 "target_time_cost":round(batch_data['target_time_cost']/60,3),
                 "draft_time_cost":round(batch_data['draft_time_cost']/60,3),
@@ -956,6 +1115,7 @@ for epoch in epoch_bar:
             postfix = {
                 "step": step,
                 "acc": avg_logs["average_acc_length"],
+                "draft_acc": avg_logs["draft_acceptance_rate"],
                 "gen": f"{avg_logs['last_' + str(sample_num) + '_generate_time_cost']:.2f}m",
                 "train": f"{avg_logs['last_' + str(sample_num) + '_train_time_cost']:.2f}m",
                 "reward": avg_logs["mean_reward"],
@@ -975,7 +1135,44 @@ for epoch in epoch_bar:
         if step%500==0 and step!=0:
             model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
             model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
+
+        if (
+            save_checkpoint_steps > 0
+            and step > 0
+            and step % save_checkpoint_steps == 0
+            and step != last_checkpoint_step
+        ):
+            save_training_checkpoint(
+                checkpoint_dir,
+                model=model,
+                optimizer_target=optimizer_target,
+                optimizer_draft=optimizer_draft,
+                epoch=epoch,
+                next_batch=i + 1,
+                step=step,
+                used_items=used_items,
+                draft_step=draft_step,
+                draft_accumulated_step=draft_accumulated_step,
+                batch_data=batch_data,
+                keep_last=keep_last_checkpoints,
+            )
+            last_checkpoint_step = step
             
 
 model.save_model(f"{saved_draft_model_dir}/step{step}.pth")
-model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')   
+model.target_model.save_pretrained(f'{saved_model_dir}/step{step}')
+if checkpoint_dir:
+    save_training_checkpoint(
+        checkpoint_dir,
+        model=model,
+        optimizer_target=optimizer_target,
+        optimizer_draft=optimizer_draft,
+        epoch=num_epochs,
+        next_batch=0,
+        step=step,
+        used_items=used_items,
+        draft_step=draft_step,
+        draft_accumulated_step=draft_accumulated_step,
+        batch_data=batch_data,
+        keep_last=keep_last_checkpoints,
+    )
