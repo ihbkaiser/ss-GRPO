@@ -118,15 +118,18 @@ def sampling(
 def get_adaptive_hyperparameters(bsz, verification_capacity,
                                 max_draft_token_length, max_draft_k, max_verification_num,
                                 min_draft_token_length, draft_token_length_c):
-    
-    verification_num = min(math.floor(verification_capacity/bsz), max_verification_num)
+    if bsz <= 0:
+        return 1, 1, 1
+
+    verification_num = max(2, min(math.floor(verification_capacity / bsz), max_verification_num))
 
     draft_token_length = min(math.floor(math.log2(verification_num/draft_token_length_c)), max_draft_token_length)
     draft_token_length = max(draft_token_length, min_draft_token_length)
     
-    draft_k = min(verification_num-1, max_draft_k)
+    draft_k = max(1, min(verification_num-1, max_draft_k))
 
-    draft_total_token = verification_num - 1
+    tree_node_capacity = draft_k + draft_k * draft_k * max(draft_token_length - 1, 0)
+    draft_total_token = min(verification_num - 1, tree_node_capacity)
     
     
     return draft_token_length, draft_k, draft_total_token
@@ -292,6 +295,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         total_input_ids=torch.concat(total_input_ids, dim=-1) # (bsz, node_nums)
         total_position_ids=torch.concat(total_position_ids, dim=1) # (bsz, node_nums)
         confidences=torch.concat(confidences, dim=-1) # (bsz, node_nums)
+        draft_total_token=min(int(draft_total_token), int(confidences.shape[-1]))
         
         chosen_index=torch.topk(confidences, k=draft_total_token, dim=-1)
         chosen_index, _=torch.sort(chosen_index.indices, dim=-1, descending=False)
@@ -1095,4 +1099,3 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'all_draft_input_states':all_draft_input_states,
         'all_draft_input_ids':all_draft_input_ids
     }
-    
