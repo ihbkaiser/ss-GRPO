@@ -4,10 +4,30 @@ import asyncio
 import json
 import math
 import re
+import warnings
 from typing import Dict
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+
+warnings.filterwarnings(
+    "ignore",
+    message="equations=True in NormalizationConfig is deprecated.*",
+)
+
+_ANSWER_EXTRACTION_CONFIG = [
+    LatexExtractionConfig(
+        normalization_config=NormalizationConfig(
+            nits=False,
+            malformed_operators=False,
+            basic_latex=True,
+            boxed="all",
+            units=True,
+        ),
+        boxed_match_priority=0,
+        try_extract_without_anchor=False,
+    )
+]
 
 
 def accuracy_reward_func(completions, solution, **kwargs):
@@ -22,20 +42,7 @@ def accuracy_reward_func(completions, solution, **kwargs):
         if len(gold_parsed) != 0:
             answer_parsed = parse(
                 content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
+                extraction_config=_ANSWER_EXTRACTION_CONFIG,
                 extraction_mode="first_match",
             )
             try:
@@ -63,5 +70,4 @@ def format_reward_func(completions, **kwargs):
         return count
 
     return [count_tags(c) for c in completions]
-
 
