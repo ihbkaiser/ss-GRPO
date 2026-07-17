@@ -291,19 +291,28 @@ accumulated_step=0
 batch_logs=[]
 start_time=time.time()
 
-for epoch in range(num_epochs):
+epoch_bar = tqdm(range(num_epochs), desc="Draft epoch", dynamic_ncols=True)
+for epoch in epoch_bar:
 
     log_file = log_dir + f"/epoch_{epoch}.log"
     with open(log_file,'w',encoding='utf-8') as f:
         pass
 
-    for i,batch in enumerate(dataloader):
+    batch_bar = tqdm(
+        dataloader,
+        total=len(dataloader),
+        desc=f"Draft epoch {epoch + 1}/{num_epochs}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    for i,batch in enumerate(batch_bar):
 
         input_ids=batch['input_ids'].to('cuda')
         attention_mask=batch['attention_mask'].to('cuda')
         loss_mask=batch['loss_mask'].to('cuda')
         
         if not torch.any(loss_mask==1):
+            batch_bar.set_postfix(step=step, phase="skip_empty_mask", refresh=False)
             continue
         
         with torch.no_grad():
@@ -414,6 +423,16 @@ for epoch in range(num_epochs):
                 
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(avg_logs) + '\n')
+
+                postfix = {
+                    "step": step,
+                    "loss": avg_logs["loss"],
+                    "top1": avg_logs["top1_acc"],
+                    "topk": avg_logs["topk_acc"],
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                }
+                batch_bar.set_postfix(postfix, refresh=False)
+                epoch_bar.set_postfix(postfix, refresh=False)
 
                 total_correct_top1=total_correct_top1[-real_sample_num:]
                 total_correct_topk=total_correct_topk[-real_sample_num:]

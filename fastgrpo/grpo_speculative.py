@@ -30,6 +30,7 @@ import argparse
 from statistics import mean , stdev
 import pickle
 import importlib.util
+from tqdm.auto import tqdm
 
 def handle_signal(signum, frame):
     print("Received signal, cleaning up...")
@@ -598,7 +599,8 @@ dataloader=DataLoader(
     drop_last=False,
 )
 
-for epoch in range(num_epochs):
+epoch_bar = tqdm(range(num_epochs), desc="Epoch", dynamic_ncols=True)
+for epoch in epoch_bar:
     
     batch_data['ignore_due_correct']=0
     batch_data['ignore_due_incorrect']=0
@@ -606,14 +608,23 @@ for epoch in range(num_epochs):
     batch_data['length_range'] = []
     batch_data['length_cv'] = []
     
-    for i,batch in enumerate(dataloader):
+    batch_bar = tqdm(
+        dataloader,
+        total=len(dataloader),
+        desc=f"Epoch {epoch + 1}/{num_epochs}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    for i,batch in enumerate(batch_bar):
         
         if batch['input_ids'].shape[-1]>=max_length:
             batch=[]
+            batch_bar.set_postfix(phase="skip_prompt_len", step=step, refresh=False)
             continue
         
         if None in batch['answers']:
             batch=[]
+            batch_bar.set_postfix(phase="skip_none_answer", step=step, refresh=False)
             continue
         
         input_ids=batch['input_ids'].to('cuda')
@@ -720,6 +731,18 @@ for epoch in range(num_epochs):
         batch_data['total_decoded_token_num']+=outputs['total_decoded_token_num']
         batch_data['generate_length']+=generate_length
         batch=[]
+
+        cur_acc_length = (
+            batch_data['total_acc_length'] / max(batch_data['total_decoded_token_num'], 1)
+        )
+        batch_bar.set_postfix(
+            step=step,
+            acc=f"{cur_acc_length:.3f}",
+            gen=f"{outputs['total_time_cost'] / 60:.2f}m",
+            pending=f"{len(batch_data['messages'])}/{batch_size * accumulation_steps}",
+            phase="rollout",
+            refresh=False,
+        )
 
         if len(batch_data['messages']) == 0:
             continue 
@@ -929,6 +952,17 @@ for epoch in range(num_epochs):
 
             with open(log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(avg_logs) + '\n')
+
+            postfix = {
+                "step": step,
+                "acc": avg_logs["average_acc_length"],
+                "gen": f"{avg_logs['last_' + str(sample_num) + '_generate_time_cost']:.2f}m",
+                "train": f"{avg_logs['last_' + str(sample_num) + '_train_time_cost']:.2f}m",
+                "reward": avg_logs["mean_reward"],
+                "phase": "GRPO",
+            }
+            batch_bar.set_postfix(postfix, refresh=False)
+            epoch_bar.set_postfix(postfix, refresh=False)
                 
             torch.cuda.empty_cache()
             
