@@ -26,7 +26,7 @@ from flashgrpo.utils.gpu_monitor import GpuMonitor
 from flashgrpo.utils.metrics import MetricsLogger
 from flashgrpo.utils.seed import seed_everything
 from flashgrpo.utils.timing import format_duration
-from helper.get_QAs import get_train_QAs
+from helper.get_QAs import get_train_QAs, select_train_subset
 from helper.rewards import accuracy_reward_func, format_reward_func
 
 
@@ -836,11 +836,20 @@ def run_training(config: dict[str, Any]) -> None:
 
     qas = get_train_QAs(str(_get(config, "data.train_option", "simplelr_abel_level3to5")))
     # Keep FastGRPO semantics: sample_num is a logging window, not a dataset
-    # limiter. Use max_train_samples for smoke/debug subset runs.
+    # limiter. Use train_data_fraction for normal shorter runs and
+    # max_train_samples as a final smoke/debug cap.
     sample_num = int(_get(config, "training.sample_num", 100))
+    full_train_samples = len(qas)
+    train_data_fraction = float(_get(config, "training.train_data_fraction", 0.4))
+    train_subset_seed = int(_get(config, "training.train_subset_seed", config.get("seed", 42)))
     max_train_samples = int(_get(config, "training.max_train_samples", 0))
-    if max_train_samples > 0:
-        qas = qas[:max_train_samples]
+    qas = select_train_subset(
+        qas,
+        fraction=train_data_fraction,
+        max_samples=max_train_samples,
+        seed=train_subset_seed,
+    )
+    selected_train_samples = len(qas)
     batch_size = int(_get(config, "training.batch_size", 4))
     num_workers = int(_get(config, "training.num_workers", 4))
     dataloader = DataLoader(
@@ -897,6 +906,11 @@ def run_training(config: dict[str, Any]) -> None:
         "start_batch": start_batch,
         "start_used_items": start_used_items,
         "start_rollout_count": start_rollout_count,
+        "train_dataset_full_size": full_train_samples,
+        "train_dataset_selected_size": selected_train_samples,
+        "train_data_fraction": train_data_fraction,
+        "train_subset_seed": train_subset_seed,
+        "max_train_samples": max_train_samples,
         "baseline_source": "not_available",
         "method": "flashgrpo",
         "model_dtype_requested": model_dtype_name,

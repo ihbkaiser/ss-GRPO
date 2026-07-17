@@ -21,6 +21,9 @@ LOGPS_CHUNK_SIZE="${LOGPS_CHUNK_SIZE:-512}"
 CPEAK_NODES="${CPEAK_NODES:-128}"
 AUTO_TUNE_CPEAK="${AUTO_TUNE_CPEAK:-true}"
 MAX_TREE_NODES_PER_SEQ="${MAX_TREE_NODES_PER_SEQ:-10}"
+TRAIN_DATA_FRACTION="${TRAIN_DATA_FRACTION:-0.4}"
+TRAIN_SUBSET_SEED="${TRAIN_SUBSET_SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 python flashgrpo_b200/scripts/train_flashgrpo_b200.py \
   --config "$CONFIG" \
@@ -33,6 +36,9 @@ python flashgrpo_b200/scripts/train_flashgrpo_b200.py \
   --set training.max_training_token="$MAX_TRAINING_TOKEN" \
   --set training.max_training_padding_gap="$MAX_TRAINING_PADDING_GAP" \
   --set training.logps_chunk_size="$LOGPS_CHUNK_SIZE" \
+  --set training.train_data_fraction="$TRAIN_DATA_FRACTION" \
+  --set training.train_subset_seed="$TRAIN_SUBSET_SEED" \
+  --set training.max_train_samples="$MAX_TRAIN_SAMPLES" \
   --set flashgrpo.cpeak_nodes="$CPEAK_NODES" \
   --set flashgrpo.auto_tune_cpeak_enabled="$AUTO_TUNE_CPEAK" \
   --set flashgrpo.max_tree_nodes_per_seq="$MAX_TREE_NODES_PER_SEQ" \

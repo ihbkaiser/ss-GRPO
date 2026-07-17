@@ -22,6 +22,9 @@ MAX_LENGTH="${MAX_LENGTH:-4096}"
 MAX_TRAINING_TOKEN="${MAX_TRAINING_TOKEN:-4096}"
 MAX_TRAINING_PADDING_GAP="${MAX_TRAINING_PADDING_GAP:-4096}"
 LOGPS_CHUNK_SIZE="${LOGPS_CHUNK_SIZE:-512}"
+TRAIN_DATA_FRACTION="${TRAIN_DATA_FRACTION:-0.4}"
+TRAIN_SUBSET_SEED="${TRAIN_SUBSET_SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 "$PYTHON_BIN" pure_grpo/scripts/train_grpo.py \
   --config "$CONFIG" \
@@ -33,5 +36,8 @@ LOGPS_CHUNK_SIZE="${LOGPS_CHUNK_SIZE:-512}"
   --set training.max_training_token="$MAX_TRAINING_TOKEN" \
   --set training.max_training_padding_gap="$MAX_TRAINING_PADDING_GAP" \
   --set training.logps_chunk_size="$LOGPS_CHUNK_SIZE" \
+  --set training.train_data_fraction="$TRAIN_DATA_FRACTION" \
+  --set training.train_subset_seed="$TRAIN_SUBSET_SEED" \
+  --set training.max_train_samples="$MAX_TRAIN_SAMPLES" \
   --set logging.log_dir="logs/pure_grpo_b200/$EXP" \
   --set training.saved_model_dir="outputs/$EXP/target_lora"

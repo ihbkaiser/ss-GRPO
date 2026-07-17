@@ -10,7 +10,7 @@ import pandas as pd
 from transformers import AutoTokenizer,AutoConfig,AutoModelForCausalLM,GenerationConfig
 from helper.modeling_draft import Model
 from helper.rewards import accuracy_reward_func , format_reward_func
-from helper.get_QAs import get_test_QAs , get_train_QAs
+from helper.get_QAs import get_test_QAs , get_train_QAs, select_train_subset
 from helper.specualtive_generate import speculative_generate
 import torch
 from torch.utils.data import DataLoader
@@ -94,6 +94,12 @@ parser.add_argument('--batch_size',type=int,default=4)
 parser.add_argument('--version_name',type=str,default='normal')
 parser.add_argument('--num_epochs',type=int,default=10)
 parser.add_argument('--sample_num',type=int,default=100)
+parser.add_argument('--train_data_fraction', type=float, default=0.4,
+                    help='Fraction of the loaded train split to use. Applied to any train_option dataset.')
+parser.add_argument('--train_subset_seed', type=int, default=42,
+                    help='Seed for the deterministic train subset selection.')
+parser.add_argument('--max_train_samples', type=int, default=0,
+                    help='Optional hard cap after train_data_fraction, useful for smoke/debug runs.')
 parser.add_argument('--grpo_iteration_num',type=int,default=1)
 parser.add_argument('--repeated_generate_nums',type=int,default=8)
 parser.add_argument('--beta',type=float,default=0.01)
@@ -120,6 +126,9 @@ parser.add_argument('--saved_statistics_dir', type=str, required=True,
 args = parser.parse_args()
 num_epochs=args.num_epochs
 sample_num=args.sample_num
+train_data_fraction=args.train_data_fraction
+train_subset_seed=args.train_subset_seed
+max_train_samples=args.max_train_samples
 grpo_iteration_num=args.grpo_iteration_num
 repeated_generate_nums=args.repeated_generate_nums
 beta=args.beta
@@ -181,6 +190,7 @@ print(f"B200/spec: dtype={args.dtype}, attn_impl={attn_impl or 'default'}, "
 print(f"Draft: train={is_train_draft}")
 print(f"Iteration: grpo_iter={grpo_iteration_num}, sample={sample_num}, "
       f"repeat_gen={repeated_generate_nums}")
+print(f"Dataset subset: fraction={train_data_fraction}, max_samples={max_train_samples}, seed={train_subset_seed}")
 print("=" * 60)
 
 
@@ -208,6 +218,18 @@ if config.model_type == 'llama':
     
 
 QAs = get_train_QAs(args.train_option)
+full_train_samples = len(QAs)
+QAs = select_train_subset(
+    QAs,
+    fraction=train_data_fraction,
+    max_samples=max_train_samples,
+    seed=train_subset_seed,
+)
+selected_train_samples = len(QAs)
+print(
+    f"Train dataset: option={args.train_option}, full={full_train_samples}, "
+    f"selected={selected_train_samples}"
+)
 df = pd.DataFrame(QAs)
 
 for param in model.draft_model.parameters():
@@ -873,6 +895,11 @@ for epoch in range(num_epochs):
                 "epoch":epoch+1,
                 "step": step,
                 "used_items" : used_items ,
+                "train_dataset_full_size": full_train_samples,
+                "train_dataset_selected_size": selected_train_samples,
+                "train_data_fraction": train_data_fraction,
+                "train_subset_seed": train_subset_seed,
+                "max_train_samples": max_train_samples,
                 f"length_range" : round(mean(batch_data['length_range']),4),
                 f"length_cv" : round(mean(batch_data['length_cv']),4) ,
                 f"length_stdev" : round(mean(batch_data['length_stdev']),4) ,  

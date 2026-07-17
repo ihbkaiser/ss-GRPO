@@ -60,13 +60,93 @@ def sample_from_logits(
     temperature: float = 1.0,
     top_p: float | None = 1.0,
     top_k: int | None = None,
+    nucleus_topk_hint: int = 2048,
 ) -> torch.Tensor:
     if (not do_sample) or temperature == 0:
         return torch.argmax(logits, dim=-1)
-    probs = logits_to_probs(logits, temperature=temperature, top_p=top_p, top_k=top_k)
-    flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1).squeeze(-1)
-    return sampled.view(logits.shape[:-1])
+
+    vocab_size = int(logits.shape[-1])
+    output_shape = logits.shape[:-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+
+    def scaled(values: torch.Tensor) -> torch.Tensor:
+        values = values.float()
+        if temperature is not None and temperature > 0:
+            values = values / float(temperature)
+        return values
+
+    def draw(weights: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
+        sampled_pos = torch.multinomial(weights, num_samples=1)
+        if ids is not None:
+            sampled_pos = ids.gather(1, sampled_pos)
+        return sampled_pos.squeeze(-1)
+
+    def mask_nucleus_(weights: torch.Tensor) -> torch.Tensor:
+        cumulative = torch.cumsum(weights, dim=-1)
+        remove = torch.roll(cumulative > float(top_p), shifts=1, dims=-1)
+        remove[..., 0] = False
+        return weights.masked_fill_(remove, 0.0)
+
+    if top_k is not None and 0 < int(top_k) < vocab_size:
+        candidate_logits, candidate_ids = torch.topk(
+            flat_logits,
+            k=int(top_k),
+            dim=-1,
+            largest=True,
+            sorted=True,
+        )
+        probs = F.softmax(scaled(candidate_logits), dim=-1)
+        if top_p is not None and 0 < float(top_p) < 1.0:
+            mask_nucleus_(probs)
+        return draw(probs, candidate_ids).view(output_shape)
+
+    if top_p is not None and 0 < float(top_p) < 1.0:
+        shortlist_k = min(vocab_size, max(1, int(nucleus_topk_hint)))
+        if shortlist_k < vocab_size:
+            flat_scaled = scaled(flat_logits)
+            log_z = torch.logsumexp(flat_scaled, dim=-1, keepdim=True)
+            short_logits, short_ids = torch.topk(
+                flat_logits,
+                k=shortlist_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+            short_probs = torch.exp(scaled(short_logits) - log_z)
+            covered = short_probs.sum(dim=-1) >= float(top_p)
+            covered_flags = covered.detach().cpu().tolist()
+            if all(covered_flags):
+                mask_nucleus_(short_probs)
+                return draw(short_probs, short_ids).view(output_shape)
+
+            sampled = torch.empty(flat_logits.shape[0], dtype=torch.long, device=flat_logits.device)
+            covered_rows = [idx for idx, value in enumerate(covered_flags) if value]
+            fallback_rows = [idx for idx, value in enumerate(covered_flags) if not value]
+            if covered_rows:
+                covered_idx = torch.tensor(covered_rows, dtype=torch.long, device=flat_logits.device)
+                covered_probs = short_probs.index_select(0, covered_idx)
+                mask_nucleus_(covered_probs)
+                sampled.index_copy_(
+                    0,
+                    covered_idx,
+                    draw(covered_probs, short_ids.index_select(0, covered_idx)),
+                )
+            if fallback_rows:
+                fallback_idx = torch.tensor(fallback_rows, dtype=torch.long, device=flat_logits.device)
+                fallback_logits = flat_logits.index_select(0, fallback_idx)
+                sorted_logits, sorted_ids = torch.sort(fallback_logits, dim=-1, descending=True)
+                fallback_probs = F.softmax(scaled(sorted_logits), dim=-1)
+                mask_nucleus_(fallback_probs)
+                sampled.index_copy_(0, fallback_idx, draw(fallback_probs, sorted_ids))
+            return sampled.view(output_shape)
+
+        sorted_logits, sorted_ids = torch.sort(flat_logits, dim=-1, descending=True)
+        probs = F.softmax(scaled(sorted_logits), dim=-1)
+        mask_nucleus_(probs)
+        return draw(probs, sorted_ids).view(output_shape)
+
+    probs = F.softmax(scaled(flat_logits), dim=-1)
+    return draw(probs).view(output_shape)
 
 
 def _last_valid_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:

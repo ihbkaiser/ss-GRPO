@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from helper.get_QAs import get_train_QAs
+from helper.get_QAs import get_train_QAs, select_train_subset
 from helper.rewards import accuracy_reward_func, format_reward_func
 from pure_grpo.model_utils.qwen_wrapper import autocast_dtype, unwrap_causal_lm
 from pure_grpo.training.pure_generate import PureGenerateConfig, pure_target_generate
@@ -58,15 +58,16 @@ def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.d
     return default
 
 
-def _resolve_attn_implementation(requested: str | None) -> str:
+def _resolve_attn_implementation(requested: str | None, model_config=None) -> str:
     requested = str(requested or "eager")
     if requested == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+        uses_sliding_window = bool(getattr(model_config, "use_sliding_window", False))
+        fallback = "eager" if uses_sliding_window else "sdpa"
         print(
             "Warning: model.attn_implementation=flash_attention_2 was requested, "
-            "but flash_attn is not installed in this environment. Falling back "
-            "to eager because Qwen sliding-window attention is not implemented for sdpa."
+            f"but flash_attn is not installed in this environment. Falling back to {fallback}."
         )
-        return "eager"
+        return fallback
     return requested
 
 
@@ -384,14 +385,14 @@ def run_training(config: dict[str, Any]) -> None:
 
     model_dir = str(config["model"]["model_dir"])
     attn_impl_requested = str(_get(config, "model.attn_implementation", "eager"))
-    attn_impl = _resolve_attn_implementation(attn_impl_requested)
+    hf_config = AutoConfig.from_pretrained(model_dir)
+    attn_impl = _resolve_attn_implementation(attn_impl_requested, hf_config)
     model_dtype_name = str(_get(config, "model.dtype", "auto")).lower()
     model_torch_dtype = (
         _dtype_from_name(model_dtype_name)
         if model_dtype_name in {"fp16", "bf16", "fp32"}
         else "auto"
     )
-    hf_config = AutoConfig.from_pretrained(model_dir)
     target_model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=model_torch_dtype,
@@ -419,9 +420,17 @@ def run_training(config: dict[str, Any]) -> None:
     target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=float(_get(config, "training.target_lr", 1e-6)))
 
     qas = get_train_QAs(str(_get(config, "data.train_option", "simplelr_abel_level3to5")))
+    full_train_samples = len(qas)
+    train_data_fraction = float(_get(config, "training.train_data_fraction", 0.4))
+    train_subset_seed = int(_get(config, "training.train_subset_seed", config.get("seed", 42)))
     max_train_samples = int(_get(config, "training.max_train_samples", 0))
-    if max_train_samples > 0:
-        qas = qas[:max_train_samples]
+    qas = select_train_subset(
+        qas,
+        fraction=train_data_fraction,
+        max_samples=max_train_samples,
+        seed=train_subset_seed,
+    )
+    selected_train_samples = len(qas)
     batch_size = int(_get(config, "training.batch_size", 4))
     num_workers = int(_get(config, "training.num_workers", 4))
     dataloader = DataLoader(
@@ -474,6 +483,11 @@ def run_training(config: dict[str, Any]) -> None:
         "start_batch": start_batch,
         "start_used_items": start_used_items,
         "start_rollout_count": start_rollout_count,
+        "train_dataset_full_size": full_train_samples,
+        "train_dataset_selected_size": selected_train_samples,
+        "train_data_fraction": train_data_fraction,
+        "train_subset_seed": train_subset_seed,
+        "max_train_samples": max_train_samples,
         "method": "pure_grpo",
         "baseline_source": "target_only",
     })

@@ -28,6 +28,8 @@ training:
   start_used_items: 0
   start_rollout_count: 0
   sample_num: 100
+  train_data_fraction: 0.4
+  train_subset_seed: 42
   max_train_samples: 0
   accumulation_steps: 4
   grpo_iteration_num: 1

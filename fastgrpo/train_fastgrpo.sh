@@ -14,6 +14,9 @@ if [[ -f "$CONFIG_ENV" ]]; then
   # shellcheck source=/dev/null
   source "$CONFIG_ENV"
 fi
+TRAIN_DATA_FRACTION="${TRAIN_DATA_FRACTION:-0.4}"
+TRAIN_SUBSET_SEED="${TRAIN_SUBSET_SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 cd "$WORKSPACE"
 
@@ -46,6 +49,9 @@ mkdir -p \
   --load_lora_path "$LOAD_LORA_PATH" \
   --model_type "$MODEL_TYPE" \
   --train_option "$TRAIN_OPTION" \
+  --train_data_fraction "$TRAIN_DATA_FRACTION" \
+  --train_subset_seed "$TRAIN_SUBSET_SEED" \
+  --max_train_samples "$MAX_TRAIN_SAMPLES" \
   --version_name "$FASTGRPO_EXP" \
   --batch_size "$BATCH_SIZE" \
   --num_epochs "$NUM_EPOCHS" \
