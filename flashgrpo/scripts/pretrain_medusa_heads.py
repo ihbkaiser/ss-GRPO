@@ -37,6 +37,17 @@ def _dtype(name: str):
     raise ValueError(f"Unsupported dtype={name}")
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
 def _load_json_dataset(path: str | Path) -> list[Any]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -48,6 +59,14 @@ def _load_json_dataset(path: str | Path) -> list[Any]:
     if not isinstance(data, list):
         raise ValueError(f"Unsupported JSON dataset type: {type(data)}")
     return data
+
+
+def _module_has_nonfinite(module: torch.nn.Module) -> bool:
+    with torch.no_grad():
+        for param in module.parameters():
+            if not bool(torch.isfinite(param).all().item()):
+                return True
+    return False
 
 
 def _normalise_role(role: str) -> str:
@@ -183,7 +202,26 @@ class PadCollator:
         }
 
 
-def medusa_loss_and_metrics(medusa_heads, hidden_states, input_ids, attention_mask, loss_mask, lm_head, chunk_size: int, topk: int):
+def medusa_loss_and_metrics(
+    medusa_heads,
+    hidden_states,
+    input_ids,
+    attention_mask,
+    loss_mask,
+    lm_head,
+    *,
+    embedding_layer=None,
+    chunk_size: int,
+    topk: int,
+    chain_loss_weight: float = 0.0,
+    chain_loss_max_depth: int | None = None,
+    chain_bootstrap_from_medusa: bool = True,
+    reflex_loss_weight: float = 0.0,
+    reflex_loss_max_depth: int | None = None,
+    reflex_top_m: int = 32,
+    reflex_delta_scale: float = 0.05,
+    reflex_correction_clip_norm: float = 1.0,
+):
     total = hidden_states.new_zeros(())
     stats: dict[str, float] = {}
     valid_heads = 0
@@ -224,9 +262,118 @@ def medusa_loss_and_metrics(medusa_heads, hidden_states, input_ids, attention_ma
             stats[f"top1_head_{head_idx + 1}"] = correct1 / max(valid_total, 1)
             stats[f"top{topk}_head_{head_idx + 1}"] = correctk / max(valid_total, 1)
             stats[f"tokens_head_{head_idx + 1}"] = valid_total
-    if valid_heads == 0:
+    if valid_heads > 0:
+        total = total / valid_heads
+        stats["parallel_medusa_loss"] = float(total.detach().cpu())
+    else:
+        total = hidden_states.sum() * 0.0
+
+    chain_losses = []
+    chain_weight = float(chain_loss_weight or 0.0)
+    if chain_weight > 0.0 and embedding_layer is not None and lm_head is not None:
+        max_depth = min(int(chain_loss_max_depth or medusa_heads.num_heads), medusa_heads.num_heads)
+        for depth_idx in range(max_depth):
+            shift = depth_idx + 2
+            if chain_bootstrap_from_medusa and shift <= 2:
+                continue
+            if seq_len <= shift:
+                continue
+            weight = medusa_heads.medusa_loss_decay ** depth_idx
+            for start in range(0, seq_len - shift, chunk_size):
+                end = min(start + chunk_size, seq_len - shift)
+                if chain_bootstrap_from_medusa and len(medusa_heads.heads) > 0:
+                    state = medusa_heads.heads[0].project_hidden(hidden_states[:, start:end, :].detach())
+                    first_prev_offset = 2
+                else:
+                    state = hidden_states[:, start:end, :].detach()
+                    first_prev_offset = 1
+                labels = input_ids[:, start + shift : end + shift].to(state.device)
+                valid = attention_mask[:, start + shift : end + shift].bool() & loss_mask[:, start + shift : end + shift].bool()
+                valid = valid.to(state.device)
+                labels = labels.masked_fill(~valid, -100)
+                if not bool(valid.any().item()):
+                    continue
+                for prev_offset in range(first_prev_offset, shift):
+                    prev_tokens = input_ids[:, start + prev_offset : end + prev_offset].to(state.device)
+                    state = medusa_heads.chain_next_state(state, prev_tokens, embedding_layer)
+                logits = medusa_heads.chain_logits_from_state(state, lm_head).float()
+                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100)
+                chain_losses.append(float(weight) * loss)
+                del logits, state
+    if chain_losses:
+        chain_loss = torch.stack(chain_losses).mean()
+        total = total + chain_weight * chain_loss
+        stats["chain_loss"] = float(chain_loss.detach().cpu())
+        stats["chain_loss_weight"] = chain_weight
+
+    reflex_losses = []
+    reflex_weight = float(reflex_loss_weight or 0.0)
+    if (
+        reflex_weight > 0.0
+        and lm_head is not None
+        and getattr(medusa_heads, "reflex_fast_state_dim", 0) > 0
+        and getattr(medusa_heads, "reflex_down", None) is not None
+    ):
+        max_depth = min(int(reflex_loss_max_depth or medusa_heads.num_heads), medusa_heads.num_heads)
+        lm_weight = lm_head.weight.detach()
+        for head_idx, head in enumerate(medusa_heads.heads[:max_depth]):
+            shift = head_idx + 2
+            if seq_len <= shift:
+                continue
+            weight = medusa_heads.medusa_loss_decay ** head_idx
+            for start in range(0, seq_len - shift, chunk_size):
+                end = min(start + chunk_size, seq_len - shift)
+                hidden = hidden_states[:, start:end, :]
+                labels = input_ids[:, start + shift : end + shift].to(hidden.device)
+                valid = attention_mask[:, start + shift : end + shift].bool() & loss_mask[:, start + shift : end + shift].bool()
+                labels_for_loss = labels.masked_fill(~valid, -100)
+                if not bool(valid.any().item()):
+                    continue
+                base_hidden = head.project_hidden(hidden)
+                lm_dtype = getattr(lm_head.weight, "dtype", base_hidden.dtype)
+                base_logits = lm_head(base_hidden.to(dtype=lm_dtype)).float()
+                with torch.no_grad():
+                    k = min(max(1, int(reflex_top_m)), base_logits.shape[-1])
+                    top_values, top_ids = torch.topk(base_logits.detach(), k=k, dim=-1)
+                    top_probs = torch.softmax(top_values, dim=-1)
+                    flat_top_ids = top_ids.reshape(-1)
+                    top_weight = lm_weight.index_select(0, flat_top_ids).reshape(*top_ids.shape, -1).float()
+                    expected_weight = (top_probs.unsqueeze(-1) * top_weight).sum(dim=-2)
+                    safe_labels = labels.masked_fill(~valid, 0).reshape(-1)
+                    true_weight = lm_weight.index_select(0, safe_labels).reshape(*labels.shape, -1).float()
+                    hidden_feedback = (true_weight - expected_weight).masked_fill(~valid.unsqueeze(-1), 0.0)
+                fast_feedback = medusa_heads.feedback_to_fast_state(hidden_feedback.reshape(-1, hidden_feedback.shape[-1]))
+                delta = medusa_heads.reflex_delta(
+                    fast_feedback,
+                    head_idx,
+                    max_norm=float(reflex_correction_clip_norm),
+                    scale=float(reflex_delta_scale),
+                    normalize=True,
+                )
+                if delta is None:
+                    continue
+                delta = delta.reshape_as(base_hidden).to(device=base_hidden.device, dtype=base_hidden.dtype)
+                reflex_hidden = base_hidden + delta
+                reflex_logits = lm_head(reflex_hidden.to(dtype=lm_dtype)).float()
+                reflex_loss = F.cross_entropy(
+                    reflex_logits.reshape(-1, reflex_logits.shape[-1]),
+                    labels_for_loss.reshape(-1),
+                    ignore_index=-100,
+                )
+                reflex_losses.append(float(weight) * reflex_loss)
+                with torch.no_grad():
+                    pred1 = reflex_logits.argmax(dim=-1)
+                    valid_total = int(valid.sum().item())
+                    stats[f"reflex_top1_head_{head_idx + 1}"] = float(((pred1 == labels) & valid).sum().item()) / max(valid_total, 1)
+                del base_logits, reflex_logits, base_hidden, reflex_hidden, delta, fast_feedback
+    if reflex_losses:
+        reflex_loss = torch.stack(reflex_losses).mean()
+        total = total + reflex_weight * reflex_loss
+        stats["reflex_loss"] = float(reflex_loss.detach().cpu())
+        stats["reflex_loss_weight"] = reflex_weight
+
+    if valid_heads == 0 and not chain_losses and not reflex_losses:
         return hidden_states.sum() * 0.0, {"train_loss": 0.0}
-    total = total / valid_heads
     stats["train_loss"] = float(total.detach().cpu())
     return total, stats
 
@@ -243,6 +390,9 @@ def parse_args():
     parser.add_argument("--max_seq_len", type=int, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--load_medusa_checkpoint", default=None)
+    parser.add_argument("--train_reflex_only", default=None)
+    parser.add_argument("--freeze_loaded_base_heads", default=None)
     parser.add_argument("--num_medusa_heads", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
@@ -259,6 +409,18 @@ def parse_args():
     parser.add_argument("--loss_chunk_size", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--topk_metric", type=int, default=None)
+    parser.add_argument("--chain_loss_weight", type=float, default=None)
+    parser.add_argument("--chain_loss_max_depth", type=int, default=None)
+    parser.add_argument("--chain_bootstrap_from_medusa", default=None)
+    parser.add_argument("--chain_bottleneck_ratio", type=int, default=None)
+    parser.add_argument("--chain_gate_init", type=float, default=None)
+    parser.add_argument("--reflex_fast_state_dim", type=int, default=None)
+    parser.add_argument("--reflex_init_scale", type=float, default=None)
+    parser.add_argument("--reflex_loss_weight", type=float, default=None)
+    parser.add_argument("--reflex_loss_max_depth", type=int, default=None)
+    parser.add_argument("--reflex_top_m", type=int, default=None)
+    parser.add_argument("--reflex_delta_scale", type=float, default=None)
+    parser.add_argument("--reflex_correction_clip_norm", type=float, default=None)
     return parser.parse_args()
 
 
@@ -297,15 +459,41 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype, config=hf_config).cuda().eval()
     model.requires_grad_(False)
     base = unwrap_causal_lm(model)
-    medusa_heads = MedusaHeads(
-        hf_config.hidden_size,
-        hf_config.vocab_size,
-        num_heads=int(cfg.get("num_medusa_heads", 3)),
-        dtype=head_dtype,
-        tie_lm_head=bool(cfg.get("tie_lm_head", True)),
-        lm_head=base.lm_head,
-        medusa_loss_decay=float(cfg.get("medusa_loss_decay", 0.8)),
-    ).cuda().train()
+    load_medusa_checkpoint = str(cfg.get("load_medusa_checkpoint", "") or "")
+    if load_medusa_checkpoint:
+        medusa_heads = MedusaHeads.from_pretrained(
+            load_medusa_checkpoint,
+            map_location="cpu",
+            dtype=head_dtype,
+            lm_head=base.lm_head,
+            chain_bottleneck_ratio=int(cfg.get("chain_bottleneck_ratio", 8)),
+            chain_gate_init=float(cfg.get("chain_gate_init", -3.0)),
+            reflex_fast_state_dim=int(cfg.get("reflex_fast_state_dim", 0) or 0),
+            reflex_init_scale=float(cfg.get("reflex_init_scale", 0.0)),
+        )
+        print(f"Loaded initial MEDUSA heads from {load_medusa_checkpoint}")
+    else:
+        medusa_heads = MedusaHeads(
+            hf_config.hidden_size,
+            hf_config.vocab_size,
+            num_heads=int(cfg.get("num_medusa_heads", 3)),
+            dtype=head_dtype,
+            tie_lm_head=bool(cfg.get("tie_lm_head", True)),
+            lm_head=base.lm_head,
+            medusa_loss_decay=float(cfg.get("medusa_loss_decay", 0.8)),
+            chain_bottleneck_ratio=int(cfg.get("chain_bottleneck_ratio", 8)),
+            chain_gate_init=float(cfg.get("chain_gate_init", -3.0)),
+            reflex_fast_state_dim=int(cfg.get("reflex_fast_state_dim", 0) or 0),
+            reflex_init_scale=float(cfg.get("reflex_init_scale", 0.0)),
+        )
+    medusa_heads = medusa_heads.cuda().train()
+    if _as_bool(cfg.get("train_reflex_only", False)):
+        for name, param in medusa_heads.named_parameters():
+            param.requires_grad_(name.startswith("reflex_"))
+    elif load_medusa_checkpoint and _as_bool(cfg.get("freeze_loaded_base_heads", False)):
+        for name, param in medusa_heads.named_parameters():
+            if name.startswith("heads.") or name.startswith("chain_cell."):
+                param.requires_grad_(False)
 
     examples = _load_json_dataset(dataset_path)
     random.shuffle(examples)
@@ -335,8 +523,11 @@ def main() -> None:
         drop_last=False,
     )
 
+    trainable_params = [param for param in medusa_heads.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable MEDUSA/reflex parameters. Check train_reflex_only/reflex_fast_state_dim settings.")
     optimizer = torch.optim.AdamW(
-        medusa_heads.parameters(),
+        trainable_params,
         lr=float(cfg.get("learning_rate", 5e-4)),
         weight_decay=float(cfg.get("weight_decay", 0.0)),
     )
@@ -377,8 +568,17 @@ def main() -> None:
                 attention_mask,
                 loss_mask,
                 base.lm_head,
+                embedding_layer=base.get_input_embeddings(),
                 chunk_size=int(cfg.get("loss_chunk_size", 64)),
                 topk=int(cfg.get("topk_metric", 5)),
+                chain_loss_weight=float(cfg.get("chain_loss_weight", 0.0)),
+                chain_loss_max_depth=int(cfg.get("chain_loss_max_depth", int(cfg.get("num_medusa_heads", 3)))),
+                chain_bootstrap_from_medusa=_as_bool(cfg.get("chain_bootstrap_from_medusa", True)),
+                reflex_loss_weight=float(cfg.get("reflex_loss_weight", 0.0)),
+                reflex_loss_max_depth=int(cfg.get("reflex_loss_max_depth", int(cfg.get("num_medusa_heads", 3)))),
+                reflex_top_m=int(cfg.get("reflex_top_m", 32)),
+                reflex_delta_scale=float(cfg.get("reflex_delta_scale", 0.05)),
+                reflex_correction_clip_norm=float(cfg.get("reflex_correction_clip_norm", 1.0)),
             )
             if (not loss.requires_grad) or (not torch.isfinite(loss)):
                 row = {
@@ -400,8 +600,29 @@ def main() -> None:
                 peak_memory = max(peak_memory, torch.cuda.max_memory_allocated())
 
             if (batch_idx + 1) % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(medusa_heads.parameters(), float(cfg.get("grad_clip_norm", 1.0)))
+                grad_norm = torch.nn.utils.clip_grad_norm_(medusa_heads.parameters(), float(cfg.get("grad_clip_norm", 1.0)))
+                if not bool(torch.isfinite(torch.as_tensor(grad_norm)).item()):
+                    row = {
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                        "batch": batch_idx,
+                        "learning_rate": scheduler.get_last_lr()[0],
+                        "skipped_nonfinite_grad": True,
+                        "grad_norm": float("nan"),
+                        **stats,
+                    }
+                    with metrics_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(row, ensure_ascii=True) + "\n")
+                    optimizer.zero_grad(set_to_none=True)
+                    progress.set_postfix(loss="nan_grad", tok_s=f"{seen_tokens / max(time.time() - start_time, 1e-9):.0f}", refresh=False)
+                    progress.update(1)
+                    continue
                 optimizer.step()
+                if _module_has_nonfinite(medusa_heads):
+                    raise RuntimeError(
+                        "Non-finite MEDUSA/reflex parameters after optimizer.step(); "
+                        "aborting before saving a corrupted checkpoint. Lower learning_rate or loss weights."
+                    )
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
@@ -430,10 +651,25 @@ def main() -> None:
         "base_model_name_or_path": model_name_or_path,
         "dataset_path": str(dataset_path),
         "num_train_examples": len(train_examples),
+        "load_medusa_checkpoint": load_medusa_checkpoint,
+        "train_reflex_only": _as_bool(cfg.get("train_reflex_only", False)),
+        "freeze_loaded_base_heads": _as_bool(cfg.get("freeze_loaded_base_heads", False)),
         "num_medusa_heads": medusa_heads.num_heads,
         "hidden_size": medusa_heads.hidden_size,
         "vocab_size": medusa_heads.vocab_size,
         "medusa_loss_decay": medusa_heads.medusa_loss_decay,
+        "chain_bottleneck_ratio": medusa_heads.chain_bottleneck_ratio,
+        "chain_gate_init": medusa_heads.chain_gate_init,
+        "chain_loss_weight": float(cfg.get("chain_loss_weight", 0.0)),
+        "chain_loss_max_depth": int(cfg.get("chain_loss_max_depth", int(cfg.get("num_medusa_heads", 3)))),
+        "chain_bootstrap_from_medusa": _as_bool(cfg.get("chain_bootstrap_from_medusa", True)),
+        "reflex_fast_state_dim": medusa_heads.reflex_fast_state_dim,
+        "reflex_init_scale": medusa_heads.reflex_init_scale,
+        "reflex_loss_weight": float(cfg.get("reflex_loss_weight", 0.0)),
+        "reflex_loss_max_depth": int(cfg.get("reflex_loss_max_depth", int(cfg.get("num_medusa_heads", 3)))),
+        "reflex_top_m": int(cfg.get("reflex_top_m", 32)),
+        "reflex_delta_scale": float(cfg.get("reflex_delta_scale", 0.05)),
+        "reflex_correction_clip_norm": float(cfg.get("reflex_correction_clip_norm", 1.0)),
         "head_dtype": str(head_dtype).replace("torch.", ""),
         "max_seq_len": int(cfg.get("max_seq_len", 1024)),
         "global_step": global_step,

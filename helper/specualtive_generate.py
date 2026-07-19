@@ -442,6 +442,9 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
     start_time=time.time()
     target_past_key_values=DynamicCache()
     avg_acc_length=[0,0]
+    total_accepted_draft_tokens = 0
+    total_proposed_draft_tokens = 0
+    total_verify_rounds = 0
     eos_token_id = tokenizer.eos_token_id
     bsz=input_ids.shape[0]
     end_sig=[0]*bsz
@@ -621,6 +624,7 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         past_kv_len=target_past_key_values.get_seq_length()
         kv_length=past_kv_len+draft_total_token+1
         q_length=draft_total_token+1
+        round_draft_candidates_per_sequence = int(next_token_trees.shape[-1])
 
         target_trees=draft_trees
         
@@ -709,6 +713,8 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         acc_length=[0]*bsz
         chosen_index=[[] for _ in range(bsz)]
         next_token=[[] for _ in range(bsz)]
+        round_accepted_draft_tokens = 0
+        round_verified_sequences = 0
             
         target_next_token_tree_list=target_next_token_tree.tolist()
         
@@ -764,9 +770,15 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
                 
                 avg_acc_length[0]=avg_acc_length[0]+acc_length[idx_tree]
                 avg_acc_length[1]+=1
+                round_verified_sequences += 1
+                round_accepted_draft_tokens += max(acc_length[idx_tree] - 1, 0)
                         
             else:
                 acc_length[idx_tree]=0
+
+        total_verify_rounds += 1
+        total_accepted_draft_tokens += round_accepted_draft_tokens
+        total_proposed_draft_tokens += round_verified_sequences * round_draft_candidates_per_sequence
 
         max_acc_length=max(acc_length)
         last_valid_index=[max_acc_length-1]*bsz 
@@ -1115,8 +1127,16 @@ def speculative_generate(model, input_ids, attention_mask, tokenizer,
         'generated_token_ids':filtered_generated_token_ids,
         'max_sequence_length':max_sequence_length,
         'total_acc_length':avg_acc_length[0],
+        'average_accept_length': avg_acc_length[0] / max(avg_acc_length[1], 1),
         'total_acc':max_sequence_length/token_num,
         'total_decoded_token_num':avg_acc_length[1],
+        'total_accepted_draft_tokens': int(total_accepted_draft_tokens),
+        'total_proposed_draft_tokens': int(total_proposed_draft_tokens),
+        'draft_acceptance_rate': (
+            total_accepted_draft_tokens / total_proposed_draft_tokens
+            if total_proposed_draft_tokens else 0.0
+        ),
+        'total_verify_rounds': int(total_verify_rounds),
         'total_time_cost':time.time()-start_time,
         'target_time_cost':total_target_time,
         'draft_time_cost':total_draft_time,

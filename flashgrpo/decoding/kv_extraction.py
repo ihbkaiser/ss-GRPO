@@ -67,6 +67,23 @@ def _gather_paths_from_layer(
     return tree_tensor.gather(dim=2, index=expanded).contiguous()
 
 
+def _compact_tree_layer_in_place(
+    tree_tensor: torch.Tensor,
+    path_positions: torch.Tensor,
+    *,
+    old_seq_len: int,
+    max_len: int,
+) -> torch.Tensor:
+    """Move accepted tree KV into the first tail slots without copying prefix KV."""
+
+    path = _gather_paths_from_layer(tree_tensor, path_positions)
+    tree_tensor[:, :, old_seq_len : old_seq_len + max_len, :].copy_(path)
+    # The view is intentionally allowed to be non-contiguous. DynamicCache
+    # concatenates it with the next token block before attention, producing a
+    # contiguous tensor while avoiding an O(prefix_length) copy here.
+    return tree_tensor[:, :, : old_seq_len + max_len, :]
+
+
 def extract_accepted_path_kv(
     old_past_key_values,
     tree_past_key_values,
@@ -74,6 +91,7 @@ def extract_accepted_path_kv(
     *,
     causal_lm=None,
     cache_format: str = "auto",
+    compact_in_place: bool = True,
 ) -> KvExtractionResult:
     """Compact tree-forward KV cache to old prefix + accepted path nodes.
 
@@ -94,58 +112,107 @@ def extract_accepted_path_kv(
         device=first_key.device,
     )
     tree_seq_len = int(first_key.shape[2])
-    if int(path_positions.max().item()) >= tree_seq_len:
+    max_path_position = old_seq_len + max(max(int(node_idx) for node_idx in path) for path in accepted_node_indices)
+    if max_path_position >= tree_seq_len:
         raise ValueError(
-            f"Accepted node points outside tree cache: max_pos={int(path_positions.max().item())}, "
+            f"Accepted node points outside tree cache: max_pos={max_path_position}, "
             f"tree_seq_len={tree_seq_len}, old_seq_len={old_seq_len}"
         )
 
     if hasattr(tree_past_key_values, "key_cache"):
-        new_cache = _new_dynamic_cache(causal_lm)
+        new_cache = tree_past_key_values if compact_in_place else _new_dynamic_cache(causal_lm)
         new_keys = []
         new_values = []
         for layer_idx in range(_cache_layer_count(tree_past_key_values)):
             tree_key, tree_value = _get_cache_layer(tree_past_key_values, layer_idx)
-            prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
-            prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
-            path_key = _gather_paths_from_layer(tree_key, path_positions)
-            path_value = _gather_paths_from_layer(tree_value, path_positions)
-            new_keys.append(torch.cat([prefix_key, path_key], dim=2).contiguous())
-            new_values.append(torch.cat([prefix_value, path_value], dim=2).contiguous())
+            if compact_in_place:
+                new_keys.append(
+                    _compact_tree_layer_in_place(
+                        tree_key,
+                        path_positions,
+                        old_seq_len=old_seq_len,
+                        max_len=max_len,
+                    )
+                )
+                new_values.append(
+                    _compact_tree_layer_in_place(
+                        tree_value,
+                        path_positions,
+                        old_seq_len=old_seq_len,
+                        max_len=max_len,
+                    )
+                )
+            else:
+                prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
+                prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
+                path_key = _gather_paths_from_layer(tree_key, path_positions)
+                path_value = _gather_paths_from_layer(tree_value, path_positions)
+                new_keys.append(torch.cat([prefix_key, path_key], dim=2).contiguous())
+                new_values.append(torch.cat([prefix_value, path_value], dim=2).contiguous())
         new_cache.key_cache = new_keys
         new_cache.value_cache = new_values
-        return KvExtractionResult(new_cache, max_len, "dynamic_key_cache")
+        mode = "dynamic_key_cache_in_place" if compact_in_place else "dynamic_key_cache"
+        return KvExtractionResult(new_cache, max_len, mode)
 
     if isinstance(tree_past_key_values, (tuple, list)):
         layers = []
         for tree_key, tree_value in tree_past_key_values:
-            prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
-            prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
-            path_key = _gather_paths_from_layer(tree_key, path_positions)
-            path_value = _gather_paths_from_layer(tree_value, path_positions)
-            layers.append(
-                (
-                    torch.cat([prefix_key, path_key], dim=2).contiguous(),
-                    torch.cat([prefix_value, path_value], dim=2).contiguous(),
+            if compact_in_place:
+                key = _compact_tree_layer_in_place(
+                    tree_key,
+                    path_positions,
+                    old_seq_len=old_seq_len,
+                    max_len=max_len,
                 )
-            )
-        return KvExtractionResult(tuple(layers), max_len, "legacy_tuple")
+                value = _compact_tree_layer_in_place(
+                    tree_value,
+                    path_positions,
+                    old_seq_len=old_seq_len,
+                    max_len=max_len,
+                )
+            else:
+                prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
+                prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
+                path_key = _gather_paths_from_layer(tree_key, path_positions)
+                path_value = _gather_paths_from_layer(tree_value, path_positions)
+                key = torch.cat([prefix_key, path_key], dim=2).contiguous()
+                value = torch.cat([prefix_value, path_value], dim=2).contiguous()
+            layers.append((key, value))
+        mode = "legacy_tuple_in_place" if compact_in_place else "legacy_tuple"
+        return KvExtractionResult(tuple(layers), max_len, mode)
 
     # New Cache classes in transformers may expose layers instead of key_cache.
     if hasattr(tree_past_key_values, "layers"):
-        new_cache = _new_dynamic_cache(causal_lm)
+        new_cache = tree_past_key_values if compact_in_place else _new_dynamic_cache(causal_lm)
         for layer_idx in range(_cache_layer_count(tree_past_key_values)):
             tree_key, tree_value = _get_cache_layer(tree_past_key_values, layer_idx)
-            prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
-            prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
-            path_key = _gather_paths_from_layer(tree_key, path_positions)
-            path_value = _gather_paths_from_layer(tree_value, path_positions)
+            if compact_in_place:
+                compact_key = _compact_tree_layer_in_place(
+                    tree_key,
+                    path_positions,
+                    old_seq_len=old_seq_len,
+                    max_len=max_len,
+                )
+                compact_value = _compact_tree_layer_in_place(
+                    tree_value,
+                    path_positions,
+                    old_seq_len=old_seq_len,
+                    max_len=max_len,
+                )
+            else:
+                prefix_key = tree_key[:, :, :old_seq_len, :].contiguous()
+                prefix_value = tree_value[:, :, :old_seq_len, :].contiguous()
+                path_key = _gather_paths_from_layer(tree_key, path_positions)
+                path_value = _gather_paths_from_layer(tree_value, path_positions)
+                compact_key = torch.cat([prefix_key, path_key], dim=2).contiguous()
+                compact_value = torch.cat([prefix_value, path_value], dim=2).contiguous()
             _set_cache_layer(
                 new_cache,
                 layer_idx,
-                torch.cat([prefix_key, path_key], dim=2).contiguous(),
-                torch.cat([prefix_value, path_value], dim=2).contiguous(),
+                compact_key,
+                compact_value,
             )
-        return KvExtractionResult(new_cache, max_len, "dynamic_layers")
+        mode = "dynamic_layers_in_place" if compact_in_place else "dynamic_layers"
+        return KvExtractionResult(new_cache, max_len, mode)
 
     raise TypeError(f"Unsupported cache type for KV path extraction: {type(tree_past_key_values)}")
