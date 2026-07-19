@@ -25,8 +25,9 @@ learning. FlashGRPO uses extra heads on top of the policy hidden state:
 2. MEDUSA heads propose future candidates `y2, y3, ...`.
 3. A tree-attention target forward verifies candidate nodes.
 4. The decoder walks a path by sampling from target logits at each parent.
-5. A future token is accepted only if the target-sampled token is in the
-   MEDUSA candidate children.
+5. A matching future token continues through the verified tree. A non-matching
+   target sample is retained as a correction token and becomes the forced root
+   of the next round, so stochastic decoding does not resample on rejection.
 
 The MEDUSA heads never directly decide an output token in the main path.
 
@@ -188,3 +189,35 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python flashgrpo/scripts/test_kv_extraction.
 
 If `pytest` is unavailable, the smoke script above is the main integration
 check.
+# Within-rollout motivation experiment
+
+For a complete one-command run (pretrain heads when missing, train GRPO,
+select an adjacent checkpoint pair, replay all three variants, and archive the
+logs):
+
+```bash
+bash flashgrpo_b200/scripts/run_motivation_oneclick.sh
+```
+
+By default the one-click runner evaluates checkpoint lags 1, 2, and 3 against
+the newest policy checkpoint. Override this with, for example,
+`MISMATCH_LAGS=1,3,5`. Unavailable lags are skipped and recorded in the master
+log.
+
+To isolate feedback latency, replay a policy checkpoint immediately after an
+update with the MEDUSA heads from immediately before that update:
+
+```bash
+NEW_TARGET_LORA=outputs/.../target_lora/step10 \
+OLD_HEAD_DIR=outputs/.../medusa_heads/step5 \
+MOTIVATION_PROMPTS=32 \
+bash flashgrpo_b200/scripts/run_within_rollout_motivation.sh
+```
+
+The runner uses the same GSM8K subset, greedy decoding, fixed cpeak, and no
+policy/head update for all three variants (`disabled`, `delayed`, and
+`immediate`). It writes `within_rollout_windows.csv`,
+`within_rollout_comparison.csv`, and `within_rollout_motivation.{png,svg}` in
+the immediate run's log directory. `delayed` accumulates verifier feedback but
+withholds proposal injection until the trajectory is over; `immediate` applies
+the evolving fast state to subsequent proposals in that trajectory.

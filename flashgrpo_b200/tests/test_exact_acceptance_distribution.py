@@ -41,9 +41,56 @@ def test_exact_accepts_only_target_sampled_child():
     tree = CandidateTree(tokens=[5, 7, 9], parents=[-1, 0, 0], depths=[1, 2, 2])
     logits = torch.full((3, 16), -10.0)
     logits[0, 7] = 10.0
-    accepted, nodes, _ = exact_accept_path(tree, logits, do_sample=False, temperature=1.0, top_p=1.0, top_k=None)
+    accepted, nodes, _, correction = exact_accept_path(
+        tree,
+        logits,
+        do_sample=False,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+    )
     assert accepted == [5, 7]
     assert nodes == [0, 1]
+    assert correction is None
+
+
+def test_target_mismatch_is_returned_as_correction_token():
+    tree = CandidateTree(tokens=[5, 7], parents=[-1, 0], depths=[1, 2])
+    logits = torch.full((2, 16), -10.0)
+    logits[0, 9] = 10.0
+    accepted, nodes, _, correction = exact_accept_path(
+        tree,
+        logits,
+        do_sample=False,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+    )
+    assert accepted == [5]
+    assert nodes == [0]
+    assert correction == 9
+
+
+def test_stochastic_match_or_correction_preserves_target_distribution():
+    sample_count = 50_000
+    tree = CandidateTree(tokens=[2, 0], parents=[-1, 0], depths=[1, 2])
+    trees = [tree] * sample_count
+    root_logits = torch.log(torch.tensor([0.6, 0.4]))
+    tree_logits = root_logits.view(1, 1, 2).expand(sample_count, 2, 2).clone()
+
+    torch.manual_seed(456)
+    accepted, _, _, corrections = exact_accept_paths_batch(
+        trees,
+        tree_logits,
+        do_sample=True,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+    )
+    emitted = [tokens[1] if len(tokens) > 1 else correction for tokens, correction in zip(accepted, corrections)]
+    assert all(token is not None for token in emitted)
+    observed = torch.bincount(torch.tensor(emitted), minlength=2).float() / sample_count
+    assert torch.max(torch.abs(observed - torch.tensor([0.6, 0.4]))) < 0.015
 
 
 def test_packed_internal_logits_match_dense_acceptance():
