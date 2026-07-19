@@ -138,18 +138,21 @@ def exact_accept_path(
     temperature: float,
     top_p: float | None,
     top_k: int | None,
-) -> tuple[list[int], list[int], int]:
+) -> tuple[list[int], list[int], int, int | None]:
     """Walk one MEDUSA tree using target samples only.
 
     The root token has already been sampled from target logits before tree
-    construction. Future tokens are accepted only when a fresh target sample
-    from the current parent distribution is present among that parent node's
-    children.
+    construction. Future tree tokens are accepted only when a fresh target
+    sample from the current parent distribution is present among that parent's
+    children. A non-matching target sample is returned as a correction token;
+    callers must emit it, immediately or as the forced root of the next round,
+    rather than resampling from the same distribution.
     """
 
     accepted_tokens = [int(tree.tokens[0])]
     accepted_nodes = [0]
     parent = 0
+    correction_token = None
     while True:
         children = tree.children.get(parent, [])
         if not children:
@@ -169,11 +172,12 @@ def exact_accept_path(
                 match = child
                 break
         if match is None:
+            correction_token = sampled
             break
         accepted_tokens.append(sampled)
         accepted_nodes.append(match)
         parent = match
-    return accepted_tokens, accepted_nodes, parent
+    return accepted_tokens, accepted_nodes, parent, correction_token
 
 
 @torch.no_grad()
@@ -187,19 +191,21 @@ def exact_accept_paths_batch(
     top_k: int | None,
     node_to_logit: torch.Tensor | None = None,
     node_to_logit_cpu: list[list[int]] | None = None,
-) -> tuple[list[list[int]], list[list[int]], list[int]]:
+) -> tuple[list[list[int]], list[list[int]], list[int], list[int | None]]:
     """Batched equivalent of :func:`exact_accept_path`.
 
     Target samples at the same tree depth are drawn in one CUDA operation.
     Candidate lookup remains on CPU because ``CandidateTree`` is a compact
-    Python structure. The accepted distribution is unchanged: every token is
-    still sampled solely from the target policy at its current parent node.
+    Python structure. Non-matching samples are returned separately as target
+    correction tokens. Discarding those samples and drawing again would bias
+    stochastic decoding toward the proposal tree.
     """
 
     batch_size = len(trees)
     accepted_tokens = [[int(tree.tokens[0])] for tree in trees]
     accepted_nodes = [[0] for _ in trees]
     parent_nodes = [0 for _ in trees]
+    correction_tokens: list[int | None] = [None for _ in trees]
     active_rows = [row for row, tree in enumerate(trees) if tree.children.get(0)]
 
     while active_rows:
@@ -247,6 +253,7 @@ def exact_accept_paths_batch(
                 None,
             )
             if match is None:
+                correction_tokens[row] = int(token)
                 continue
             accepted_tokens[row].append(int(token))
             accepted_nodes[row].append(int(match))
@@ -257,4 +264,4 @@ def exact_accept_paths_batch(
 
     if len(accepted_tokens) != batch_size:
         raise RuntimeError("Batched acceptance produced an invalid batch size")
-    return accepted_tokens, accepted_nodes, parent_nodes
+    return accepted_tokens, accepted_nodes, parent_nodes, correction_tokens

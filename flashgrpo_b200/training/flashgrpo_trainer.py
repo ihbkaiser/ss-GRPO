@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -386,12 +387,19 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
     if len(rows) == 1:
         return rows[0]
     generated = []
+    motivation_trace = []
     for row in rows:
+        sequence_offset = len(generated)
         generated.extend(row["generated_token_ids"])
+        for trace_row in row.get("motivation_trace", []):
+            adjusted = dict(trace_row)
+            adjusted["sequence_id"] = int(adjusted["sequence_id"]) + sequence_offset
+            motivation_trace.append(adjusted)
     total_acc_length = sum(int(row.get("total_acc_length", 0)) for row in rows)
     total_decoded = sum(int(row.get("total_decoded_token_num", 0)) for row in rows)
     total_accepted = sum(int(row.get("total_accepted_medusa_tokens", row.get("total_accepted_draft_tokens", 0))) for row in rows)
     total_proposed = sum(int(row.get("total_proposed_medusa_tokens", row.get("total_proposed_draft_tokens", 0))) for row in rows)
+    total_corrections = sum(int(row.get("total_correction_tokens", 0)) for row in rows)
     total_verify = sum(int(row.get("total_verify_rounds", 0)) for row in rows)
     tree_query_rows = sum(int(row.get("tree_query_rows", 0)) for row in rows)
     tree_lm_head_rows = sum(int(row.get("tree_lm_head_rows", 0)) for row in rows)
@@ -408,6 +416,8 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "total_proposed_draft_tokens": int(total_proposed),
         "total_accepted_medusa_tokens": int(total_accepted),
         "total_proposed_medusa_tokens": int(total_proposed),
+        "total_correction_tokens": int(total_corrections),
+        "correction_token_rate": total_corrections / max(total_decoded, 1),
         "draft_acceptance_rate": total_accepted / max(total_proposed, 1),
         "medusa_acceptance_rate": total_accepted / max(total_proposed, 1),
         "total_verify_rounds": int(total_verify),
@@ -438,6 +448,7 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "reflex_metrics": reflex_metrics,
         "reflex_head_metrics": reflex_metrics.get("per_head", {}),
         "reflex_aux_records": _merge_reflex_aux_records([row.get("reflex_aux_records", {}) for row in rows]),
+        "motivation_trace": motivation_trace,
     }
     return out
 
@@ -740,6 +751,9 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_aux_cache_max_records=int(aux.get("max_cached_records", fg.get("medusa_max_tokens_per_update", 8192))),
         reflex_aux_cache_stride=int(aux.get("cache_stride", 1)),
         reflex_aux_store_fast_state=bool(aux.get("update_fast_state_injections", False)),
+        reflex_adaptation_mode=str(reflex.get("adaptation_mode", "immediate")),
+        motivation_trace_enabled=bool(reflex.get("motivation_trace_enabled", False)),
+        motivation_trace_window_tokens=int(reflex.get("motivation_trace_window_tokens", 32)),
     )
 
 
@@ -1279,6 +1293,8 @@ def run_training(config: dict[str, Any]) -> None:
                 "total_verify_rounds": outputs.get("total_verify_rounds", 0),
                 "accepted_medusa_tokens": outputs.get("total_accepted_medusa_tokens", 0),
                 "proposed_medusa_tokens": outputs.get("total_proposed_medusa_tokens", 0),
+                "correction_tokens": outputs.get("total_correction_tokens", 0),
+                "correction_token_rate": outputs.get("correction_token_rate", 0.0),
                 "tree_nodes_per_seq": outputs["average_tree_nodes_per_seq"],
                 "cpeak_nodes": int(cpeak_for_batch),
                 "cpeak_tuning": bool(cpeak_tuning),
@@ -1304,6 +1320,16 @@ def run_training(config: dict[str, Any]) -> None:
                 "reflex_aux_cache_collected": bool(collect_reflex_aux_cache),
                 "reflex_aux_cached_records": int((outputs.get("reflex_aux_records", {}).get("hidden").shape[0]) if outputs.get("reflex_aux_records", {}).get("hidden") is not None else 0),
                 "reflex": outputs.get("reflex_metrics", {}),
+                "motivation_trace": outputs.get("motivation_trace", []),
+                "motivation_adaptation_mode": str(reflex_cfg.get("adaptation_mode", "immediate")),
+                "motivation_generation_hashes": (
+                    [
+                        hashlib.sha256(",".join(map(str, token_ids)).encode("utf-8")).hexdigest()
+                        for token_ids in outputs["generated_token_ids"]
+                    ]
+                    if bool(reflex_cfg.get("motivation_trace_enabled", False))
+                    else []
+                ),
                 "mean_response_length": length_mean,
                 "response_length_variance": float(np.var(token_lengths)) if token_lengths else 0.0,
                 "response_length_stdev": length_stdev,

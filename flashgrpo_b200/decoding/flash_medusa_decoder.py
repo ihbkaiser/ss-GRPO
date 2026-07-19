@@ -114,6 +114,9 @@ class FlashMedusaConfig:
     reflex_aux_cache_max_records: int = 8192
     reflex_aux_cache_stride: int = 1
     reflex_aux_store_fast_state: bool = False
+    reflex_adaptation_mode: str = "immediate"
+    motivation_trace_enabled: bool = False
+    motivation_trace_window_tokens: int = 32
 
 
 class FlashMedusaDecoder:
@@ -128,6 +131,8 @@ class FlashMedusaDecoder:
             raise ValueError(f"Unsupported cache_update_mode={config.cache_update_mode}")
         if config.proposal_mode not in {"medusa", "chain"}:
             raise ValueError(f"Unsupported proposal_mode={config.proposal_mode}")
+        if config.reflex_adaptation_mode not in {"disabled", "delayed", "immediate"}:
+            raise ValueError("reflex_adaptation_mode must be disabled, delayed, or immediate")
         self._reflex_guard_baseline = 0.0
         self._reflex_guard_samples = 0
         self._reflex_guard_bad_windows = 0
@@ -140,7 +145,7 @@ class FlashMedusaDecoder:
         self._reflex_guard_disabled_until = -1
 
     def _reflex_enabled(self) -> bool:
-        if not bool(self.config.reflex_enabled):
+        if not bool(self.config.reflex_enabled) or self.config.reflex_adaptation_mode == "disabled":
             return False
         if self.config.reflex_state_space == "hidden":
             return True
@@ -152,6 +157,7 @@ class FlashMedusaDecoder:
     def _reflex_effective_injection_scale(self, generation_step: int) -> float:
         if not (
             self._reflex_enabled()
+            and self.config.reflex_adaptation_mode == "immediate"
             and bool(self.config.reflex_proposal_injection_enabled)
             and float(self.config.reflex_proposal_injection_scale) != 0.0
         ):
@@ -602,7 +608,33 @@ class FlashMedusaDecoder:
 
         total_sequences = attention_mask.shape[0]
         generated: list[list[int]] = [[] for _ in range(total_sequences)]
+        trace_enabled = bool(cfg.motivation_trace_enabled)
+        trace_window = max(1, int(cfg.motivation_trace_window_tokens))
+        trace_buckets: dict[tuple[int, int], dict] = {}
+
+        def trace_bucket(sequence_id: int, generated_position: int) -> dict:
+            window_index = max(0, int(generated_position)) // trace_window
+            key = (int(sequence_id), window_index)
+            if key not in trace_buckets:
+                trace_buckets[key] = {
+                    "sequence_id": int(sequence_id),
+                    "window_index": int(window_index),
+                    "token_start": int(window_index * trace_window),
+                    "token_end": int((window_index + 1) * trace_window - 1),
+                    "verify_rounds": 0,
+                    "accepted_length_sum": 0,
+                    "accepted_medusa_tokens": 0,
+                    "proposed_medusa_tokens": 0,
+                    "feedback_events": 0,
+                    "fast_state_rms_sum": 0.0,
+                    "fast_state_rms_observations": 0,
+                }
+            return trace_buckets[key]
+
         active_original_indices = list(range(total_sequences))
+        # Preserve a target sample that misses the proposal tree. Carrying it
+        # into the next round avoids conditioning output on proposal membership.
+        pending_root_tokens: dict[int, int] = {}
         full_attention_mask = attention_mask.long()
         logical_lens = mask_logical_lengths(full_attention_mask)
         initial_logical_lens = logical_lens.clone()
@@ -655,6 +687,7 @@ class FlashMedusaDecoder:
         total_decoded_steps = 0
         total_accepted_medusa_tokens = 0
         total_proposed_medusa_tokens = 0
+        total_correction_tokens = 0
         total_verify_rounds = 0
         active_batch_sum = 0
         tree_node_sum = 0
@@ -688,13 +721,32 @@ class FlashMedusaDecoder:
                 active_fast_state = None
                 active_effective_updates = None
 
-            root_tokens = sample_from_logits(
-                current_logits,
-                do_sample=cfg.do_sample,
-                temperature=cfg.temperature,
-                top_p=cfg.top_p,
-                top_k=cfg.top_k,
-            )
+            pending_rows = [
+                row for row, sequence_id in enumerate(active_original_indices)
+                if int(sequence_id) in pending_root_tokens
+            ]
+            pending_row_set = set(pending_rows)
+            fresh_rows = [row for row in range(active_bsz) if row not in pending_row_set]
+            root_tokens = torch.empty((active_bsz,), dtype=torch.long, device=device)
+            if fresh_rows:
+                fresh_index = torch.as_tensor(fresh_rows, dtype=torch.long, device=device)
+                fresh_tokens = sample_from_logits(
+                    current_logits.index_select(0, fresh_index),
+                    do_sample=cfg.do_sample,
+                    temperature=cfg.temperature,
+                    top_p=cfg.top_p,
+                    top_k=cfg.top_k,
+                )
+                root_tokens.index_copy_(0, fresh_index, fresh_tokens)
+            if pending_rows:
+                pending_index = torch.as_tensor(pending_rows, dtype=torch.long, device=device)
+                pending_values = torch.as_tensor(
+                    [pending_root_tokens.pop(int(active_original_indices[row])) for row in pending_rows],
+                    dtype=torch.long,
+                    device=device,
+                )
+                root_tokens.index_copy_(0, pending_index, pending_values)
+                total_correction_tokens += len(pending_rows)
 
             use_medusa_tree = int(generation_step) >= int(cfg.enable_medusa_spec_after)
             if use_medusa_tree:
@@ -877,8 +929,14 @@ class FlashMedusaDecoder:
                 raw_accepted_per_row = [[int(token)] for token in root_tokens.detach().cpu().tolist()]
                 raw_accepted_nodes_per_row = [[0] for _ in trees]
                 raw_parent_nodes = [0 for _ in trees]
+                raw_correction_tokens = [None for _ in trees]
             else:
-                raw_accepted_per_row, raw_accepted_nodes_per_row, raw_parent_nodes = exact_accept_paths_batch(
+                (
+                    raw_accepted_per_row,
+                    raw_accepted_nodes_per_row,
+                    raw_parent_nodes,
+                    raw_correction_tokens,
+                ) = exact_accept_paths_batch(
                     trees,
                     tree_logits,
                     do_sample=cfg.do_sample,
@@ -894,8 +952,13 @@ class FlashMedusaDecoder:
             accepted_nodes_per_row: list[list[int]] = []
             finished_flags: list[bool] = []
             parent_nodes: list[int] = []
-            for row, (raw_tokens, raw_nodes, raw_parent) in enumerate(
-                zip(raw_accepted_per_row, raw_accepted_nodes_per_row, raw_parent_nodes)
+            for row, (raw_tokens, raw_nodes, raw_parent, raw_correction) in enumerate(
+                zip(
+                    raw_accepted_per_row,
+                    raw_accepted_nodes_per_row,
+                    raw_parent_nodes,
+                    raw_correction_tokens,
+                )
             ):
                 accepted_tokens = list(raw_tokens)
                 accepted_nodes = list(raw_nodes)
@@ -911,6 +974,13 @@ class FlashMedusaDecoder:
                         eos_seen = True
                         break
                 accepted_len = len(accepted_tokens)
+                finished = eos_seen or int(old_logical_lens_cpu[row]) + accepted_len >= max_length
+                if (
+                    raw_correction is not None
+                    and accepted_len == len(raw_tokens)
+                    and not finished
+                ):
+                    pending_root_tokens[int(active_original_indices[row])] = int(raw_correction)
                 accept_hist[accepted_len] = accept_hist.get(accepted_len, 0) + 1
                 for depth in range(2, accepted_len + 1):
                     accept_by_depth[depth] = accept_by_depth.get(depth, 0) + 1
@@ -918,9 +988,20 @@ class FlashMedusaDecoder:
                 total_decoded_steps += 1
                 total_accepted_medusa_tokens += max(accepted_len - 1, 0)
                 total_proposed_medusa_tokens += max(tree.node_count - 1, 0)
+                if trace_enabled:
+                    sequence_id = int(active_original_indices[row])
+                    bucket = trace_bucket(sequence_id, len(generated[sequence_id]))
+                    bucket["verify_rounds"] += 1
+                    bucket["accepted_length_sum"] += int(accepted_len)
+                    bucket["accepted_medusa_tokens"] += max(accepted_len - 1, 0)
+                    bucket["proposed_medusa_tokens"] += max(tree.node_count - 1, 0)
+                    if active_fast_state is not None:
+                        state_rms = float(active_fast_state[row].float().square().mean().sqrt().detach().cpu())
+                        bucket["fast_state_rms_sum"] += state_rms
+                        bucket["fast_state_rms_observations"] += 1
                 accepted_per_row.append(accepted_tokens)
                 accepted_nodes_per_row.append([int(node_idx) for node_idx in accepted_nodes])
-                finished_flags.append(eos_seen or int(old_logical_lens_cpu[row]) + accepted_len >= max_length)
+                finished_flags.append(finished)
                 parent_nodes.append(parent)
 
             total_verify_rounds += 1
@@ -995,7 +1076,10 @@ class FlashMedusaDecoder:
                             true_tokens,
                         )
                         feedback_index = torch.as_tensor(feedback_row_indices, dtype=torch.long, device=device)
-                        feedback.index_copy_(0, feedback_index, sparse.feedback)
+                        projected_feedback = sparse.feedback
+                        if cfg.reflex_state_space != "hidden":
+                            projected_feedback = self.medusa_heads.feedback_to_fast_state(projected_feedback)
+                        feedback.index_copy_(0, feedback_index, projected_feedback)
                         has_feedback.index_copy_(0, feedback_index, sparse.has_feedback)
                         effective_mass.index_copy_(0, feedback_index, sparse.effective_mass)
                         reflex_stats.add_records(
@@ -1005,6 +1089,19 @@ class FlashMedusaDecoder:
                             sparse.record_tv,
                             sparse.record_gates,
                         )
+                        if trace_enabled:
+                            for group_idx, local_row in enumerate(feedback_row_indices):
+                                if not bool(sparse.has_feedback[group_idx].item()):
+                                    continue
+                                row = offset_rows[local_row]
+                                sequence_id = int(active_original_indices[row])
+                                generated_position = (
+                                    int(old_logical_lens_cpu[row])
+                                    - int(initial_logical_lens[sequence_id].item())
+                                    + offset
+                                    - 1
+                                )
+                                trace_bucket(sequence_id, generated_position)["feedback_events"] += 1
                         if reflex_aux_buffer is not None:
                             for group_idx, local_row in enumerate(feedback_row_indices):
                                 row = offset_rows[local_row]
@@ -1183,10 +1280,25 @@ class FlashMedusaDecoder:
         reflex_metrics["pending_prediction_records"] = len(prediction_buffer) if prediction_buffer is not None else 0
         reflex_metrics["feedback_collection_rounds"] = int(reflex_feedback_collection_rounds)
         reflex_metrics["feedback_collection_fraction"] = reflex_feedback_collection_rounds / max(total_verify_rounds, 1)
+        reflex_metrics["adaptation_mode"] = str(cfg.reflex_adaptation_mode)
         if reflex_manager is not None:
             reflex_metrics.update(reflex_manager.norm_stats())
         else:
             reflex_metrics.update({"fast_state_norm_mean": 0.0, "fast_state_norm_p95": 0.0})
+        motivation_trace = []
+        if trace_enabled:
+            for key in sorted(trace_buckets):
+                trace_row = dict(trace_buckets[key])
+                observations = int(trace_row.pop("fast_state_rms_observations"))
+                rms_sum = float(trace_row.pop("fast_state_rms_sum"))
+                trace_row["average_accept_length"] = float(trace_row["accepted_length_sum"]) / max(
+                    int(trace_row["verify_rounds"]), 1
+                )
+                trace_row["medusa_acceptance_rate"] = float(trace_row["accepted_medusa_tokens"]) / max(
+                    int(trace_row["proposed_medusa_tokens"]), 1
+                )
+                trace_row["fast_state_rms_mean"] = rms_sum / max(observations, 1)
+                motivation_trace.append(trace_row)
         return {
             "generated_token_ids": generated,
             "max_sequence_length": max_sequence_length,
@@ -1198,6 +1310,8 @@ class FlashMedusaDecoder:
             "total_proposed_draft_tokens": int(total_proposed_medusa_tokens),
             "total_accepted_medusa_tokens": int(total_accepted_medusa_tokens),
             "total_proposed_medusa_tokens": int(total_proposed_medusa_tokens),
+            "total_correction_tokens": int(total_correction_tokens),
+            "correction_token_rate": total_correction_tokens / max(total_decoded_steps, 1),
             "draft_acceptance_rate": float(accept_rate),
             "medusa_acceptance_rate": float(accept_rate),
             "total_verify_rounds": int(total_verify_rounds),
@@ -1227,4 +1341,5 @@ class FlashMedusaDecoder:
             "reflex_metrics": reflex_metrics,
             "reflex_head_metrics": reflex_metrics.get("per_head", {}),
             "reflex_aux_records": reflex_aux_buffer.to_batch() if reflex_aux_buffer is not None else {},
+            "motivation_trace": motivation_trace,
         }
