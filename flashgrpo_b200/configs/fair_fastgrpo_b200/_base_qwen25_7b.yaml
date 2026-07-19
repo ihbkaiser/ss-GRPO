@@ -24,7 +24,11 @@ generation:
   repeated_generate_nums: 8
 
 training:
-  batch_size: 16
+  # Historical FastGRPO logs contain ceil(dataset_size / 8) rollout records
+  # and advance one GRPO step per roughly 32 usable prompts. This establishes
+  # the actual launch override as batch_size=8, accumulation_steps=4 even
+  # though the current b200.env defaults were later set to 16/2.
+  batch_size: 8
   num_epochs: 1
   start_epoch: 0
   start_batch: 0
@@ -34,7 +38,7 @@ training:
   train_data_fraction: 0.4
   train_subset_seed: 42
   max_train_samples: 0
-  accumulation_steps: 2
+  accumulation_steps: 4
   grpo_iteration_num: 1
   target_lr: 1.0e-6
   beta: 0.04
