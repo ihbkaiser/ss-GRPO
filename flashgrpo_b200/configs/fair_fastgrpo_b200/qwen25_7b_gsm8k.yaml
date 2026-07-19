@@ -1,0 +1,14 @@
+inherits: _base_qwen25_7b.yaml
+
+run_name: flashgrpo_fair_fastgrpo_b200_qwen25_7b_gsm8k
+
+data:
+  train_option: gsm8k
+
+training:
+  saved_model_dir: outputs/flashgrpo_fair_fastgrpo_b200_qwen25_7b_gsm8k/target_lora
+  saved_medusa_dir: outputs/flashgrpo_fair_fastgrpo_b200_qwen25_7b_gsm8k/medusa_heads
+
+logging:
+  log_dir: logs/flashgrpo_fair_fastgrpo_b200/qwen25_7b_gsm8k
+

@@ -1,0 +1,89 @@
+inherits: ../reflexgrpo_optimized_b200_qwen25_7b_simplelrabel3to5.yaml
+
+# Controlled workload profile matching fastgrpo/configs/b200.env. Dataset and
+# artifact paths are supplied by the six leaf configs in this directory.
+method: flashgrpo_fair_fastgrpo_b200_qwen25_7b
+seed: 42
+
+model:
+  model_dir: /workspace/storage-shared/models/Qwen2.5-7B-Instruct
+  model_type: qwen2
+  dtype: bf16
+  attn_implementation: sdpa
+
+generation:
+  do_sample: true
+  temperature: 1.0
+  top_p: 0.95
+  top_k:
+  # FastGRPO tokenizes up to 4096, then skips a batch when its padded prompt
+  # reaches max_length=2048. This explicit cap reproduces that effective bound.
+  max_prompt_length: 2048
+  # Total prompt + completion length, matching GEN_MAX_LENGTH in b200.env.
+  max_length: 2048
+  repeated_generate_nums: 8
+
+training:
+  batch_size: 16
+  num_epochs: 1
+  start_epoch: 0
+  start_batch: 0
+  start_used_items: 0
+  start_rollout_count: 0
+  sample_num: 100
+  train_data_fraction: 0.4
+  train_subset_seed: 42
+  max_train_samples: 0
+  accumulation_steps: 2
+  grpo_iteration_num: 1
+  target_lr: 1.0e-6
+  beta: 0.04
+  epsilon: 0.1
+  max_training_padding_gap: 1024
+  max_training_token: 8192
+  logps_chunk_size: 512
+  load_lora_path: ""
+  save_steps: 10
+  save_on_exception: true
+  num_workers: 8
+  persistent_workers: true
+
+flashgrpo:
+  medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b
+  require_pretrained_heads: true
+  allow_random_init: false
+  proposal_mode: medusa
+  acceptance: exact_target
+  typical:
+    enabled: false
+  # Cpeak autotuning is part of FlashGRPO. It may select any measured budget
+  # up to 768, matching FastGRPO local's global verification-capacity ceiling.
+  # Its tuning trials remain inside the timed run and therefore count in E2E.
+  cpeak_nodes: 128
+  auto_tune_cpeak_enabled: true
+  auto_tune_cpeak_candidates: [128, 192, 256, 384, 512, 768]
+  auto_tune_cpeak_trials_per_candidate: 3
+  auto_tune_cpeak_start_rollout: 0
+  max_tree_nodes_per_seq: 10
+  empty_cache_after_target_train: false
+  empty_cache_threshold_mb: 140000
+  empty_cache_reserved_ratio: 1.6
+  gpu_poll_interval_s: 20.0
+  inference_head_mirror: true
+  inference_head_dtype: bf16
+  head_inference_autocast: false
+  project_internal_tree_logits_only: true
+  inplace_kv_compaction: true
+
+aux_head_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b
+
+reflex:
+  feedback_stride: 8
+  feedback_stride_min: 8
+
+aux_update:
+  reflex_record_microbatch_size: 128
+
+logging:
+  append: false
+  statistical_time: false
