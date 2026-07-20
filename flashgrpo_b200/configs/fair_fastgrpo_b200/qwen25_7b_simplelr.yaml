@@ -6,9 +6,9 @@ data:
   train_option: simplelr_abel_level3to5
 
 training:
-  saved_model_dir: outputs/flashgrpo_fair_fastgrpo_b200_qwen25_7b_simplelr/target_lora
-  saved_medusa_dir: outputs/flashgrpo_fair_fastgrpo_b200_qwen25_7b_simplelr/medusa_heads
+  saved_model_dir: outputs/{run_name}/target_lora
+  saved_medusa_dir: outputs/{run_name}/medusa_heads
 
 logging:
-  log_dir: logs/flashgrpo_fair_fastgrpo_b200/qwen25_7b_simplelr
+  log_dir: logs/flashgrpo_fair_fastgrpo_b200/{run_name}
 

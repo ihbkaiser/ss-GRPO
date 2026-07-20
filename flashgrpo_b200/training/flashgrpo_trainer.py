@@ -792,7 +792,8 @@ def _aux_refresh_allowed_for_generation_step(config: dict[str, Any], generation_
 def run_training(config: dict[str, Any]) -> None:
     seed_everything(int(config.get("seed", 42)))
     run_name = str(config.get("run_name", "flashgrpo_run"))
-    log_dir = Path(config.get("logging", {}).get("log_dir", f"logs/flashgrpo/{run_name}"))
+    raw_log_dir = str(config.get("logging", {}).get("log_dir", f"logs/flashgrpo/{run_name}"))
+    log_dir = Path(raw_log_dir.format(run_name=run_name))
     logger = MetricsLogger(log_dir, append=bool(_get(config, "logging.append", False)))
     save_resolved_config(config, log_dir / "config_resolved.yaml")
     gpu_monitor = GpuMonitor(
@@ -1032,8 +1033,10 @@ def run_training(config: dict[str, Any]) -> None:
     generation_oom_split_retry = bool(_get(config, "flashgrpo.generation_oom_split_retry", True))
     generation_oom_max_splits = int(_get(config, "flashgrpo.generation_oom_max_splits", 3))
     save_steps = int(_get(config, "training.save_steps", 500))
-    saved_model_dir = Path(_get(config, "training.saved_model_dir", f"outputs/{run_name}/flashgrpo_target"))
-    saved_medusa_dir = Path(_get(config, "training.saved_medusa_dir", f"outputs/{run_name}/flashgrpo_medusa"))
+    raw_saved_model_dir = str(_get(config, "training.saved_model_dir", f"outputs/{run_name}/flashgrpo_target"))
+    raw_saved_medusa_dir = str(_get(config, "training.saved_medusa_dir", f"outputs/{run_name}/flashgrpo_medusa"))
+    saved_model_dir = Path(raw_saved_model_dir.format(run_name=run_name))
+    saved_medusa_dir = Path(raw_saved_medusa_dir.format(run_name=run_name))
     saved_model_dir.mkdir(parents=True, exist_ok=True)
     saved_medusa_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_cfg = config.get("checkpoint", {})
