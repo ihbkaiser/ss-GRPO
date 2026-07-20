@@ -1,0 +1,43 @@
+inherits: _base_qwen25_7b.yaml
+
+method: flashgrpo_ablation_medusa_online_ce_no_reflex
+run_name: flashgrpo_b200_medusa_online_ce_no_reflex_qwen25_7b
+
+# Keep the B200 model, data, GRPO, exact verification, tree scheduler and
+# pretrained MEDUSA checkpoint identical to the full Reflex run. Only the
+# proposal adaptation mechanism changes in this ablation.
+flashgrpo:
+  proposal_mode: medusa
+  chain_enable_after: 1000000000
+  chain_loss_weight: 0.0
+  chain_loss_max_depth: 0
+  online_medusa: true
+  medusa_update_mode: rollout_ce
+  medusa_train_every: 1
+  medusa_update_steps_per_iter: 1
+  medusa_lr: 1.0e-5
+
+reflex:
+  enabled: false
+  adaptation_mode: disabled
+  feedback_enabled: false
+  proposal_injection_enabled: false
+  motivation_trace_enabled: false
+
+# Reliability tracking, selective refresh, distillation/proximal losses and
+# Reflex caches are all disabled. MEDUSA heads are updated directly by
+# completion-only CE after every rollout batch.
+aux_update:
+  mode: none
+  reflex_cache_enabled: false
+  require_reflex_cache: false
+  update_future_heads: false
+  update_fast_state_injections: false
+  update_feedback_projection: false
+  update_updater: false
+  update_backbone: false
+  update_lm_head: false
+
+checkpoint:
+  save_aux_every_grpo_iters: 0
+  save_aux_on_triggered_update: false

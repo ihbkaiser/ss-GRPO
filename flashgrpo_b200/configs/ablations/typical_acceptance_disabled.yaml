@@ -1,4 +1,6 @@
-inherits: ../flashgrpo_qwen25_1p5b_simplelrabel3to5.yaml
+inherits: _base_qwen25_7b.yaml
+method: flashgrpo_b200_ablation_typical_acceptance_disabled
+run_name: flashgrpo_b200_ablation_typical_acceptance_disabled
 flashgrpo:
   acceptance: exact_target
   typical:

@@ -330,9 +330,11 @@ def build_medusa_update_batch(prompt_input_ids, prompt_attention_mask, generated
     rows = []
     masks = []
     loss_masks = []
-    batch = prompt_input_ids.shape[0]
+    prompt_ids_cpu = prompt_input_ids.detach().to(device="cpu")
+    prompt_mask_cpu = prompt_attention_mask.detach().to(device="cpu", dtype=torch.bool)
+    batch = prompt_ids_cpu.shape[0]
     for prompt_idx in range(batch):
-        prompt_ids = prompt_input_ids[prompt_idx][prompt_attention_mask[prompt_idx].bool()].detach().cpu().tolist()
+        prompt_ids = prompt_ids_cpu[prompt_idx][prompt_mask_cpu[prompt_idx]].tolist()
         for repeat_idx in range(repeated_generate_nums):
             gen_idx = prompt_idx * repeated_generate_nums + repeat_idx
             gen_ids = [int(x) for x in generated_token_ids[gen_idx]]
@@ -351,6 +353,34 @@ def build_medusa_update_batch(prompt_input_ids, prompt_attention_mask, generated
         torch.tensor(masks, dtype=torch.long),
         torch.tensor(loss_masks, dtype=torch.long),
     )
+
+
+def _merge_online_ce_update_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {
+            "medusa_loss": 0.0,
+            "head_update_time": 0.0,
+            "head_update_tokens": 0,
+            "head_update_steps": 0,
+        }
+    out: dict[str, Any] = {}
+    for key in {key for row in rows for key in row}:
+        values = [row[key] for row in rows if key in row]
+        if not values:
+            continue
+        if all(isinstance(value, bool) for value in values):
+            out[key] = any(values)
+        elif all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            if key in {"head_update_time", "head_update_tokens", "head_update_steps"} or key.endswith("_tokens"):
+                out[key] = sum(values)
+            else:
+                out[key] = sum(float(value) for value in values) / len(values)
+        else:
+            out[key] = values[-1]
+    elapsed = float(out.get("head_update_time", 0.0) or 0.0)
+    tokens = int(out.get("head_update_tokens", 0) or 0)
+    out["head_update_tokens_per_sec"] = tokens / max(elapsed, 1e-9)
+    return out
 
 
 @dataclass
@@ -943,7 +973,22 @@ def run_training(config: dict[str, Any]) -> None:
         ),
     )
     aux_cfg = config.get("aux_update", {})
-    default_aux_mode = "reliability_triggered" if reflex_enabled else "always"
+    online_medusa_enabled = bool(fg.get("online_medusa", True))
+    medusa_update_mode = str(fg.get("medusa_update_mode", "reliability_triggered")).lower()
+    if not online_medusa_enabled:
+        medusa_update_mode = "none"
+    if medusa_update_mode not in {"none", "reliability_triggered", "rollout_ce"}:
+        raise ValueError(
+            "flashgrpo.medusa_update_mode must be one of: none, reliability_triggered, rollout_ce"
+        )
+    configured_aux_mode = str(aux_cfg.get("mode", "")).lower()
+    if medusa_update_mode == "rollout_ce" and configured_aux_mode not in {"", "none"}:
+        raise ValueError(
+            "flashgrpo.medusa_update_mode=rollout_ce bypasses auxiliary refresh; set aux_update.mode=none"
+        )
+    default_aux_mode = "none" if medusa_update_mode != "reliability_triggered" else (
+        "reliability_triggered" if reflex_enabled else "always"
+    )
     aux_tracker = ReliabilityTracker(
         mode=str(aux_cfg.get("mode", default_aux_mode)),
         calibration_iterations=int(aux_cfg.get("calibration_iterations", 20)),
@@ -1065,7 +1110,7 @@ def run_training(config: dict[str, Any]) -> None:
         "train_subset_seed": train_subset_seed,
         "max_train_samples": max_train_samples,
         "baseline_source": "not_available",
-        "method": "flashgrpo",
+        "method": str(config.get("method", "flashgrpo")),
         "model_dtype_requested": model_dtype_name,
         "model_torch_dtype": str(model_torch_dtype).replace("torch.", ""),
         "attn_implementation_requested": attn_impl_requested,
@@ -1090,10 +1135,15 @@ def run_training(config: dict[str, Any]) -> None:
         "aux_head_checkpoint": medusa_checkpoint,
         "aux_checkpoint_has_reflex_up": bool(loaded_reflex_up),
         "aux_update_mode": str(aux_cfg.get("mode", default_aux_mode)),
+        "medusa_update_mode": medusa_update_mode,
+        "online_medusa_enabled": online_medusa_enabled,
+        "rollout_ce_train_every": int(fg.get("medusa_train_every", 1)),
+        "rollout_ce_update_steps": int(fg.get("medusa_update_steps_per_iter", 1)),
         "aux_calibration_iterations": int(aux_cfg.get("calibration_iterations", 20)),
         "aux_update_interval": int(aux_cfg.get("check_interval", aux_cfg.get("interval", 20))),
         "aux_update_steps": aux_refresher.config.steps,
-        "aux_update_before_policy_step": True,
+        "aux_update_before_policy_step": medusa_update_mode == "reliability_triggered",
+        "rollout_ce_before_reward": medusa_update_mode == "rollout_ce",
         "aux_update_defer_until_reflex_warmup_complete": bool(aux_cfg.get("defer_until_reflex_warmup_complete", False)),
         "medusa_lr": float(fg.get("medusa_lr", 5e-4)),
         "medusa_adam_eps": float(fg.get("medusa_adam_eps", 1e-6)),
@@ -1114,6 +1164,8 @@ def run_training(config: dict[str, Any]) -> None:
     total_generate_time = 0.0
     total_train_time = 0.0
     total_head_update_time = 0.0
+    total_online_ce_updates = 0
+    total_online_ce_tokens = 0
     total_rollout_tokens = 0
     total_accepted_length = 0
     total_decoded_steps = 0
@@ -1148,8 +1200,16 @@ def run_training(config: dict[str, Any]) -> None:
             input_ids = batch["input_ids"].cuda()
             attention_mask = batch["attention_mask"].cuda()
             answers = batch["answers"]
-            online_aux_enabled = bool(fg.get("online_medusa", True))
+            online_aux_enabled = bool(
+                online_medusa_enabled and medusa_update_mode == "reliability_triggered"
+            )
             generation_step_for_batch = int(rollout_count)
+            rollout_ce_interval = max(1, int(fg.get("medusa_train_every", 1)))
+            rollout_ce_due = bool(
+                online_medusa_enabled
+                and medusa_update_mode == "rollout_ce"
+                and generation_step_for_batch % rollout_ce_interval == 0
+            )
             cpeak_for_batch, cpeak_tuning = cpeak_tuner.budget_for(generation_step_for_batch)
             decoder.config.cpeak_nodes = int(cpeak_for_batch)
             next_grpo_step = acc.used_items // required_used_items + 1
@@ -1196,6 +1256,54 @@ def run_training(config: dict[str, Any]) -> None:
                     })
                 raise
             rollout_count += 1
+            head_stats: dict[str, Any] = {
+                "medusa_loss": 0.0,
+                "head_update_time": 0.0,
+                "head_update_tokens": 0,
+                "head_update_steps": 0,
+                "aux_update_deferred": False,
+                "online_ce_update_due": rollout_ce_due,
+                "online_ce_update_performed": False,
+            }
+            if rollout_ce_due:
+                head_ids, head_mask, head_loss_mask = build_medusa_update_batch(
+                    input_ids,
+                    attention_mask,
+                    outputs["generated_token_ids"],
+                    repeated_generate_nums,
+                    int(tokenizer.pad_token_id),
+                )
+                update_rows = []
+                update_start = time.time()
+                for _ in range(max(1, int(fg.get("medusa_update_steps_per_iter", 1)))):
+                    update_rows.append(
+                        medusa_trainer.update(
+                            head_ids,
+                            head_mask,
+                            head_loss_mask,
+                            head_weights=None,
+                        )
+                    )
+                update_wall_time = time.time() - update_start
+                head_stats.update(_merge_online_ce_update_stats(update_rows))
+                head_stats["head_update_time"] = update_wall_time
+                head_stats["head_update_tokens_per_sec"] = int(
+                    head_stats.get("head_update_tokens", 0) or 0
+                ) / max(update_wall_time, 1e-9)
+                head_stats["online_ce_update_performed"] = bool(
+                    int(head_stats.get("head_update_steps", 0) or 0) > 0
+                    and not bool(head_stats.get("head_update_reverted_nonfinite", False))
+                )
+                head_stats["online_ce_update_mode"] = "completion_ce_after_rollout"
+                if head_stats["online_ce_update_performed"]:
+                    total_online_ce_updates += 1
+                    total_online_ce_tokens += int(head_stats.get("head_update_tokens", 0) or 0)
+                if inference_medusa_heads is not medusa_heads and head_stats["online_ce_update_performed"]:
+                    _sync_medusa_inference_mirror(medusa_heads, inference_medusa_heads)
+                    head_stats["inference_mirror_synced"] = True
+                total_head_update_time += update_wall_time
+                del head_ids, head_mask, head_loss_mask, update_rows
+                maybe_empty_cuda_cache(config)
             target_model.train()
             medusa_heads.train()
             total_generate_time += outputs["total_time_cost"]
@@ -1231,15 +1339,19 @@ def run_training(config: dict[str, Any]) -> None:
             length_stdev = stdev(token_lengths) if len(token_lengths) > 1 else 0.0
             length_mean = mean(token_lengths) if token_lengths else 0.0
 
-            head_stats = {"medusa_loss": 0.0, "head_update_time": 0.0, "head_update_tokens": 0, "aux_update_deferred": False}
-            aux_tracker.observe(outputs.get("reflex_metrics", {}))
+            if medusa_update_mode == "reliability_triggered":
+                aux_tracker.observe(outputs.get("reflex_metrics", {}))
             reflex_records = outputs.get("reflex_aux_records", {})
             if collect_reflex_aux_cache and reflex_records.get("hidden") is not None:
                 pending_aux_record_batches.append(reflex_records)
             aux_decision = ReliabilityDecision(
                 evaluated=False,
                 triggered=False,
-                reason=aux_refresh_skip_reason or "await_grpo_boundary",
+                reason=(
+                    aux_refresh_skip_reason or "await_grpo_boundary"
+                    if medusa_update_mode == "reliability_triggered"
+                    else "aux_disabled_rollout_ce"
+                ),
                 head_metrics=(outputs.get("reflex_metrics", {}) or {}).get("per_head", {}),
             )
             head_stats["aux_update_evaluated"] = bool(aux_decision.evaluated)
@@ -1312,6 +1424,11 @@ def run_training(config: dict[str, Any]) -> None:
                 "head_update_tokens": head_stats.get("head_update_tokens", 0),
                 "head_update_tokens_per_sec": head_stats.get("head_update_tokens_per_sec", 0.0),
                 "head_update_time_ratio_vs_total": head_stats.get("head_update_time", 0.0) / max(outputs["total_time_cost"] + head_stats.get("head_update_time", 0.0), 1e-9),
+                "medusa_update_mode": medusa_update_mode,
+                "online_ce_update_due": head_stats.get("online_ce_update_due", False),
+                "online_ce_update_performed": head_stats.get("online_ce_update_performed", False),
+                "online_ce_update_steps": head_stats.get("head_update_steps", 0),
+                "inference_mirror_synced": head_stats.get("inference_mirror_synced", False),
                 "aux_update_evaluated": head_stats.get("aux_update_evaluated", False),
                 "aux_update_triggered": head_stats.get("aux_update_triggered", False),
                 "aux_update_reason": head_stats.get("aux_update_reason", ""),
@@ -1376,10 +1493,15 @@ def run_training(config: dict[str, Any]) -> None:
             )
             pending_aux_record_batches.clear()
             boundary_aux_stats: dict[str, Any] = {
-                "phase": "auxiliary_decision",
+                "phase": (
+                    "auxiliary_decision"
+                    if medusa_update_mode == "reliability_triggered"
+                    else "auxiliary_disabled"
+                ),
                 "epoch": epoch + 1,
                 "step": step,
                 "rollout_count": rollout_count,
+                "medusa_update_mode": medusa_update_mode,
                 "aux_update_evaluated": bool(aux_decision.evaluated),
                 "aux_update_triggered": bool(aux_decision.triggered),
                 "aux_update_reason": aux_decision.reason,
@@ -1574,6 +1696,9 @@ def run_training(config: dict[str, Any]) -> None:
         "total_generate_time_s": total_generate_time,
         "total_train_time_s": total_train_time,
         "total_head_update_time_s": total_head_update_time,
+        "medusa_update_mode": medusa_update_mode,
+        "total_online_ce_updates": int(total_online_ce_updates),
+        "total_online_ce_tokens": int(total_online_ce_tokens),
         "total_wall_time_s": time.time() - start_time,
         "total_rollout_tokens": int(total_rollout_tokens),
         "generation_tokens_per_s": total_rollout_tokens / max(total_generate_time, 1e-9),

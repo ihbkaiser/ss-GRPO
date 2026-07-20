@@ -1,0 +1,18 @@
+inherits: ../fair_fastgrpo_b200/_base_qwen25_7b.yaml
+
+# Shared controlled workload for all Qwen2.5-7B ablations. Algorithm-specific
+# leaf configs should override only the factor they are measuring.
+method: flashgrpo_b200_ablation
+run_name: flashgrpo_b200_ablation_qwen25_7b
+
+data:
+  train_option: simplelr_abel_level3to5
+
+training:
+  saved_model_dir: outputs/{run_name}/target_lora
+  saved_medusa_dir: outputs/{run_name}/medusa_heads
+
+logging:
+  log_dir: logs/{run_name}
+  append: false
+

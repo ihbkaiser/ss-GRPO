@@ -20,3 +20,30 @@ def test_medusa_head_loss_decreases_on_toy_batch():
         opt.step()
         losses.append(float(loss.detach()))
     assert losses[-1] < losses[0]
+
+
+def test_tied_lm_head_is_a_frozen_projection_during_medusa_ce():
+    torch.manual_seed(1)
+    hidden_size = 8
+    vocab_size = 16
+    lm_head = torch.nn.Linear(hidden_size, vocab_size, bias=False)
+    heads = MedusaHeads(
+        hidden_size,
+        vocab_size,
+        num_heads=2,
+        tie_lm_head=True,
+        lm_head=lm_head,
+    )
+    hidden = torch.randn(2, 8, hidden_size)
+    input_ids = torch.randint(0, vocab_size, (2, 8))
+    attention_mask = torch.ones(2, 8, dtype=torch.long)
+    loss, _ = heads.compute_loss(
+        hidden,
+        input_ids,
+        attention_mask,
+        lm_head=lm_head,
+        chunk_size=4,
+    )
+    loss.backward()
+    assert lm_head.weight.grad is None
+    assert any(parameter.grad is not None for parameter in heads.parameters())

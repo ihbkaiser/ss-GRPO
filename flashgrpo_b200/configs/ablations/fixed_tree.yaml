@@ -1,4 +1,6 @@
-inherits: ../flashgrpo_qwen25_1p5b_simplelrabel3to5.yaml
+inherits: _base_qwen25_7b.yaml
+method: flashgrpo_b200_ablation_fixed_tree
+run_name: flashgrpo_b200_ablation_fixed_tree
 flashgrpo:
   tree_mode: fixed
   fixed_tree_topk_by_depth: [4, 3, 2]

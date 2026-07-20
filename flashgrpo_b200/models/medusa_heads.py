@@ -84,7 +84,10 @@ class MedusaPredictionHead(nn.Module):
         if lm_head is None:
             raise ValueError("lm_head is required when tie_lm_head=True")
         lm_dtype = getattr(lm_head.weight, "dtype", medusa_hidden.dtype)
-        return lm_head(medusa_hidden.to(dtype=lm_dtype))
+        weight = lm_head.weight.detach()
+        bias = getattr(lm_head, "bias", None)
+        bias = bias.detach() if bias is not None else None
+        return F.linear(medusa_hidden.to(dtype=lm_dtype), weight, bias)
 
 
 class MedusaHeads(nn.Module):
@@ -287,7 +290,10 @@ class MedusaHeads(nn.Module):
 
     def chain_logits_from_state(self, state: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
         lm_dtype = getattr(lm_head.weight, "dtype", state.dtype)
-        return lm_head(state.to(dtype=lm_dtype))
+        weight = lm_head.weight.detach()
+        bias = getattr(lm_head, "bias", None)
+        bias = bias.detach() if bias is not None else None
+        return F.linear(state.to(dtype=lm_dtype), weight, bias)
 
     def compute_loss(
         self,
