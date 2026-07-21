@@ -2,10 +2,19 @@ from flashgrpo_b200.decoding.medusa_tree import plan_tree
 import torch
 
 from flashgrpo_b200.training.flashgrpo_trainer import (
+    _optional_path,
     CpeakRolloutTuner,
     _merge_online_ce_update_stats,
     build_medusa_update_batch,
 )
+
+
+def test_optional_checkpoint_path_does_not_stringify_yaml_null():
+    assert _optional_path(None) == ""
+    assert _optional_path("") == ""
+    assert _optional_path("None") == ""
+    assert _optional_path(" null ") == ""
+    assert _optional_path("outputs/run/step10") == "outputs/run/step10"
 
 
 def test_concurrency_tree_shrinks_with_batch():

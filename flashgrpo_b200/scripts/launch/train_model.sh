@@ -12,6 +12,8 @@ cd "$ROOT"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 METHOD="${METHOD:-hrdcr}"
 DATASET="${DATASET:-gsm8k}"
@@ -128,7 +130,6 @@ cmd=(
   --set "training.start_batch=$START_BATCH"
   --set "training.start_used_items=$START_USED_ITEMS"
   --set "training.start_rollout_count=$START_ROLLOUT_COUNT"
-  --set "training.load_lora_path=$LOAD_LORA_PATH"
   --set "flashgrpo.cpeak_nodes=$CPEAK_NODES"
   --set "flashgrpo.auto_tune_cpeak_enabled=$AUTO_TUNE_CPEAK"
   --set "flashgrpo.max_tree_nodes_per_seq=$MAX_TREE_NODES_PER_SEQ"
@@ -138,6 +139,9 @@ cmd=(
   --set "training.saved_medusa_dir=$OUTPUT_DIR/medusa_heads"
 )
 
+if [[ -n "$LOAD_LORA_PATH" ]]; then
+  cmd+=(--set "training.load_lora_path=$LOAD_LORA_PATH")
+fi
 if [[ -n "${CPEAK_CANDIDATES:-}" ]]; then
   cmd+=(--set "flashgrpo.auto_tune_cpeak_candidates=$CPEAK_CANDIDATES")
 fi
@@ -155,6 +159,6 @@ fi
 [[ -f "$CONFIG" ]] || { echo "Config not found: $CONFIG" >&2; exit 2; }
 [[ -f "$MODEL/config.json" ]] || { echo "Model config not found: $MODEL/config.json" >&2; exit 2; }
 [[ -f "$HEADS/medusa_config.json" ]] || { echo "MEDUSA checkpoint not found: $HEADS/medusa_config.json" >&2; exit 2; }
+[[ -f "$HEADS/medusa_heads.pt" ]] || { echo "MEDUSA weights not found: $HEADS/medusa_heads.pt" >&2; exit 2; }
 mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
 "${cmd[@]}" 2>&1 | tee -a "$LOG_DIR/console.log"
-

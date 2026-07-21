@@ -12,6 +12,8 @@ cd "$ROOT"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 CONFIG="${CONFIG:-flashgrpo_b200/configs/${MODEL_KEY}/pretrain.yaml}"
 PRETRAIN_DATASET="${PRETRAIN_DATASET:-sharegpt}"
@@ -88,4 +90,3 @@ fi
 [[ -f "$DATA_PATH" ]] || { echo "Pretrain data not found: $DATA_PATH" >&2; exit 2; }
 mkdir -p "$OUT" "$LOG_DIR"
 "${cmd[@]}" 2>&1 | tee -a "$LOG_DIR/console.log"
-

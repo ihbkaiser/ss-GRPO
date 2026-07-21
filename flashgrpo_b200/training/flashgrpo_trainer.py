@@ -40,6 +40,16 @@ def _get(mapping: dict[str, Any], key: str, default=None):
     return cur
 
 
+def _optional_path(value: Any) -> str:
+    """Normalize nullable YAML/CLI path values without turning None into a path."""
+    if value is None:
+        return ""
+    path = str(value).strip()
+    if path.lower() in {"", "none", "null"}:
+        return ""
+    return path
+
+
 def _dtype_from_name(name: str, default: torch.dtype = torch.float32) -> torch.dtype:
     name = str(name).lower()
     if name == "fp16":
@@ -991,7 +1001,7 @@ def run_training(config: dict[str, Any]) -> None:
         target_modules=lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
     )
     target_model = get_peft_model(target_model, lora_config)
-    load_lora_path = str(config.get("training", {}).get("load_lora_path", ""))
+    load_lora_path = _optional_path(config.get("training", {}).get("load_lora_path"))
     if load_lora_path:
         target_model.load_adapter(load_lora_path, adapter_name="default")
     target_model.print_trainable_parameters()
@@ -1025,7 +1035,7 @@ def run_training(config: dict[str, Any]) -> None:
         anchor_bottleneck_ratio=int(reflex_cfg.get("anchor_bottleneck_ratio", 16)),
         anchor_gate_init=float(reflex_cfg.get("anchor_gate_init", -2.0)),
     ).cuda()
-    medusa_checkpoint = str(
+    medusa_checkpoint = _optional_path(
         fg.get("medusa_heads_checkpoint", "")
         or config.get("aux_head_checkpoint", "")
         or fg.get("load_medusa_path", "")
