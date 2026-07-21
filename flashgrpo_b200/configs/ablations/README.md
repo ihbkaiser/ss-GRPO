@@ -31,5 +31,16 @@ HEADS=outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b \
 bash flashgrpo_b200/train.sh
 ```
 
+Llama-3.1-8B uses the matching Llama ablation config and pretrained heads:
+
+```bash
+RUN_NAME=medusa_ce_no_reflex_llama31_8b_simplelr \
+DATASET=simplelr \
+CONFIG=flashgrpo_b200/configs/ablations/medusa_online_ce_no_reflex_llama31_8b.yaml \
+MODEL=/workspace/storage-shared/models/Llama-3.1-8B-Instruct \
+HEADS=outputs/flashgrpo_b200_medusa_sharegpt_llama31_8b \
+bash flashgrpo_b200/train.sh
+```
+
 `heads_4.yaml` and `heads_5.yaml` require a matching pretrained checkpoint;
 set `HEADS` to a checkpoint trained with the requested number of heads.

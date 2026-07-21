@@ -30,6 +30,7 @@ class ReliabilityTracker:
         min_records_per_head: int = 1024,
         trigger_z_high: float = 2.5,
         acceptance_drop_min: float = 0.05,
+        acceptance_only_trigger: bool = False,
         patience: int = 2,
         cooldown_iterations: int = 50,
         max_heads_per_event: int = 2,
@@ -41,6 +42,7 @@ class ReliabilityTracker:
         self.min_records_per_head = max(1, int(min_records_per_head))
         self.trigger_z_high = float(trigger_z_high)
         self.acceptance_drop_min = float(acceptance_drop_min)
+        self.acceptance_only_trigger = bool(acceptance_only_trigger)
         self.patience = max(1, int(patience))
         self.cooldown_iterations = max(0, int(cooldown_iterations))
         self.max_heads_per_event = max(1, int(max_heads_per_event))
@@ -132,6 +134,7 @@ class ReliabilityTracker:
             "min_records_per_head": self.min_records_per_head,
             "trigger_z_high": self.trigger_z_high,
             "acceptance_drop_min": self.acceptance_drop_min,
+            "acceptance_only_trigger": self.acceptance_only_trigger,
             "patience": self.patience,
             "cooldown_iterations": self.cooldown_iterations,
             "max_heads_per_event": self.max_heads_per_event,
@@ -228,7 +231,10 @@ class ReliabilityTracker:
             drift_scores[head] = float(z_score)
             acc_drop = float(median(baseline_accept)) - float(metrics.get("acceptance_rate", 0.0))
             in_cooldown = step < int(self.cooldown_until.get(head, -1))
-            degraded = z_score > self.trigger_z_high and acc_drop >= self.acceptance_drop_min and not in_cooldown
+            if self.acceptance_only_trigger:
+                degraded = acc_drop >= self.acceptance_drop_min and not in_cooldown
+            else:
+                degraded = z_score > self.trigger_z_high and acc_drop >= self.acceptance_drop_min and not in_cooldown
             self.patience_counters[head] = self.patience_counters.get(head, 0) + 1 if degraded else 0
             if self.patience_counters[head] >= self.patience:
                 candidates.append((float(z_score), int(head)))
@@ -273,6 +279,8 @@ class AuxiliaryHeadRefreshConfig:
     max_cached_records: int = 8192
     validation_fraction: float = 0.10
     max_validation_ce_regression: float = 0.01
+    max_validation_tv_regression: float = 0.01
+    min_validation_candidate_mass_improvement: float = 0.0
     rollback_on_validation_regression: bool = True
     save_aux_every_grpo_iters: int = 0
     save_aux_on_triggered_update: bool = False
@@ -327,6 +335,10 @@ class AuxiliaryHeadRefresher:
             max_cached_records=int(aux_cfg.get("max_cached_records", 8192)),
             validation_fraction=float(aux_cfg.get("validation_fraction", 0.10)),
             max_validation_ce_regression=float(aux_cfg.get("max_validation_ce_regression", 0.01)),
+            max_validation_tv_regression=float(aux_cfg.get("max_validation_tv_regression", 0.01)),
+            min_validation_candidate_mass_improvement=float(
+                aux_cfg.get("min_validation_candidate_mass_improvement", 0.0)
+            ),
             rollback_on_validation_regression=bool(aux_cfg.get("rollback_on_validation_regression", True)),
             save_aux_every_grpo_iters=int(checkpoint_cfg.get("save_aux_every_grpo_iters", 0)),
             save_aux_on_triggered_update=bool(checkpoint_cfg.get("save_aux_on_triggered_update", False)),
@@ -467,19 +479,35 @@ class AuxiliaryHeadRefresher:
             after_ce = float(validation_after.get("validation_ce", float("inf")))
             before_tv = float(validation_before.get("validation_sparse_tv", float("inf")))
             after_tv = float(validation_after.get("validation_sparse_tv", float("inf")))
+            before_mass = float(validation_before.get("validation_candidate_mass", float("-inf")))
+            after_mass = float(validation_after.get("validation_candidate_mass", float("-inf")))
             max_ce = before_ce * (1.0 + float(self.config.max_validation_ce_regression))
             has_sparse_validation = math.isfinite(before_tv) and math.isfinite(after_tv)
-            primary_improved = after_tv < before_tv if has_sparse_validation else after_ce < before_ce
+            has_coverage_validation = math.isfinite(before_mass) and math.isfinite(after_mass)
+            if has_coverage_validation:
+                primary_improved = after_mass > (
+                    before_mass + float(self.config.min_validation_candidate_mass_improvement)
+                )
+                tv_guard = (
+                    not has_sparse_validation
+                    or after_tv <= before_tv + float(self.config.max_validation_tv_regression)
+                )
+            else:
+                primary_improved = after_tv < before_tv if has_sparse_validation else after_ce < before_ce
+                tv_guard = True
             refresh_committed = bool(
                 math.isfinite(before_ce)
                 and math.isfinite(after_ce)
                 and after_ce <= max_ce
                 and primary_improved
+                and tv_guard
             )
             base["refresh_validation_ce_before"] = before_ce
             base["refresh_validation_ce_after"] = after_ce
             base["refresh_validation_tv_before"] = before_tv
             base["refresh_validation_tv_after"] = after_tv
+            base["refresh_validation_candidate_mass_before"] = before_mass
+            base["refresh_validation_candidate_mass_after"] = after_mass
             base["refresh_validation_records"] = int(validation_after.get("validation_records", 0))
             if not refresh_committed and parameter_backup is not None:
                 self.medusa_heads.load_state_dict(parameter_backup)

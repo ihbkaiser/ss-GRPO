@@ -1,0 +1,26 @@
+inherits: ../_shared/hrdcr_train.yaml
+
+method: flashgrpo_b200_hrdcr_qwen25_1p5b
+run_name: qwen25_1p5b_hrdcr
+aux_head_checkpoint: outputs/pretrain/qwen25_1p5b
+
+model:
+  model_dir: /workspace/storage-shared/models/Qwen2.5-1.5B-Instruct
+  model_type: qwen2
+  dtype: bf16
+  attn_implementation: sdpa
+
+training:
+  batch_size: 16
+  accumulation_steps: 2
+  saved_model_dir: outputs/train/qwen25_1p5b/{run_name}/target_lora
+  saved_medusa_dir: outputs/train/qwen25_1p5b/{run_name}/medusa_heads
+
+flashgrpo:
+  medusa_heads_checkpoint: outputs/pretrain/qwen25_1p5b
+  cpeak_nodes: 256
+  auto_tune_cpeak_candidates: [256, 384, 512, 768, 1024]
+
+logging:
+  log_dir: logs/flashgrpo_b200/qwen25_1p5b/train/{run_name}
+

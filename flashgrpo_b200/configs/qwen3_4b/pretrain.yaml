@@ -1,0 +1,9 @@
+inherits: ../_shared/pretrain_heads.yaml
+
+model_name_or_path: /workspace/storage-shared/models/Qwen3-4B
+output_dir: outputs/pretrain/qwen3_4b
+log_dir: logs/flashgrpo_b200/qwen3_4b/pretrain
+batch_size: 8
+gradient_accumulation_steps: 4
+loss_chunk_size: 64
+

@@ -1,0 +1,14 @@
+inherits: medusa_online_ce_no_reflex_qwen25_7b.yaml
+
+method: flashgrpo_ablation_medusa_online_ce_no_reflex_llama31_8b
+run_name: flashgrpo_b200_medusa_online_ce_no_reflex_llama31_8b
+
+model:
+  model_dir: /workspace/storage-shared/models/Llama-3.1-8B-Instruct
+  model_type: llama
+
+flashgrpo:
+  medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_llama31_8b
+
+aux_head_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_llama31_8b
+

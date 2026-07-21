@@ -1,0 +1,9 @@
+inherits: ../_shared/pretrain_heads.yaml
+
+model_name_or_path: /workspace/storage-shared/models/Llama-3.1-8B-Instruct
+output_dir: outputs/pretrain/llama31_8b
+log_dir: logs/flashgrpo_b200/llama31_8b/pretrain
+batch_size: 4
+gradient_accumulation_steps: 8
+loss_chunk_size: 32
+

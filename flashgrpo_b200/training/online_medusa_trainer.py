@@ -28,8 +28,18 @@ class OnlineMedusaConfig:
     reflex_normalize_correction: bool = True
     rollback_nonfinite_update: bool = True
     refresh_distill_weight: float = 0.7
+    refresh_tv_weight: float = 0.0
+    refresh_coverage_weight: float = 0.0
     refresh_hard_token_weight: float = 0.3
     refresh_proximal_weight: float = 0.1
+    anchor_conditioning_enabled: bool = False
+    acceptance_tv_weight: float = 0.0
+    acceptance_kl_weight: float = 0.0
+    acceptance_distill_topk: int = 64
+    acceptance_temperature: float = 1.0
+    acceptance_coverage_weight: float = 0.0
+    acceptance_candidate_topk_by_head: tuple[int, ...] = (4, 3, 2)
+    acceptance_rank_temperature: float = 0.5
 
 
 class OnlineMedusaTrainer:
@@ -141,6 +151,14 @@ class OnlineMedusaTrainer:
                 chain_bootstrap_from_medusa=cfg.chain_bootstrap_from_medusa,
                 embedding_layer=embedding_layer,
                 head_weights=head_weights,
+                anchor_conditioning=bool(cfg.anchor_conditioning_enabled),
+                acceptance_tv_weight=float(cfg.acceptance_tv_weight),
+                acceptance_kl_weight=float(cfg.acceptance_kl_weight),
+                acceptance_distill_topk=int(cfg.acceptance_distill_topk),
+                acceptance_temperature=float(cfg.acceptance_temperature),
+                acceptance_coverage_weight=float(cfg.acceptance_coverage_weight),
+                acceptance_candidate_topk_by_head=tuple(cfg.acceptance_candidate_topk_by_head),
+                acceptance_rank_temperature=float(cfg.acceptance_rank_temperature),
             )
             if not torch.isfinite(loss):
                 continue
@@ -257,6 +275,43 @@ class OnlineMedusaTrainer:
             old_prob * (old_logp.masked_fill(~valid, 0.0) - new_logp.masked_fill(~valid, 0.0))
         ).sum(dim=-1) + old_tail * (torch.log(old_tail) - torch.log(new_tail))
 
+    @staticmethod
+    def _sparse_candidate_coverage(
+        new_logits: torch.Tensor,
+        target_ids: torch.Tensor,
+        target_logits: torch.Tensor,
+        target_logsumexp: torch.Tensor,
+        *,
+        candidate_topk: int,
+        rank_temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Straight-through target mass covered by new proposal candidates."""
+
+        valid = target_ids.ge(0)
+        safe_ids = target_ids.clamp_min(0)
+        target_prob = torch.exp(
+            target_logits.float() - target_logsumexp.float().unsqueeze(-1)
+        ).masked_fill(~valid, 0.0)
+        proposal = new_logits.float()
+        max_k = min(max(1, int(candidate_topk)), int(proposal.shape[-1]))
+        top_values, top_ids = torch.topk(proposal, k=max_k, dim=-1)
+        support_logits = torch.gather(proposal, -1, safe_ids)
+        rank_temperature = max(float(rank_temperature), 1e-4)
+        losses = []
+        masses = []
+        for budget in range(1, max_k + 1):
+            cutoff = top_values[:, budget - 1 : budget].detach()
+            hard = (
+                safe_ids.unsqueeze(-1).eq(top_ids[:, :budget].unsqueeze(-2)).any(dim=-1)
+                & valid
+            )
+            soft = torch.sigmoid((support_logits - cutoff) / rank_temperature) * valid
+            membership = hard.float() + soft - soft.detach()
+            coverage = (target_prob * membership).sum(dim=-1).clamp(min=0.0, max=1.0)
+            losses.append(1.0 - coverage)
+            masses.append((target_prob * hard).sum(dim=-1))
+        return torch.stack(losses).mean(dim=0), torch.stack(masses).mean(dim=0)
+
     def _project_with_reflex(
         self,
         hidden: torch.Tensor,
@@ -265,9 +320,20 @@ class OnlineMedusaTrainer:
         *,
         update_fast_state_injections: bool,
         scale: torch.Tensor | float = 1.0,
+        anchor_token_ids: torch.Tensor | None = None,
+        embedding_layer=None,
     ) -> torch.Tensor:
         head = self.medusa_heads.heads[head_idx]
         projected = head.project_hidden(hidden)
+        if (
+            bool(self.config.anchor_conditioning_enabled)
+            and getattr(self.medusa_heads, "anchor_conditioner", None) is not None
+            and anchor_token_ids is not None
+        ):
+            if embedding_layer is None:
+                raise ValueError("embedding_layer is required for anchor-conditioned refresh")
+            anchor_embeddings = embedding_layer(anchor_token_ids.to(device=projected.device)).detach()
+            projected = self.medusa_heads.anchor_conditioner(projected, anchor_embeddings, head_idx)
         if getattr(self.medusa_heads, "reflex_fast_state_dim", 0) <= 0 or fast_state.numel() == 0:
             return projected
         up = self.medusa_heads.reflex_up[head_idx]
@@ -374,12 +440,15 @@ class OnlineMedusaTrainer:
                 f = fast[mask]
                 s = scales[mask]
                 y = labels[mask]
+                anchor_tokens = prev_tokens[mask, 0].clamp_min(0) if prev_tokens.shape[1] > 0 else None
                 projected = self._project_with_reflex(
                     h,
                     f,
                     head_idx,
                     update_fast_state_injections=update_fast_state_injections,
                     scale=s,
+                    anchor_token_ids=anchor_tokens,
+                    embedding_layer=embedding_layer,
                 )
                 logits = self._logits_from_hidden(projected, head_idx, lm_head).float()
                 hard_loss = F.cross_entropy(logits, y, reduction="none")
@@ -394,11 +463,25 @@ class OnlineMedusaTrainer:
                     target_ids = target_top_ids[start:end].to(device=device).long()[mask]
                     target_values = target_top_logits[start:end].to(device=device).float()[mask]
                     target_lse = target_logsumexp[start:end].to(device=device).float()[mask]
-                    distill, _ = self._sparse_cross_entropy_with_tail(
+                    distill, tv = self._sparse_cross_entropy_with_tail(
                         logits,
                         target_ids,
                         target_values,
                         target_lse,
+                    )
+                    candidate_budgets = tuple(cfg.acceptance_candidate_topk_by_head or (4, 3, 2))
+                    candidate_k = int(
+                        candidate_budgets[min(head_idx, len(candidate_budgets) - 1)]
+                        if candidate_budgets
+                        else 1
+                    )
+                    coverage, candidate_mass = self._sparse_candidate_coverage(
+                        logits,
+                        target_ids,
+                        target_values,
+                        target_lse,
+                        candidate_topk=candidate_k,
+                        rank_temperature=float(cfg.acceptance_rank_temperature),
                     )
                     proximal = torch.zeros_like(distill)
                     if (
@@ -415,6 +498,8 @@ class OnlineMedusaTrainer:
                         )
                     sparse_loss = (
                         float(cfg.refresh_distill_weight) * distill
+                        + float(cfg.refresh_tv_weight) * tv
+                        + float(cfg.refresh_coverage_weight) * coverage
                         + float(cfg.refresh_hard_token_weight) * hard_loss
                         + float(cfg.refresh_proximal_weight) * proximal
                     )
@@ -422,6 +507,15 @@ class OnlineMedusaTrainer:
                     stat_sums[f"head_{head_idx + 1}_distill"] = stat_sums.get(
                         f"head_{head_idx + 1}_distill", 0.0
                     ) + float(distill[selected_teacher].mean().detach().cpu())
+                    stat_sums[f"head_{head_idx + 1}_acceptance_tv"] = stat_sums.get(
+                        f"head_{head_idx + 1}_acceptance_tv", 0.0
+                    ) + float(tv[selected_teacher].mean().detach().cpu())
+                    stat_sums[f"head_{head_idx + 1}_candidate_mass"] = stat_sums.get(
+                        f"head_{head_idx + 1}_candidate_mass", 0.0
+                    ) + float(candidate_mass[selected_teacher].mean().detach().cpu())
+                    stat_sums[f"head_{head_idx + 1}_coverage_loss"] = stat_sums.get(
+                        f"head_{head_idx + 1}_coverage_loss", 0.0
+                    ) + float(coverage[selected_teacher].mean().detach().cpu())
                 loss = per_record_loss.mean()
                 weighted = float(aux_weight * decay) * loss
                 losses.append(weighted)
@@ -550,15 +644,20 @@ class OnlineMedusaTrainer:
                 "validation_records": 0,
                 "validation_sparse_tv": float("inf"),
                 "validation_sparse_records": 0,
+                "validation_candidate_mass": float("-inf"),
+                "validation_candidate_records": 0,
             }
         device = next(self.medusa_heads.parameters()).device
         base = unwrap_causal_lm(self.target_model)
         lm_head = base.lm_head
+        embedding_layer = base.get_input_embeddings()
         micro = max(1, int(self.config.reflex_record_microbatch_size or 64))
         loss_sum = 0.0
         count = 0
         tv_sum = 0.0
         tv_count = 0
+        candidate_mass_sum = 0.0
+        candidate_mass_count = 0
         was_training = self.medusa_heads.training
         self.medusa_heads.eval()
         for start in range(0, int(hidden_cpu.shape[0]), micro):
@@ -569,6 +668,7 @@ class OnlineMedusaTrainer:
             )
             labels = records["labels"][start:end].to(device=device).long()
             horizons = records["horizons"][start:end].to(device=device).long()
+            prev_tokens = records["prev_tokens"][start:end].to(device=device).long()
             has_sparse_teacher = records.get("has_sparse_teacher")
             has_sparse_teacher = (
                 has_sparse_teacher[start:end].to(device=device).bool()
@@ -579,23 +679,57 @@ class OnlineMedusaTrainer:
                 mask = horizons.eq(head_idx + 2)
                 if not bool(mask.any().item()) or self._head_weight(head_weights, head_idx) <= 0.0:
                     continue
-                logits = self._logits_from_hidden(head.project_hidden(hidden[mask]), head_idx, lm_head).float()
+                projected = head.project_hidden(hidden[mask])
+                if (
+                    bool(self.config.anchor_conditioning_enabled)
+                    and getattr(self.medusa_heads, "anchor_conditioner", None) is not None
+                    and prev_tokens.shape[1] > 0
+                ):
+                    anchor_tokens = prev_tokens[mask, 0].clamp_min(0)
+                    anchor_embeddings = embedding_layer(anchor_tokens).detach()
+                    projected = self.medusa_heads.anchor_conditioner(projected, anchor_embeddings, head_idx)
+                logits = self._logits_from_hidden(projected, head_idx, lm_head).float()
                 loss_sum += float(F.cross_entropy(logits, labels[mask], reduction="sum").cpu())
                 count += int(mask.sum().item())
                 selected_teacher = has_sparse_teacher[mask]
                 if bool(selected_teacher.any().item()) and torch.is_tensor(records.get("target_top_ids")):
+                    target_ids = records["target_top_ids"][start:end].to(device=device).long()[mask]
+                    target_values = records["target_top_logits"][start:end].to(device=device).float()[mask]
+                    target_lse = records["target_logsumexp"][start:end].to(device=device).float()[mask]
                     _, tv = self._sparse_cross_entropy_with_tail(
                         logits,
-                        records["target_top_ids"][start:end].to(device=device).long()[mask],
-                        records["target_top_logits"][start:end].to(device=device).float()[mask],
-                        records["target_logsumexp"][start:end].to(device=device).float()[mask],
+                        target_ids,
+                        target_values,
+                        target_lse,
                     )
                     tv_sum += float(tv[selected_teacher].sum().cpu())
                     tv_count += int(selected_teacher.sum().item())
+                    candidate_budgets = tuple(self.config.acceptance_candidate_topk_by_head or (4, 3, 2))
+                    candidate_k = int(
+                        candidate_budgets[min(head_idx, len(candidate_budgets) - 1)]
+                        if candidate_budgets
+                        else 1
+                    )
+                    _, candidate_mass = self._sparse_candidate_coverage(
+                        logits,
+                        target_ids,
+                        target_values,
+                        target_lse,
+                        candidate_topk=candidate_k,
+                        rank_temperature=float(self.config.acceptance_rank_temperature),
+                    )
+                    candidate_mass_sum += float(candidate_mass[selected_teacher].sum().cpu())
+                    candidate_mass_count += int(selected_teacher.sum().item())
         self.medusa_heads.train(was_training)
         return {
             "validation_ce": loss_sum / max(count, 1),
             "validation_records": int(count),
             "validation_sparse_tv": tv_sum / max(tv_count, 1) if tv_count else float("inf"),
             "validation_sparse_records": int(tv_count),
+            "validation_candidate_mass": (
+                candidate_mass_sum / max(candidate_mass_count, 1)
+                if candidate_mass_count
+                else float("-inf")
+            ),
+            "validation_candidate_records": int(candidate_mass_count),
         }

@@ -74,6 +74,19 @@ def _load_json_dataset(path: str | Path) -> list[Any]:
     return data
 
 
+def _select_dataset_fraction(examples: list[Any], fraction: float, seed: int) -> list[Any]:
+    """Select a stable random subset without changing the source ordering."""
+    fraction = float(fraction)
+    if fraction <= 0:
+        raise ValueError(f"dataset_fraction must be > 0, got {fraction}")
+    if fraction >= 1.0 or not examples:
+        return examples
+    target = max(1, int(math.ceil(len(examples) * fraction)))
+    indices = list(range(len(examples)))
+    random.Random(int(seed)).shuffle(indices)
+    return [examples[index] for index in sorted(indices[:target])]
+
+
 def _module_has_nonfinite(module: torch.nn.Module) -> bool:
     with torch.no_grad():
         for param in module.parameters():
@@ -401,8 +414,10 @@ def parse_args():
     parser.add_argument("--conversation_format", default=None)
     parser.add_argument("--model_name_or_path", "--model", dest="model_name_or_path", default=None)
     parser.add_argument("--max_seq_len", type=int, default=None)
+    parser.add_argument("--dataset_fraction", type=float, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--log_dir", default=None)
     parser.add_argument("--load_medusa_checkpoint", default=None)
     parser.add_argument("--train_reflex_only", default=None)
     parser.add_argument("--freeze_loaded_base_heads", default=None)
@@ -415,6 +430,11 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default=None)
     parser.add_argument("--head_dtype", choices=["fp16", "bf16", "fp32"], default=None)
+    parser.add_argument(
+        "--attn_implementation",
+        choices=["eager", "sdpa", "flash_attention_2"],
+        default=None,
+    )
     parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--eval_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -459,9 +479,11 @@ def main() -> None:
         raise ValueError("--dataset_path is required for the local ShareGPT run")
     output_dir = Path(cfg.get("output_dir", "outputs/flashgrpo_medusa_sharegpt_qwen25_1p5b"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "pretrain_metrics.jsonl"
+    log_dir = Path(cfg.get("log_dir") or output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = log_dir / "pretrain_metrics.jsonl"
     metrics_path.write_text("", encoding="utf-8")
-    save_resolved_config(cfg, output_dir / "pretrain_config_resolved.yaml")
+    save_resolved_config(cfg, log_dir / "pretrain_config_resolved.yaml")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, padding_side="right")
     if tokenizer.pad_token_id is None:
@@ -515,6 +537,10 @@ def main() -> None:
                 param.requires_grad_(False)
 
     examples = _load_json_dataset(dataset_path)
+    full_num_examples = len(examples)
+    dataset_fraction = float(cfg.get("dataset_fraction", 1.0))
+    examples = _select_dataset_fraction(examples, dataset_fraction, int(cfg.get("seed", 42)))
+    selected_fraction_examples = len(examples)
     random.shuffle(examples)
     num_samples = int(cfg.get("num_samples", 0) or 0)
     if num_samples > 0:
@@ -669,6 +695,9 @@ def main() -> None:
     summary = {
         "base_model_name_or_path": model_name_or_path,
         "dataset_path": str(dataset_path),
+        "dataset_fraction": dataset_fraction,
+        "num_source_examples": full_num_examples,
+        "num_fraction_examples": selected_fraction_examples,
         "num_train_examples": len(train_examples),
         "load_medusa_checkpoint": load_medusa_checkpoint,
         "train_reflex_only": _as_bool(cfg.get("train_reflex_only", False)),
@@ -695,9 +724,10 @@ def main() -> None:
         "tokens_seen": seen_tokens,
         "peak_memory_mb": peak_memory / 1024**2,
         "output_dir": str(output_dir),
+        "log_dir": str(log_dir),
     }
-    (output_dir / "pretrain_summary.txt").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    (output_dir / "pretrain_summary.yaml").write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
+    (log_dir / "pretrain_summary.txt").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (log_dir / "pretrain_summary.yaml").write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
     print(json.dumps(summary, indent=2))
 
 

@@ -1,0 +1,27 @@
+inherits: ../reflexgrpo_horizon_consensus_b200_qwen25_7b_gsm8k.yaml
+
+method: flashgrpo_b200_ablation_medusa_head_only_no_reflex_fair
+run_name: flashgrpo_b200_head_only_no_reflex_fair_qwen25_7b_gsm8k
+
+# Dataset fraction and run-name-based output paths are inherited from the main
+# config. Edit training.train_data_fraction there once for both paired runs.
+
+# Fair ablation: exact verification, CPeak autotuning, tree scheduler, BF16
+# inference mirror, pretrained heads and reliability-triggered auxiliary refresh
+# are unchanged. Only the proposal-time m_t mechanism is removed.
+reflex:
+  enabled: false
+  adaptation_mode: disabled
+  feedback_enabled: false
+  proposal_injection_enabled: false
+  horizon_resolved: false
+  anchor_conditioning_enabled: false
+  utility_scheduler_enabled: false
+  motivation_trace_enabled: false
+
+persistent_memory:
+  enabled: false
+
+logging:
+  log_dir: logs/{run_name}
+  append: false

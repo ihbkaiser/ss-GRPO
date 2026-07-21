@@ -1,5 +1,9 @@
 # FlashGRPO
 
+> B200 users: the canonical multi-model config layout and launch commands are
+> documented in [EXPERIMENTS.md](EXPERIMENTS.md). The historical commands below
+> are retained as method background and may refer to the 3090 package.
+
 FlashGRPO is a GRPO training path that replaces the external FastGRPO draft
 model with MEDUSA-style heads attached to the policy model.
 

@@ -4,14 +4,14 @@
 B200 environment. Its Python imports point to `flashgrpo_b200.*`, so changes
 here do not affect the original `flashgrpo` package used for the 3090 setup.
 
-Main B200 defaults:
+Canonical B200 defaults:
 
 - target model dtype is loaded from config and defaults to `bf16`;
 - Qwen 7B uses fused PyTorch SDPA because MEDUSA tree verification requires a
   custom 4D ancestor mask;
-- rollout `batch_size` is 8 and `accumulation_steps` is 4, keeping the GRPO
-  effective prompt-group batch at 32;
-- GRPO training token budget is `max_training_token: 4096`;
+- effective prompt-group batch is 32 by default (`16x2` for 1.5B and `8x4`
+  for 4B-8B models);
+- GRPO training token budget is `max_training_token: 8192`;
 - the throughput-first tree budget is `cpeak_nodes: 128` with at most 10 nodes
   per sequence; the first 18 rollout batches test six hardware budgets and
   lock the one with the best median output-token throughput;
@@ -24,11 +24,13 @@ Main B200 defaults:
 - `empty_cache_after_target_train` is disabled to avoid unnecessary cache churn
   on high-memory GPUs.
 
-Default 7B command:
+The supported model launchers are Qwen2.5-1.5B, Qwen3-4B, Qwen2.5-7B and
+Llama-3.1-8B. See [EXPERIMENTS.md](EXPERIMENTS.md) for the complete layout and
+override list.
+
+Default Qwen2.5-7B commands:
 
 ```bash
-MODEL="$PWD/models/Qwen2.5-7B-Instruct" \
-HEADS=outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b \
-EXP=reflexgrpo_b200_qwen25_7b_speedopt \
-bash flashgrpo_b200/train.sh
+bash flashgrpo_b200/pretrain_qwen25_7b.sh
+DATASET=gsm8k TRAIN_DATA_FRACTION=0.4 bash flashgrpo_b200/train_qwen25_7b.sh
 ```

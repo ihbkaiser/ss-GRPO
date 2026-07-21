@@ -1,0 +1,18 @@
+inherits: train_hrdcr.yaml
+
+method: flashgrpo_b200_medusa_only_qwen25_7b
+run_name: qwen25_7b_medusa_only
+
+reflex:
+  enabled: false
+  adaptation_mode: disabled
+  feedback_enabled: false
+  proposal_injection_enabled: false
+  horizon_resolved: false
+  anchor_conditioning_enabled: false
+  utility_scheduler_enabled: false
+  motivation_trace_enabled: false
+
+persistent_memory:
+  enabled: false
+

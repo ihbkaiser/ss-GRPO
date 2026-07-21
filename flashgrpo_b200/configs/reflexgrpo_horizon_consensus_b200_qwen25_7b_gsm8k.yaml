@@ -1,0 +1,144 @@
+inherits: fair_fastgrpo_b200/qwen25_7b_gsm8k.yaml
+
+method: horizon_resolved_delayed_credit_reflexgrpo_b200
+run_name: reflexgrpo_hrdcr_b200_qwen25_7b_gsm8k
+aux_head_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b
+
+data:
+  train_option: gsm8k
+
+training:
+  # Change this one line to choose the fraction of any supported dataset.
+  train_data_fraction: 0.4
+  train_subset_seed: 42
+  max_train_samples: 0
+  saved_model_dir: outputs/{run_name}/target_lora
+  saved_medusa_dir: outputs/{run_name}/medusa_heads
+
+flashgrpo:
+  medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_7b
+  proposal_mode: medusa
+  chain_enable_after: 1000000000
+  chain_loss_weight: 0.0
+  chain_loss_max_depth: 0
+  online_medusa: true
+  medusa_update_mode: reliability_triggered
+  medusa_lr: 1.0e-5
+
+reflex:
+  enabled: true
+  adaptation_mode: immediate
+  state_space: hidden
+  feedback_enabled: true
+  proposal_injection_enabled: true
+  proposal_injection_scale: 1.0
+  proposal_injection_after: 0
+  proposal_injection_warmup: 0
+
+  # Horizon-Resolved Delayed-Credit Reflex (HRDCR).
+  horizon_resolved: true
+  consensus_strength: 0.35
+  consensus_floor: 0.10
+  head_shrinkage_updates: 8.0
+  preconditioner_mix: 0.25
+  feedback_variance_beta: 0.98
+
+  # Optional context/feature variants remain off in the recommended run.
+  context_rank: 0
+  context_mix: 0.0
+  context_min_mass: 0.01
+  context_learning_rate: 0.5
+  context_seed: 17
+  feature_feedback_weight: 0.0
+  feature_agreement_floor: 0.0
+
+  # Delayed-credit trust calibration for the exact m_{t,k} used at proposal.
+  hint_quality_beta: 0.90
+  hint_quality_floor: 0.0
+  hint_quality_temperature: 0.10
+  hint_cold_start: 0.20
+
+  half_life_tokens: 48
+  eta: 0.5
+  state_rms_clip: 2.0
+  numerical_reset_rms: 2.5
+  feedback_rms_clip: 3.0
+  relative_rms_delta_base: 0.0125
+  horizon_delta_rule: trust_calibrated
+  warmup_effective_updates: 4.0
+  magnitude_gate_floor: 0.20
+
+  proposal_topk: 32
+  target_topk: 32
+  feedback_union_cap: 96
+  # B200 can afford denser online feedback than the 3090 config while keeping
+  # CPU/GPU transfer overhead bounded.
+  feedback_stride: 8
+  feedback_stride_min: 8
+  feedback_objective: distribution
+  coverage_feedback_weight: 0.0
+  tv_gate_low: 0.05
+  tv_gate_high: 0.20
+  horizon_weight_decay: 0.85
+
+  anchor_conditioning_enabled: false
+  utility_scheduler_enabled: false
+  guard_calibration_rollouts: 20
+  guard_aal_drop_fraction: 0.05
+  guard_patience: 2
+  guard_disable_rollouts: 50
+  motivation_trace_enabled: false
+
+persistent_memory:
+  enabled: false
+
+aux_update:
+  mode: reliability_triggered
+  metric_source: medusa_acceptance
+  acceptance_only_trigger: true
+  calibration_iterations: 20
+  check_interval: 20
+  min_records_per_head: 512
+  acceptance_drop_min: 0.04
+  patience: 2
+  cooldown_iterations: 40
+  max_heads_per_event: 2
+
+  steps: 2
+  only_triggered_heads: true
+  reflex_cache_enabled: true
+  require_reflex_cache: true
+  sparse_teacher_enabled: true
+  cache_stride: 8
+  max_cached_records: 2048
+  reflex_record_microbatch_size: 128
+
+  candidate_coverage_weight: 1.0
+  candidate_topk_by_head: [4, 3, 2]
+  rank_temperature: 0.5
+  distill_weight: 0.50
+  acceptance_tv_weight: 1.0
+  hard_token_weight: 0.25
+  proximal_kl_weight: 0.05
+  rollback_on_validation_regression: true
+  max_validation_ce_regression: 0.01
+  max_validation_tv_regression: 0.01
+  min_validation_candidate_mass_improvement: 0.0
+  rollback_nonfinite_update: true
+  update_future_heads: true
+  update_fast_state_injections: false
+  update_feedback_projection: false
+  update_updater: false
+  update_backbone: false
+  update_lm_head: false
+
+checkpoint:
+  save_aux_every_grpo_iters: 100
+  save_aux_on_triggered_update: true
+  min_iters_between_aux_trigger_saves: 50
+  keep_last_aux_checkpoints: 3
+
+logging:
+  log_dir: logs/{run_name}
+  append: false
+
