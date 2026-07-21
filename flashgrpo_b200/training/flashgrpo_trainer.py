@@ -660,6 +660,17 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         }
     feedback_collection_rounds = sum(int(row.get("feedback_collection_rounds", 0) or 0) for row in rows)
     feature_feedback_count = sum(int(row.get("feature_feedback_count", 0) or 0) for row in rows)
+    correction_observations = sum(int(row.get("correction_observations", 0) or 0) for row in rows)
+    candidate_probe_count = sum(int(row.get("candidate_set_probe_count", 0) or 0) for row in rows)
+
+    def correction_mean(key: str) -> float:
+        if correction_observations <= 0:
+            return 0.0
+        return sum(
+            float(row.get(key, 0.0) or 0.0)
+            * int(row.get("correction_observations", 0) or 0)
+            for row in rows
+        ) / correction_observations
 
     def mean_head_values(key: str) -> list[float]:
         values = [row.get(key) for row in rows if isinstance(row.get(key), list)]
@@ -705,6 +716,24 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
             for row in rows
         ) / max(feature_feedback_count, 1),
         "feature_feedback_count": int(feature_feedback_count),
+        "raw_fast_state_rms": correction_mean("raw_fast_state_rms"),
+        "hint_trust": correction_mean("hint_trust"),
+        "warm_gate": correction_mean("warm_gate"),
+        "correction_rms": correction_mean("correction_rms"),
+        "correction_to_hidden_rms_ratio": correction_mean(
+            "correction_to_hidden_rms_ratio"
+        ),
+        "correction_observations": int(correction_observations),
+        "candidate_set_changed_fraction": sum(
+            float(row.get("candidate_set_changed_fraction", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        )
+        / max(candidate_probe_count, 1),
+        "candidate_set_probe_count": int(candidate_probe_count),
+        "reflex_win_count": sum(int(row.get("reflex_win_count", 0) or 0) for row in rows),
+        "reflex_loss_count": sum(int(row.get("reflex_loss_count", 0) or 0) for row in rows),
+        "reflex_total_time": sum(float(row.get("reflex_total_time", 0.0) or 0.0) for row in rows),
         "nonzero_gate_fraction": sum(float(row.get("nonzero_gate_fraction", 0.0) or 0.0) for row in rows) / max(len(rows), 1),
         "feedback_collection_rounds": feedback_collection_rounds,
         "pending_prediction_records": sum(int(row.get("pending_prediction_records", 0) or 0) for row in rows),
@@ -888,6 +917,7 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_state_rms_clip=float(reflex.get("state_rms_clip", 2.0)),
         reflex_numerical_reset_rms=float(reflex.get("numerical_reset_rms", 2.5)),
         reflex_relative_rms_delta_base=float(reflex.get("relative_rms_delta_base", 0.01)),
+        reflex_injection_gate_mode=str(reflex.get("injection_gate_mode", "legacy")),
         reflex_horizon_delta_rule=str(reflex.get("horizon_delta_rule", "inverse_sqrt")),
         reflex_warmup_effective_updates=float(reflex.get("warmup_effective_updates", 16.0)),
         reflex_magnitude_gate_floor=float(reflex.get("magnitude_gate_floor", 0.25)),
@@ -895,6 +925,7 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_guard_aal_drop_fraction=float(reflex.get("guard_aal_drop_fraction", 0.05)),
         reflex_guard_patience=int(reflex.get("guard_patience", 2)),
         reflex_guard_disable_rollouts=int(reflex.get("guard_disable_rollouts", 50)),
+        reflex_candidate_probe_interval=int(reflex.get("candidate_probe_interval", 32)),
         reflex_feedback_clip_norm=float(reflex.get("feedback_clip_norm", 2.0)),
         reflex_hidden_feedback_clip_norm=float(reflex.get("hidden_feedback_clip_norm", 0.0)),
         reflex_fast_state_clip_norm=float(reflex.get("fast_state_clip_norm", 8.0)),
@@ -1302,6 +1333,7 @@ def run_training(config: dict[str, Any]) -> None:
         "reflex_consensus_strength": float(reflex_cfg.get("consensus_strength", 0.25)),
         "reflex_hint_quality_floor": float(reflex_cfg.get("hint_quality_floor", 0.0)),
         "reflex_horizon_delta_rule": str(reflex_cfg.get("horizon_delta_rule", "inverse_sqrt")),
+        "reflex_injection_gate_mode": str(reflex_cfg.get("injection_gate_mode", "legacy")),
         "reflex_feedback_objective": str(reflex_cfg.get("feedback_objective", "distribution")),
         "reflex_feedback_ce_gate": bool(reflex_cfg.get("feedback_ce_gate", True)),
         "aux_head_checkpoint": medusa_checkpoint,

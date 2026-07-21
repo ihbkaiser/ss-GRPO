@@ -30,6 +30,7 @@ FAIR_FIELDS = (
 def test_model_config_matrix_and_fair_ablation():
     for model_key, (model_type, model_tail) in MODELS.items():
         main = load_config(CONFIG_ROOT / model_key / "train_hrdcr.yaml")
+        normalized = load_config(CONFIG_ROOT / model_key / "train_hrdcr_normalized.yaml")
         ablation = load_config(CONFIG_ROOT / model_key / "train_medusa_only.yaml")
         pretrain = load_config(CONFIG_ROOT / model_key / "pretrain.yaml")
 
@@ -42,8 +43,18 @@ def test_model_config_matrix_and_fair_ablation():
 
         assert main["reflex"]["enabled"] is True
         assert main["reflex"]["horizon_resolved"] is True
+        assert normalized["reflex"]["injection_gate_mode"] == "normalized"
+        assert normalized["reflex"]["feedback_objective"] == "coverage"
+        assert normalized["reflex"]["feedback_stride_min"] == 1
+        assert normalized["reflex"]["half_life_tokens"] == 24
+        assert normalized["reflex"]["eta"] == 0.75
+        assert normalized["reflex"]["relative_rms_delta_base"] == 0.02
+        assert normalized["reflex"]["warmup_effective_updates"] == 1.0
+        assert normalized["reflex"]["hint_cold_start"] == 0.5
         assert ablation["reflex"]["enabled"] is False
+        assert ablation["reflex"].get("injection_gate_mode", "legacy") == "legacy"
         assert main["aux_update"] == ablation["aux_update"]
+        assert normalized["aux_update"] == main["aux_update"]
         for section, field in FAIR_FIELDS:
             assert main[section][field] == ablation[section][field]
-
+            assert normalized[section][field] == main[section][field]

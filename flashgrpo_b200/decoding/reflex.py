@@ -694,6 +694,272 @@ class PredictionBuffer:
 
 
 @dataclass(slots=True)
+class CoveragePredictionBatch:
+    """GPU-resident candidate records for the coverage feedback objective."""
+
+    sequence_ids: torch.Tensor
+    target_positions: torch.Tensor
+    head_indices: torch.Tensor
+    candidate_ids: torch.Tensor
+    candidate_valid: torch.Tensor
+    baseline_candidate_ids: torch.Tensor
+    baseline_candidate_valid: torch.Tensor
+    probe_valid: torch.Tensor
+
+
+@dataclass(slots=True)
+class CoverageFeedbackRecords:
+    """Mature coverage records, grouped by target token without Python rows."""
+
+    group_indices: torch.Tensor
+    head_indices: torch.Tensor
+    candidate_ids: torch.Tensor
+    candidate_valid: torch.Tensor
+    baseline_candidate_ids: torch.Tensor
+    baseline_candidate_valid: torch.Tensor
+    probe_valid: torch.Tensor
+
+
+class CoveragePredictionBuffer:
+    """Tensor-only prediction buffer used by normal coverage rounds.
+
+    Candidate ids stay on the proposal device.  In particular, this path never
+    stores proposal logits, a vocabulary log-normalizer, or the full fast hint.
+    One object is allocated per sampled verification round rather than per
+    sequence/head pair.
+    """
+
+    def __init__(self):
+        self._batches: list[CoveragePredictionBatch] = []
+
+    @torch.no_grad()
+    def add_from_logits(
+        self,
+        *,
+        sequence_ids: list[int],
+        anchor_positions: torch.Tensor,
+        logits_by_horizon: list[torch.Tensor],
+        candidate_topk_by_horizon: Iterable[int],
+        baseline_logits_by_horizon: list[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not sequence_ids or not logits_by_horizon:
+            device = anchor_positions.device
+            zero = torch.zeros((), device=device, dtype=torch.long)
+            return zero, zero
+
+        device = logits_by_horizon[0].device
+        batch_size = len(sequence_ids)
+        sequence = torch.as_tensor(sequence_ids, dtype=torch.long, device=device)
+        anchors = anchor_positions.detach().to(device=device, dtype=torch.long)
+        if tuple(anchors.shape) != (batch_size,):
+            raise ValueError("Coverage anchor positions must be [batch]")
+        topk = [max(1, int(value)) for value in candidate_topk_by_horizon]
+        head_count = min(len(logits_by_horizon), len(topk))
+        if head_count <= 0:
+            zero = torch.zeros((), device=device, dtype=torch.long)
+            return zero, zero
+        max_k = max(
+            min(topk[head_idx], int(logits_by_horizon[head_idx].shape[-1]))
+            for head_idx in range(head_count)
+        )
+
+        record_count = batch_size * head_count
+        candidate_ids = torch.full(
+            (record_count, max_k),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+        candidate_valid = torch.zeros_like(candidate_ids, dtype=torch.bool)
+        probe_enabled = baseline_logits_by_horizon is not None
+        baseline_ids = (
+            torch.full_like(candidate_ids, -1)
+            if probe_enabled
+            else torch.empty((record_count, 0), device=device, dtype=torch.long)
+        )
+        baseline_valid = (
+            torch.zeros_like(candidate_valid)
+            if probe_enabled
+            else torch.empty((record_count, 0), device=device, dtype=torch.bool)
+        )
+        probe_valid = torch.zeros((record_count,), device=device, dtype=torch.bool)
+        head_indices = torch.arange(head_count, device=device, dtype=torch.long).repeat_interleave(
+            batch_size
+        )
+        sequence_ids_flat = sequence.repeat(head_count)
+        target_positions = torch.cat(
+            [anchors + head_idx + 2 for head_idx in range(head_count)],
+            dim=0,
+        )
+
+        for head_idx in range(head_count):
+            start = head_idx * batch_size
+            end = start + batch_size
+            k = min(topk[head_idx], int(logits_by_horizon[head_idx].shape[-1]))
+            ids = torch.topk(logits_by_horizon[head_idx].detach(), k=k, dim=-1).indices
+            candidate_ids[start:end, :k].copy_(ids)
+            candidate_valid[start:end, :k] = True
+            if baseline_logits_by_horizon is not None and head_idx < len(baseline_logits_by_horizon):
+                baseline = baseline_logits_by_horizon[head_idx]
+                baseline_k = min(k, int(baseline.shape[-1]))
+                baseline_top = torch.topk(baseline.detach(), k=baseline_k, dim=-1).indices
+                baseline_ids[start:end, :baseline_k].copy_(baseline_top)
+                baseline_valid[start:end, :baseline_k] = True
+                probe_valid[start:end] = True
+
+        self._batches.append(
+            CoveragePredictionBatch(
+                sequence_ids=sequence_ids_flat,
+                target_positions=target_positions,
+                head_indices=head_indices,
+                candidate_ids=candidate_ids,
+                candidate_valid=candidate_valid,
+                baseline_candidate_ids=baseline_ids,
+                baseline_candidate_valid=baseline_valid,
+                probe_valid=probe_valid,
+            )
+        )
+        if not probe_enabled:
+            zero = torch.zeros((), device=device, dtype=torch.long)
+            return zero, zero
+        sentinel = torch.iinfo(torch.long).max
+        corrected_sorted = candidate_ids.masked_fill(~candidate_valid, sentinel).sort(dim=-1).values
+        baseline_sorted = baseline_ids.masked_fill(~baseline_valid, sentinel).sort(dim=-1).values
+        changed = corrected_sorted.ne(baseline_sorted).any(dim=-1) & probe_valid
+        return changed.sum(), probe_valid.sum()
+
+    @torch.no_grad()
+    def pop_mature_batch(
+        self,
+        sequence_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+    ) -> CoverageFeedbackRecords:
+        if tuple(sequence_ids.shape) != tuple(target_positions.shape):
+            raise ValueError("Coverage sequence ids and target positions must align")
+        device = sequence_ids.device
+        group_count = int(sequence_ids.numel())
+        if group_count == 0:
+            return self._empty_records(device, 0)
+
+        groups: list[torch.Tensor] = []
+        heads: list[torch.Tensor] = []
+        candidates: list[torch.Tensor] = []
+        candidate_masks: list[torch.Tensor] = []
+        baselines: list[torch.Tensor] = []
+        baseline_masks: list[torch.Tensor] = []
+        probe_masks: list[torch.Tensor] = []
+        retained_batches: list[CoveragePredictionBatch] = []
+        max_k = max((int(batch.candidate_ids.shape[-1]) for batch in self._batches), default=0)
+        baseline_max_k = max(
+            (int(batch.baseline_candidate_ids.shape[-1]) for batch in self._batches),
+            default=0,
+        )
+
+        for batch in self._batches:
+            sequence = sequence_ids.to(device=batch.sequence_ids.device, dtype=torch.long)
+            positions = target_positions.to(device=batch.target_positions.device, dtype=torch.long)
+            pair_match = batch.sequence_ids.unsqueeze(1).eq(sequence.unsqueeze(0)) & batch.target_positions.unsqueeze(
+                1
+            ).eq(positions.unsqueeze(0))
+            matched = pair_match.any(dim=1)
+            matched_groups = pair_match.long().argmax(dim=1)[matched]
+            groups.append(matched_groups.to(device=device))
+            heads.append(batch.head_indices[matched].to(device=device))
+
+            def padded(values: torch.Tensor, fill: int | bool, output_width: int) -> torch.Tensor:
+                selected = values[matched].to(device=device)
+                width = int(selected.shape[-1])
+                if width >= output_width:
+                    return selected
+                output = torch.full(
+                    (int(selected.shape[0]), output_width),
+                    fill,
+                    device=device,
+                    dtype=selected.dtype,
+                )
+                output[:, :width].copy_(selected)
+                return output
+
+            candidates.append(padded(batch.candidate_ids, -1, max_k))
+            candidate_masks.append(padded(batch.candidate_valid, False, max_k))
+            baselines.append(padded(batch.baseline_candidate_ids, -1, baseline_max_k))
+            baseline_masks.append(padded(batch.baseline_candidate_valid, False, baseline_max_k))
+            probe_masks.append(batch.probe_valid[matched].to(device=device))
+
+            keep = ~matched
+            if bool(keep.any().item()):
+                retained_batches.append(
+                    CoveragePredictionBatch(
+                        sequence_ids=batch.sequence_ids[keep],
+                        target_positions=batch.target_positions[keep],
+                        head_indices=batch.head_indices[keep],
+                        candidate_ids=batch.candidate_ids[keep],
+                        candidate_valid=batch.candidate_valid[keep],
+                        baseline_candidate_ids=batch.baseline_candidate_ids[keep],
+                        baseline_candidate_valid=batch.baseline_candidate_valid[keep],
+                        probe_valid=batch.probe_valid[keep],
+                    )
+                )
+        self._batches = retained_batches
+        if not groups:
+            return self._empty_records(device, max_k)
+        return CoverageFeedbackRecords(
+            group_indices=torch.cat(groups, dim=0),
+            head_indices=torch.cat(heads, dim=0),
+            candidate_ids=torch.cat(candidates, dim=0),
+            candidate_valid=torch.cat(candidate_masks, dim=0),
+            baseline_candidate_ids=torch.cat(baselines, dim=0),
+            baseline_candidate_valid=torch.cat(baseline_masks, dim=0),
+            probe_valid=torch.cat(probe_masks, dim=0),
+        )
+
+    @staticmethod
+    def _empty_records(device: torch.device, width: int) -> CoverageFeedbackRecords:
+        return CoverageFeedbackRecords(
+            group_indices=torch.empty((0,), device=device, dtype=torch.long),
+            head_indices=torch.empty((0,), device=device, dtype=torch.long),
+            candidate_ids=torch.empty((0, width), device=device, dtype=torch.long),
+            candidate_valid=torch.empty((0, width), device=device, dtype=torch.bool),
+            baseline_candidate_ids=torch.empty((0, 0), device=device, dtype=torch.long),
+            baseline_candidate_valid=torch.empty((0, 0), device=device, dtype=torch.bool),
+            probe_valid=torch.empty((0,), device=device, dtype=torch.bool),
+        )
+
+    def clear_sequence(self, sequence_id: int) -> None:
+        self.clear_sequences([sequence_id])
+
+    def clear_sequences(self, sequence_ids: Iterable[int]) -> None:
+        sequence_ids = list(sequence_ids)
+        if not sequence_ids:
+            return
+        retained: list[CoveragePredictionBatch] = []
+        for batch in self._batches:
+            finished = torch.as_tensor(
+                sequence_ids,
+                device=batch.sequence_ids.device,
+                dtype=torch.long,
+            )
+            keep = ~batch.sequence_ids.unsqueeze(1).eq(finished.unsqueeze(0)).any(dim=1)
+            if bool(keep.any().item()):
+                retained.append(
+                    CoveragePredictionBatch(
+                        sequence_ids=batch.sequence_ids[keep],
+                        target_positions=batch.target_positions[keep],
+                        head_indices=batch.head_indices[keep],
+                        candidate_ids=batch.candidate_ids[keep],
+                        candidate_valid=batch.candidate_valid[keep],
+                        baseline_candidate_ids=batch.baseline_candidate_ids[keep],
+                        baseline_candidate_valid=batch.baseline_candidate_valid[keep],
+                        probe_valid=batch.probe_valid[keep],
+                    )
+                )
+        self._batches = retained
+
+    def __len__(self) -> int:
+        return sum(int(batch.sequence_ids.numel()) for batch in self._batches)
+
+
+@dataclass(slots=True)
 class SparseFeedbackBatch:
     feedback: torch.Tensor
     has_feedback: torch.Tensor
@@ -712,6 +978,11 @@ class SparseFeedbackBatch:
     target_top_ids: torch.Tensor
     target_top_logits: torch.Tensor
     target_logsumexp: torch.Tensor
+    coverage_head_indices: torch.Tensor | None = None
+    coverage_hits: torch.Tensor | None = None
+    coverage_probe_valid: torch.Tensor | None = None
+    coverage_wins: torch.Tensor | None = None
+    coverage_losses: torch.Tensor | None = None
 
 
 class LMHeadFeedback:
@@ -957,6 +1228,152 @@ class LMHeadFeedback:
             target_top_ids=empty_support,
             target_top_logits=torch.empty((group_count, 0), dtype=torch.float16),
             target_logsumexp=torch.zeros((group_count,), dtype=torch.float32),
+        )
+
+    @torch.no_grad()
+    def compute_coverage_tensors(
+        self,
+        records: CoverageFeedbackRecords,
+        true_tokens: torch.Tensor,
+        *,
+        group_count: int | None = None,
+        compute_hidden_feedback: bool = True,
+    ) -> SparseFeedbackBatch:
+        """Vectorized GPU coverage feedback for normal HRDCR rounds."""
+
+        weight = self.lm_head.weight.detach()
+        device = weight.device
+        true_tokens = true_tokens.to(device=device, dtype=torch.long)
+        group_count = int(true_tokens.numel()) if group_count is None else int(group_count)
+        if int(true_tokens.numel()) != group_count:
+            raise ValueError("Coverage true tokens must align with feedback groups")
+        num_heads = max(0, int(self.num_heads))
+        feedback_width = int(weight.shape[-1]) if compute_hidden_feedback else 0
+        record_count = int(records.group_indices.numel())
+
+        feedback = torch.zeros((group_count, feedback_width), device=device, dtype=torch.float32)
+        head_feedback = torch.zeros(
+            (group_count, num_heads, feedback_width),
+            device=device,
+            dtype=torch.float32,
+        )
+        head_has_feedback = torch.zeros((group_count, num_heads), device=device, dtype=torch.bool)
+        head_effective_mass = torch.zeros((group_count, num_heads), device=device, dtype=torch.float32)
+        has_feedback = torch.zeros((group_count,), device=device, dtype=torch.bool)
+        effective_mass = torch.zeros((group_count,), device=device, dtype=torch.float32)
+        empty_support = torch.empty((group_count, 0), dtype=torch.int32)
+
+        if record_count == 0:
+            return SparseFeedbackBatch(
+                feedback=feedback,
+                has_feedback=has_feedback,
+                effective_mass=effective_mass,
+                head_feedback=head_feedback,
+                head_has_feedback=head_has_feedback,
+                head_effective_mass=head_effective_mass,
+                head_context_keys=weight.new_zeros((group_count, num_heads, 0), dtype=torch.float32),
+                head_prediction_hint=head_feedback.clone(),
+                head_hint_observed=head_has_feedback.clone(),
+                feature_agreement=weight.new_zeros((group_count, num_heads), dtype=torch.float32),
+                feature_gate=weight.new_zeros((group_count, num_heads), dtype=torch.float32),
+                record_true_probs=weight.new_zeros((0,), dtype=torch.float32),
+                record_tv=weight.new_zeros((0,), dtype=torch.float32),
+                record_gates=weight.new_zeros((0,), dtype=torch.float32),
+                target_top_ids=empty_support,
+                target_top_logits=torch.empty((group_count, 0), dtype=torch.float16),
+                target_logsumexp=torch.zeros((group_count,), dtype=torch.float32),
+                coverage_head_indices=records.head_indices.to(device=device, dtype=torch.long),
+                coverage_hits=torch.empty((0,), device=device, dtype=torch.bool),
+                coverage_probe_valid=torch.empty((0,), device=device, dtype=torch.bool),
+                coverage_wins=torch.empty((0,), device=device, dtype=torch.bool),
+                coverage_losses=torch.empty((0,), device=device, dtype=torch.bool),
+            )
+
+        groups = records.group_indices.to(device=device, dtype=torch.long)
+        heads = records.head_indices.to(device=device, dtype=torch.long)
+        candidates = records.candidate_ids.to(device=device, dtype=torch.long)
+        candidate_valid = records.candidate_valid.to(device=device, dtype=torch.bool)
+        if candidates.shape != candidate_valid.shape or int(candidates.shape[0]) != record_count:
+            raise ValueError("Coverage candidates and valid mask must align")
+
+        actual = true_tokens.index_select(0, groups)
+        candidate_count = candidate_valid.sum(dim=-1)
+        record_valid = candidate_count.gt(0)
+        hits = (candidates.eq(actual.unsqueeze(-1)) & candidate_valid).any(dim=-1) & record_valid
+        misses = record_valid & ~hits
+        boundary_index = (candidate_count - 1).clamp_min(0).unsqueeze(-1)
+        boundary = candidates.gather(1, boundary_index).squeeze(-1)
+        flat_head_groups = groups * num_heads + heads
+
+        record_counts = torch.zeros((group_count * num_heads,), device=device, dtype=torch.float32)
+        miss_counts = torch.zeros_like(record_counts)
+        record_counts.index_add_(0, flat_head_groups, record_valid.float())
+        miss_counts.index_add_(0, flat_head_groups, misses.float())
+        head_has_feedback.copy_(miss_counts.view(group_count, num_heads).gt(0.0))
+        head_effective_mass.copy_(
+            (miss_counts / record_counts.clamp_min(1.0)).view(group_count, num_heads)
+        )
+
+        group_record_counts = torch.zeros((group_count,), device=device, dtype=torch.float32)
+        group_miss_counts = torch.zeros_like(group_record_counts)
+        group_record_counts.index_add_(0, groups, record_valid.float())
+        group_miss_counts.index_add_(0, groups, misses.float())
+        has_feedback.copy_(group_miss_counts.gt(0.0))
+        effective_mass.copy_(group_miss_counts / group_record_counts.clamp_min(1.0))
+
+        if compute_hidden_feedback:
+            safe_boundary = boundary.clamp(0, int(weight.shape[0]) - 1)
+            safe_actual = actual.clamp(0, int(weight.shape[0]) - 1)
+            record_feedback = (
+                weight.index_select(0, safe_actual).float()
+                - weight.index_select(0, safe_boundary).float()
+            )
+            record_feedback.mul_(misses.unsqueeze(-1))
+            record_feedback.mul_(float(self.coverage_feedback_weight))
+            head_flat = head_feedback.view(group_count * num_heads, feedback_width)
+            head_flat.index_add_(0, flat_head_groups, record_feedback)
+            head_flat.div_(miss_counts.clamp_min(1.0).unsqueeze(-1))
+
+            horizon_weight = torch.pow(
+                torch.full((record_count,), float(self.horizon_weight_decay), device=device),
+                heads.float(),
+            )
+            feedback.index_add_(0, groups, record_feedback * horizon_weight.unsqueeze(-1))
+            feedback.div_(group_miss_counts.clamp_min(1.0).unsqueeze(-1))
+
+        probe_valid = records.probe_valid.to(device=device, dtype=torch.bool)
+        baseline_ids = records.baseline_candidate_ids.to(device=device, dtype=torch.long)
+        baseline_valid = records.baseline_candidate_valid.to(device=device, dtype=torch.bool)
+        baseline_hits = (
+            (baseline_ids.eq(actual.unsqueeze(-1)) & baseline_valid).any(dim=-1)
+            & baseline_valid.any(dim=-1)
+            & probe_valid
+        )
+        wins = probe_valid & hits & ~baseline_hits
+        losses = probe_valid & ~hits & baseline_hits
+        return SparseFeedbackBatch(
+            feedback=feedback,
+            has_feedback=has_feedback,
+            effective_mass=effective_mass,
+            head_feedback=head_feedback,
+            head_has_feedback=head_has_feedback,
+            head_effective_mass=head_effective_mass,
+            head_context_keys=weight.new_zeros((group_count, num_heads, 0), dtype=torch.float32),
+            head_prediction_hint=torch.zeros_like(head_feedback),
+            head_hint_observed=torch.zeros_like(head_has_feedback),
+            feature_agreement=weight.new_zeros((group_count, num_heads), dtype=torch.float32),
+            feature_gate=weight.new_zeros((group_count, num_heads), dtype=torch.float32),
+            record_true_probs=hits.float(),
+            record_tv=misses.float(),
+            record_gates=misses.float(),
+            target_top_ids=empty_support,
+            target_top_logits=torch.empty((group_count, 0), dtype=torch.float16),
+            target_logsumexp=torch.zeros((group_count,), dtype=torch.float32),
+            coverage_head_indices=heads,
+            coverage_hits=hits,
+            coverage_probe_valid=probe_valid,
+            coverage_wins=wins,
+            coverage_losses=losses,
         )
 
     @torch.no_grad()
@@ -1614,6 +2031,13 @@ class ReflexStateManager:
             torch.full_like(calibrated, float(self.hint_cold_start)),
         )
 
+    def get_hint_trust(self, sequence_ids: Iterable[int]) -> torch.Tensor:
+        ids = self._ids(sequence_ids)
+        if ids.numel() == 0:
+            shape = (0, self.num_heads) if self.horizon_resolved else (0,)
+            return self.effective_updates.new_zeros(shape)
+        return self._hint_trust(ids)
+
     def _effective_horizon_state(
         self,
         ids: torch.Tensor,
@@ -1725,6 +2149,8 @@ class ReflexStateManager:
         self,
         sequence_ids: Iterable[int],
         context_keys: torch.Tensor | None = None,
+        *,
+        apply_hint_trust: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ids = self._ids(sequence_ids)
         if ids.numel() == 0:
@@ -1736,7 +2162,11 @@ class ReflexStateManager:
             update_shape = (0, self.num_heads) if self.horizon_resolved else (0,)
             return self.states.new_zeros(state_shape), self.effective_updates.new_zeros(update_shape)
         state = (
-            self._effective_horizon_state(ids, context_keys=context_keys)
+            self._effective_horizon_state(
+                ids,
+                context_keys=context_keys,
+                apply_hint_trust=apply_hint_trust,
+            )
             if self.horizon_resolved
             else self.states.index_select(0, ids)
         )
@@ -2152,8 +2582,10 @@ class ReflexStateManager:
         if self.states.numel() == 0:
             return {
                 "horizon_resolved": bool(self.horizon_resolved),
+                "raw_fast_state_rms": 0.0,
                 "fast_state_rms_mean": 0.0,
                 "fast_state_rms_p95": 0.0,
+                "hint_trust": 0.0,
                 "effective_feedback_updates_mean": 0.0,
                 "numerical_reset_count": int(self.numerical_reset_count.detach().cpu()),
             }
@@ -2165,6 +2597,7 @@ class ReflexStateManager:
         ).square().mean(dim=-1).sqrt()
         result = {
             "horizon_resolved": bool(self.horizon_resolved),
+            "raw_fast_state_rms": float(state_rms.mean().detach().cpu()),
             "fast_state_rms_mean": float(state_rms.mean().detach().cpu()),
             "fast_state_rms_p95": float(torch.quantile(state_rms.flatten(), 0.95).detach().cpu()),
             "fast_state_norm_mean": float(state_rms.mean().detach().cpu()),
@@ -2186,6 +2619,7 @@ class ReflexStateManager:
                         float(quality.gt(0.0).float().mean().detach().cpu()) if quality.numel() else 0.0
                     ),
                     "hint_trust_mean": float(trust.mean().detach().cpu()),
+                    "hint_trust": float(trust.mean().detach().cpu()),
                     "head_fast_state_rms_mean": [
                         float(value)
                         for value in state_rms.mean(dim=0).detach().cpu().tolist()
@@ -2400,6 +2834,13 @@ class ReflexBatchStats:
         self.feedback_rms: list[float] = []
         self.feature_agreements: list[float] = []
         self.feature_gates: list[float] = []
+        self._coverage_mature: torch.Tensor | None = None
+        self._coverage_hits: torch.Tensor | None = None
+        self._coverage_misses: torch.Tensor | None = None
+        self._candidate_changed: torch.Tensor | None = None
+        self._candidate_probes: torch.Tensor | None = None
+        self._reflex_wins: torch.Tensor | None = None
+        self._reflex_losses: torch.Tensor | None = None
 
     @staticmethod
     def _depth_bucket(depth: int) -> str:
@@ -2461,15 +2902,56 @@ class ReflexBatchStats:
             self.feature_agreements.extend(agreement[active].detach().float().cpu().tolist())
             self.feature_gates.extend(gate[active].detach().float().cpu().tolist())
 
+    def add_candidate_probe(self, changed: torch.Tensor, total: torch.Tensor) -> None:
+        changed = changed.detach().to(dtype=torch.long)
+        total = total.detach().to(device=changed.device, dtype=torch.long)
+        if self._candidate_changed is None:
+            self._candidate_changed = torch.zeros((), device=changed.device, dtype=torch.long)
+            self._candidate_probes = torch.zeros_like(self._candidate_changed)
+        self._candidate_changed.add_(changed)
+        self._candidate_probes.add_(total)
+
+    def add_coverage_feedback(self, batch: SparseFeedbackBatch) -> None:
+        if batch.coverage_head_indices is None or batch.coverage_hits is None:
+            return
+        heads = batch.coverage_head_indices.detach().long()
+        hits = batch.coverage_hits.detach().bool()
+        if heads.numel() == 0:
+            return
+        mature = torch.bincount(heads, minlength=self.num_heads)[: self.num_heads]
+        accepted = torch.bincount(heads[hits], minlength=self.num_heads)[: self.num_heads]
+        missed = torch.bincount(heads[~hits], minlength=self.num_heads)[: self.num_heads]
+        if self._coverage_mature is None:
+            self._coverage_mature = torch.zeros_like(mature)
+            self._coverage_hits = torch.zeros_like(mature)
+            self._coverage_misses = torch.zeros_like(mature)
+            self._reflex_wins = torch.zeros((), device=heads.device, dtype=torch.long)
+            self._reflex_losses = torch.zeros_like(self._reflex_wins)
+        self._coverage_mature.add_(mature)
+        self._coverage_hits.add_(accepted)
+        self._coverage_misses.add_(missed)
+        if batch.coverage_wins is not None:
+            self._reflex_wins.add_(batch.coverage_wins.detach().long().sum())
+        if batch.coverage_losses is not None:
+            self._reflex_losses.add_(batch.coverage_losses.detach().long().sum())
+
     def to_dict(self) -> dict:
+        coverage_mature = [0 for _ in range(self.num_heads)]
+        coverage_hits = [0 for _ in range(self.num_heads)]
+        coverage_misses = [0 for _ in range(self.num_heads)]
+        if self._coverage_mature is not None:
+            coverage_mature = [int(value) for value in self._coverage_mature.cpu().tolist()]
+            coverage_hits = [int(value) for value in self._coverage_hits.cpu().tolist()]
+            coverage_misses = [int(value) for value in self._coverage_misses.cpu().tolist()]
         per_head: dict[str, dict] = {}
         total_mature = 0
         total_gated = 0
         for head_idx in range(self.num_heads):
-            mature = self.mature[head_idx]
-            accepted = self.accepted[head_idx]
+            mature = self.mature[head_idx] + coverage_mature[head_idx]
+            accepted = self.accepted[head_idx] + coverage_hits[head_idx]
             total_mature += mature
-            total_gated += self.gated[head_idx]
+            gated_count = self.gated[head_idx] + coverage_misses[head_idx]
+            total_gated += gated_count
             buckets = {}
             for name, raw in self.depth_buckets[head_idx].items():
                 count = int(raw["mature"])
@@ -2485,7 +2967,7 @@ class ReflexBatchStats:
                 "rejection_rate": 1.0 - accepted / max(mature, 1) if mature else 0.0,
                 "mature_ce": self.ce_sum[head_idx] / max(mature, 1),
                 "sparse_tv": self.tv_sum[head_idx] / max(mature, 1),
-                "nonzero_gate_fraction": self.gated[head_idx] / max(mature, 1),
+                "nonzero_gate_fraction": gated_count / max(mature, 1),
                 "depth_buckets": buckets,
             }
         feedback = torch.tensor(self.feedback_rms, dtype=torch.float32) if self.feedback_rms else None
@@ -2495,6 +2977,10 @@ class ReflexBatchStats:
             else None
         )
         feature_gate = torch.tensor(self.feature_gates, dtype=torch.float32) if self.feature_gates else None
+        candidate_changed = int(self._candidate_changed.cpu()) if self._candidate_changed is not None else 0
+        candidate_probes = int(self._candidate_probes.cpu()) if self._candidate_probes is not None else 0
+        reflex_wins = int(self._reflex_wins.cpu()) if self._reflex_wins is not None else 0
+        reflex_losses = int(self._reflex_losses.cpu()) if self._reflex_losses is not None else 0
         return {
             "num_reflex_updates": int(total_gated),
             "feedback_rms_mean": float(feedback.mean()) if feedback is not None else 0.0,
@@ -2507,5 +2993,9 @@ class ReflexBatchStats:
             ),
             "feature_gate_mean": float(feature_gate.mean()) if feature_gate is not None else 0.0,
             "feature_feedback_count": len(self.feature_gates),
+            "candidate_set_changed_fraction": candidate_changed / max(candidate_probes, 1),
+            "candidate_set_probe_count": candidate_probes,
+            "reflex_win_count": reflex_wins,
+            "reflex_loss_count": reflex_losses,
             "per_head": per_head,
         }

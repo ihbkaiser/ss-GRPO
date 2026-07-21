@@ -3,6 +3,7 @@ import torch
 from flashgrpo_b200.decoding.flash_medusa_decoder import FlashMedusaConfig, FlashMedusaDecoder
 from flashgrpo_b200.decoding.medusa_tree import TreePlan, build_batch_trees, build_dense_tree
 from flashgrpo_b200.decoding.reflex import (
+    CoveragePredictionBuffer,
     LMHeadFeedback,
     PredictionRecord,
     ReflexAuxiliaryRecordBuffer,
@@ -155,6 +156,217 @@ def test_coverage_reflex_moves_target_token_above_candidate_boundary():
     assert float(result.head_feedback[0, 0, 2]) > 0.0
     assert float(result.head_feedback[0, 0, 1]) < 0.0
     assert result.target_top_ids.shape[-1] == 0
+
+
+def test_tensorized_coverage_hit_does_not_update_and_miss_is_exact_boundary_delta():
+    vocab = hidden = 6
+    lm_head = torch.nn.Linear(hidden, vocab, bias=False)
+    with torch.no_grad():
+        lm_head.weight.copy_(torch.eye(vocab))
+    feedback = LMHeadFeedback(
+        lm_head,
+        num_heads=1,
+        coverage_feedback_weight=1.0,
+        feedback_objective="coverage",
+    )
+
+    logits = torch.tensor([[6.0, 5.0, 4.0, 3.0, 2.0, 1.0]])
+    hit_buffer = CoveragePredictionBuffer()
+    hit_buffer.add_from_logits(
+        sequence_ids=[0],
+        anchor_positions=torch.tensor([5]),
+        logits_by_horizon=[logits],
+        candidate_topk_by_horizon=[2],
+    )
+    hit_records = hit_buffer.pop_mature_batch(torch.tensor([0]), torch.tensor([7]))
+    hit = feedback.compute_coverage_tensors(hit_records, torch.tensor([0]))
+    assert not bool(hit.has_feedback.item())
+    assert torch.count_nonzero(hit.feedback) == 0
+    assert torch.count_nonzero(hit.head_feedback) == 0
+    manager = ReflexStateManager(
+        1,
+        hidden,
+        device=torch.device("cpu"),
+        num_heads=1,
+        horizon_resolved=True,
+    )
+    manager.advance_token(
+        [0],
+        hit.feedback,
+        hit.has_feedback,
+        hit.effective_mass,
+        head_feedback=hit.head_feedback,
+        head_has_feedback=hit.head_has_feedback,
+        head_effective_mass=hit.head_effective_mass,
+        feedback_present=True,
+    )
+    assert torch.count_nonzero(manager.states) == 0
+    assert torch.count_nonzero(manager.effective_updates) == 0
+
+    miss_buffer = CoveragePredictionBuffer()
+    miss_buffer.add_from_logits(
+        sequence_ids=[0],
+        anchor_positions=torch.tensor([5]),
+        logits_by_horizon=[logits],
+        candidate_topk_by_horizon=[2],
+    )
+    miss_records = miss_buffer.pop_mature_batch(torch.tensor([0]), torch.tensor([7]))
+    miss = feedback.compute_coverage_tensors(miss_records, torch.tensor([2]))
+    expected = lm_head.weight[2] - lm_head.weight[1]
+    assert bool(miss.has_feedback.item())
+    assert torch.equal(miss.feedback[0], expected)
+    assert torch.equal(miss.head_feedback[0, 0], expected)
+
+
+def test_coverage_probe_counts_candidate_change_win_and_loss():
+    lm_head = torch.nn.Linear(4, 4, bias=False)
+    feedback = LMHeadFeedback(
+        lm_head,
+        num_heads=1,
+        coverage_feedback_weight=1.0,
+        feedback_objective="coverage",
+    )
+    corrected_logits = torch.tensor([[5.0, 3.0, 4.0, 0.0]])
+    baseline_logits = torch.tensor([[5.0, 4.0, 3.0, 0.0]])
+
+    win_buffer = CoveragePredictionBuffer()
+    changed, probed = win_buffer.add_from_logits(
+        sequence_ids=[0],
+        anchor_positions=torch.tensor([3]),
+        logits_by_horizon=[corrected_logits],
+        candidate_topk_by_horizon=[2],
+        baseline_logits_by_horizon=[baseline_logits],
+    )
+    win_records = win_buffer.pop_mature_batch(torch.tensor([0]), torch.tensor([5]))
+    win = feedback.compute_coverage_tensors(win_records, torch.tensor([2]))
+    assert int(changed) == int(probed) == 1
+    assert bool(win.coverage_wins.item())
+    assert not bool(win.coverage_losses.item())
+
+    loss_buffer = CoveragePredictionBuffer()
+    loss_buffer.add_from_logits(
+        sequence_ids=[0],
+        anchor_positions=torch.tensor([3]),
+        logits_by_horizon=[corrected_logits],
+        candidate_topk_by_horizon=[2],
+        baseline_logits_by_horizon=[baseline_logits],
+    )
+    loss_records = loss_buffer.pop_mature_batch(torch.tensor([0]), torch.tensor([5]))
+    loss = feedback.compute_coverage_tensors(loss_records, torch.tensor([1]))
+    assert bool(loss.coverage_losses.item())
+    assert not bool(loss.coverage_wins.item())
+
+
+def test_normalized_injection_has_configured_rms_and_is_scale_invariant():
+    torch.manual_seed(19)
+    batch, hidden, vocab = 3, 64, 71
+    heads = MedusaHeads(hidden, vocab, num_heads=1, dtype=torch.float32)
+    decoder = FlashMedusaDecoder(
+        object(),
+        heads,
+        object(),
+        FlashMedusaConfig(
+            reflex_enabled=True,
+            reflex_state_space="hidden",
+            reflex_feedback_enabled=True,
+            reflex_proposal_injection_enabled=True,
+            reflex_proposal_injection_scale=1.0,
+            reflex_injection_gate_mode="normalized",
+            reflex_relative_rms_delta_base=0.02,
+            reflex_warmup_effective_updates=1.0,
+        ),
+    )
+    base = torch.randn(batch, hidden)
+    state = torch.randn(batch, hidden)
+    updates = torch.full((batch,), 100.0)
+    trust = torch.ones(batch)
+    corrected = decoder._apply_reflex_correction(base, state, updates, 0, 0, trust)
+    rescaled = decoder._apply_reflex_correction(base, 100.0 * state, updates, 0, 0, trust)
+    correction = corrected - base
+    ratio = correction.square().mean(dim=-1).sqrt() / base.square().mean(dim=-1).sqrt()
+    assert torch.allclose(ratio, torch.full_like(ratio, 0.02), atol=2e-6, rtol=2e-5)
+    assert torch.allclose(corrected, rescaled, atol=2e-6, rtol=2e-5)
+
+
+def test_normalized_injection_zero_state_or_zero_trust_is_identity():
+    batch, hidden, vocab = 2, 16, 23
+    heads = MedusaHeads(hidden, vocab, num_heads=1, dtype=torch.float32)
+    decoder = FlashMedusaDecoder(
+        object(),
+        heads,
+        object(),
+        FlashMedusaConfig(
+            reflex_enabled=True,
+            reflex_state_space="hidden",
+            reflex_feedback_enabled=True,
+            reflex_proposal_injection_enabled=True,
+            reflex_proposal_injection_scale=1.0,
+            reflex_injection_gate_mode="normalized",
+            reflex_relative_rms_delta_base=0.02,
+            reflex_warmup_effective_updates=1.0,
+        ),
+    )
+    base = torch.randn(batch, hidden)
+    state = torch.randn(batch, hidden)
+    updates = torch.full((batch,), 10.0)
+    assert torch.equal(
+        decoder._apply_reflex_correction(base, torch.zeros_like(state), updates, 0, 0, torch.ones(batch)),
+        base,
+    )
+    assert torch.equal(
+        decoder._apply_reflex_correction(base, state, updates, 0, 0, torch.zeros(batch)),
+        base,
+    )
+
+
+def test_dynamic_feedback_stride_reaches_one_for_small_active_batch():
+    assert FlashMedusaDecoder._dynamic_feedback_stride(
+        feedback_stride=8,
+        feedback_stride_min=1,
+        active_batch_size=1,
+        initial_batch_size=8,
+    ) == 1
+    assert FlashMedusaDecoder._dynamic_feedback_stride(
+        feedback_stride=8,
+        feedback_stride_min=1,
+        active_batch_size=8,
+        initial_batch_size=8,
+    ) == 8
+
+
+def test_degradation_guard_disables_feedback_path_with_injection():
+    heads = MedusaHeads(8, 11, num_heads=1, dtype=torch.float32)
+    decoder = FlashMedusaDecoder(
+        object(),
+        heads,
+        object(),
+        FlashMedusaConfig(
+            reflex_enabled=True,
+            reflex_state_space="hidden",
+            reflex_feedback_enabled=True,
+            reflex_proposal_injection_enabled=True,
+            reflex_proposal_injection_scale=1.0,
+        ),
+    )
+    decoder._reflex_guard_disabled_until = 40
+    assert decoder._reflex_effective_injection_scale(7) == 0.0
+    assert decoder._reflex_feedback_path_enabled(7) is False
+
+
+def test_medusa_only_keeps_hidden_unchanged_and_has_no_feedback_path():
+    heads = MedusaHeads(8, 11, num_heads=1, dtype=torch.float32)
+    decoder = FlashMedusaDecoder(object(), heads, object(), FlashMedusaConfig())
+    hidden = torch.randn(2, 8)
+    state = torch.randn_like(hidden)
+    corrected = decoder._apply_reflex_correction(
+        hidden,
+        state,
+        torch.full((2,), 100.0),
+        head_idx=0,
+        generation_step=0,
+    )
+    assert torch.equal(corrected, hidden)
+    assert decoder._reflex_feedback_path_enabled(0) is False
 
 
 def test_horizon_resolved_feedback_and_state_do_not_cancel_across_heads():
