@@ -1,7 +1,5 @@
-inherits: ../reflexgrpo_horizon_consensus_b200_qwen25_7b_gsm8k.yaml
+inherits: ../fair_fastgrpo_b200/_base_qwen25_7b.yaml
 
-# Canonical B200 workload shared by every model-specific config. Model paths,
-# head checkpoints and artifact paths are supplied by the model leaf configs.
 method: flashgrpo_b200_hrdcr
 run_name: flashgrpo_b200_hrdcr
 seed: 42
@@ -51,11 +49,14 @@ flashgrpo:
   chain_loss_weight: 0.0
   chain_loss_max_depth: 0
   acceptance: exact_target
+  tree_mode: concurrency_aware
+  tree_layout: dense
+  adaptive_tree_enabled: false
   online_medusa: true
-  medusa_update_mode: reliability_triggered
+  medusa_update_mode: sparse_online
   medusa_lr: 1.0e-5
   cpeak_nodes: 128
-  auto_tune_cpeak_enabled: true
+  auto_tune_cpeak_enabled: false
   auto_tune_cpeak_candidates: [128, 192, 256, 384, 512, 768]
   auto_tune_cpeak_trials_per_candidate: 3
   auto_tune_cpeak_start_rollout: 0
@@ -70,7 +71,98 @@ flashgrpo:
   empty_cache_reserved_ratio: 1.6
   gpu_poll_interval_s: 20.0
 
+reflex:
+  enabled: true
+  adaptation_mode: immediate
+  state_space: hidden
+  strict_horizon_pipeline: true
+  horizon_resolved: true
+  feedback_enabled: true
+  proposal_injection_enabled: true
+  proposal_injection_scale: 1.0
+  proposal_injection_after: 0
+  proposal_injection_warmup: 0
+
+  # Per-head m_{t,k}; shared consensus and context memory are intentionally off.
+  consensus_strength: 0.0
+  context_rank: 0
+  context_mix: 0.0
+  half_life_tokens: 32
+  state_rms_clip: 1.0
+  numerical_reset_rms: 1.25
+
+  # Predictive trust from the exact proposal-time state sketch.
+  hint_quality_beta: 0.90
+  trust_n0: 4.0
+  sketch_rank: 24
+  sketch_seed: 29
+
+  # Relative-RMS proposal trust region. No state renormalization or magnitude gate.
+  injection_gate_mode: normalized
+  relative_rms_delta_base: 0.02
+  horizon_delta_rule: constant
+  warmup_effective_updates: 0.0
+  magnitude_gate_floor: 0.0
+  guard_enabled: false
+
+  # S = TopL(q) union TopM(p) union {actual target token}.
+  proposal_topk: 16
+  target_topk: 16
+  feedback_union_cap: 48
+  feedback_temperature: 1.0
+  feedback_stride: 4
+  feedback_stride_min: 1
+  feedback_objective: distribution
+  distribution_weight: 0.25
+  coverage_feedback_weight: 1.0
+  boundary_width: 2
+  severity_tv_weight: 0.5
+  severity_out_weight: 0.5
+  severity_min: 0.02
+
+  anchor_conditioning_enabled: false
+  utility_scheduler_enabled: false
+  motivation_trace_enabled: false
+
+persistent_memory:
+  enabled: false
+
+aux_update:
+  enabled: true
+  mode: sparse_online
+  records_per_update: 512
+  min_records_per_update: 64
+  optimizer_steps: 1
+  max_heads_per_update: 2
+  max_cached_records: 2048
+  reflex_cache_enabled: true
+  cache_stride: 1
+
+  sparse_support_cap: 48
+  target_topk: 16
+  proposal_topk: 16
+  kl_weight: 0.25
+  coverage_weight: 1.0
+  proximal_weight: 0.05
+  ranking_margin: 0.5
+  min_expected_benefit: 0.001
+  reflex_record_microbatch_size: 128
+
+  full_refresh_every: 100
+  full_refresh_max_tokens: 2048
+  max_overhead_fraction: 0.01
+
+  update_backbone: false
+  update_lm_head: false
+  update_fast_state_injections: false
+  update_feedback_projection: false
+  update_updater: false
+
+checkpoint:
+  save_aux_every_grpo_iters: 100
+  save_aux_on_triggered_update: false
+  keep_last_aux_checkpoints: 3
+
 logging:
   append: false
   statistical_time: false
-

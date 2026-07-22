@@ -1,17 +1,2 @@
+# Backward-compatible alias. The canonical HRDCR config is already normalized.
 inherits: train_hrdcr.yaml
-
-method: flashgrpo_b200_hrdcr_normalized_llama31_8b
-run_name: llama31_8b_hrdcr_normalized
-
-reflex:
-  injection_gate_mode: normalized
-  feedback_objective: coverage
-  coverage_feedback_weight: 1.0
-  feedback_stride: 8
-  feedback_stride_min: 1
-  half_life_tokens: 24
-  eta: 0.75
-  relative_rms_delta_base: 0.02
-  warmup_effective_updates: 1.0
-  hint_cold_start: 0.5
-  candidate_probe_interval: 32

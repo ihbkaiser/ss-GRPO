@@ -43,16 +43,19 @@ def test_model_config_matrix_and_fair_ablation():
 
         assert main["reflex"]["enabled"] is True
         assert main["reflex"]["horizon_resolved"] is True
+        assert main["reflex"]["strict_horizon_pipeline"] is True
         assert normalized["reflex"]["injection_gate_mode"] == "normalized"
-        assert normalized["reflex"]["feedback_objective"] == "coverage"
+        assert normalized["reflex"]["feedback_objective"] == "distribution"
         assert normalized["reflex"]["feedback_stride_min"] == 1
-        assert normalized["reflex"]["half_life_tokens"] == 24
-        assert normalized["reflex"]["eta"] == 0.75
+        assert normalized["reflex"]["half_life_tokens"] == 32
         assert normalized["reflex"]["relative_rms_delta_base"] == 0.02
-        assert normalized["reflex"]["warmup_effective_updates"] == 1.0
-        assert normalized["reflex"]["hint_cold_start"] == 0.5
-        assert ablation["reflex"]["enabled"] is False
-        assert ablation["reflex"].get("injection_gate_mode", "legacy") == "legacy"
+        assert normalized["reflex"]["warmup_effective_updates"] == 0.0
+        assert ablation["reflex"]["enabled"] is True
+        assert ablation["reflex"]["feedback_enabled"] is True
+        assert ablation["reflex"]["proposal_injection_enabled"] is False
+        assert ablation["reflex"]["strict_horizon_pipeline"] is True
+        assert main["flashgrpo"]["medusa_update_mode"] == "sparse_online"
+        assert ablation["flashgrpo"]["medusa_update_mode"] == "sparse_online"
         assert main["aux_update"] == ablation["aux_update"]
         assert normalized["aux_update"] == main["aux_update"]
         for section, field in FAIR_FIELDS:

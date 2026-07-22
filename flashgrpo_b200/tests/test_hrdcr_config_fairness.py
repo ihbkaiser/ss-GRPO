@@ -4,8 +4,8 @@ from flashgrpo_b200.utils.config import load_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MAIN_CONFIG = ROOT / "flashgrpo_b200/configs/reflexgrpo_horizon_consensus_b200_qwen25_7b_gsm8k.yaml"
-ABLATION_CONFIG = ROOT / "flashgrpo_b200/configs/ablations/medusa_head_only_no_reflex_fair_qwen25_7b_gsm8k.yaml"
+MAIN_CONFIG = ROOT / "flashgrpo_b200/configs/qwen25_7b/train_hrdcr.yaml"
+ABLATION_CONFIG = ROOT / "flashgrpo_b200/configs/qwen25_7b/train_medusa_only.yaml"
 
 
 def _differences(left, right, prefix=""):
@@ -24,10 +24,6 @@ def test_head_only_ablation_changes_only_reflex_switches_and_identity():
     allowed = {
         "method",
         "run_name",
-        "reflex.adaptation_mode",
-        "reflex.enabled",
-        "reflex.feedback_enabled",
-        "reflex.horizon_resolved",
         "reflex.proposal_injection_enabled",
     }
     assert set(_differences(main, ablation)) == allowed

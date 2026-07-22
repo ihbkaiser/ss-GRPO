@@ -2831,7 +2831,7 @@ class ReflexBatchStats:
         self.tv_sum = [0.0 for _ in range(self.num_heads)]
         self.gated = [0 for _ in range(self.num_heads)]
         self.depth_buckets: list[dict[str, dict[str, float]]] = [dict() for _ in range(self.num_heads)]
-        self.feedback_rms: list[float] = []
+        self.feedback_rms: list[torch.Tensor] = []
         self.feature_agreements: list[float] = []
         self.feature_gates: list[float] = []
         self._coverage_mature: torch.Tensor | None = None
@@ -2841,6 +2841,11 @@ class ReflexBatchStats:
         self._candidate_probes: torch.Tensor | None = None
         self._reflex_wins: torch.Tensor | None = None
         self._reflex_losses: torch.Tensor | None = None
+        self._hrdcr_mature: torch.Tensor | None = None
+        self._hrdcr_hits: torch.Tensor | None = None
+        self._hrdcr_ce_sum: torch.Tensor | None = None
+        self._hrdcr_tv_sum: torch.Tensor | None = None
+        self._hrdcr_gated: torch.Tensor | None = None
 
     @staticmethod
     def _depth_bucket(depth: int) -> str:
@@ -2890,9 +2895,45 @@ class ReflexBatchStats:
             stats["tv_sum"] += cur_tv
 
     def add_feedback_rms(self, values: torch.Tensor, has_feedback: torch.Tensor) -> None:
-        if values.numel() == 0 or not bool(has_feedback.any().item()):
+        if values.numel() == 0:
             return
-        self.feedback_rms.extend(values[has_feedback].detach().float().cpu().tolist())
+        self.feedback_rms.append(values[has_feedback].detach().float())
+
+    def add_hrdcr_feedback(self, batch) -> None:
+        """Accumulate strict feedback without synchronizing GPU to CPU."""
+
+        if batch.record_head_indices.numel() == 0:
+            return
+        heads = batch.record_head_indices.detach().long()
+        valid = heads.ge(0) & heads.lt(self.num_heads)
+        heads = heads[valid]
+        if heads.numel() == 0:
+            return
+        if self._hrdcr_mature is None:
+            self._hrdcr_mature = torch.zeros(
+                (self.num_heads,), device=heads.device, dtype=torch.long
+            )
+            self._hrdcr_hits = torch.zeros_like(self._hrdcr_mature)
+            self._hrdcr_gated = torch.zeros_like(self._hrdcr_mature)
+            self._hrdcr_ce_sum = torch.zeros(
+                (self.num_heads,), device=heads.device, dtype=torch.float32
+            )
+            self._hrdcr_tv_sum = torch.zeros_like(self._hrdcr_ce_sum)
+        self._hrdcr_mature.add_(torch.bincount(heads, minlength=self.num_heads)[: self.num_heads])
+        hits = batch.record_candidate_hit.detach().bool()[valid]
+        self._hrdcr_hits.add_(
+            torch.bincount(heads[hits], minlength=self.num_heads)[: self.num_heads]
+        )
+        gated = batch.record_severity.detach().float()[valid].gt(0.0)
+        self._hrdcr_gated.add_(
+            torch.bincount(heads[gated], minlength=self.num_heads)[: self.num_heads]
+        )
+        self._hrdcr_ce_sum.index_add_(
+            0,
+            heads,
+            -torch.log(batch.record_true_probs.detach().float()[valid].clamp_min(1e-8)),
+        )
+        self._hrdcr_tv_sum.index_add_(0, heads, batch.record_tv.detach().float()[valid])
 
     def add_feature_alignment(self, agreement: torch.Tensor, gate: torch.Tensor) -> None:
         if agreement.numel() == 0 or gate.numel() == 0:
@@ -2943,14 +2984,25 @@ class ReflexBatchStats:
             coverage_mature = [int(value) for value in self._coverage_mature.cpu().tolist()]
             coverage_hits = [int(value) for value in self._coverage_hits.cpu().tolist()]
             coverage_misses = [int(value) for value in self._coverage_misses.cpu().tolist()]
+        hrdcr_mature = [0 for _ in range(self.num_heads)]
+        hrdcr_hits = [0 for _ in range(self.num_heads)]
+        hrdcr_gated = [0 for _ in range(self.num_heads)]
+        hrdcr_ce_sum = [0.0 for _ in range(self.num_heads)]
+        hrdcr_tv_sum = [0.0 for _ in range(self.num_heads)]
+        if self._hrdcr_mature is not None:
+            hrdcr_mature = [int(value) for value in self._hrdcr_mature.cpu().tolist()]
+            hrdcr_hits = [int(value) for value in self._hrdcr_hits.cpu().tolist()]
+            hrdcr_gated = [int(value) for value in self._hrdcr_gated.cpu().tolist()]
+            hrdcr_ce_sum = [float(value) for value in self._hrdcr_ce_sum.cpu().tolist()]
+            hrdcr_tv_sum = [float(value) for value in self._hrdcr_tv_sum.cpu().tolist()]
         per_head: dict[str, dict] = {}
         total_mature = 0
         total_gated = 0
         for head_idx in range(self.num_heads):
-            mature = self.mature[head_idx] + coverage_mature[head_idx]
-            accepted = self.accepted[head_idx] + coverage_hits[head_idx]
+            mature = self.mature[head_idx] + coverage_mature[head_idx] + hrdcr_mature[head_idx]
+            accepted = self.accepted[head_idx] + coverage_hits[head_idx] + hrdcr_hits[head_idx]
             total_mature += mature
-            gated_count = self.gated[head_idx] + coverage_misses[head_idx]
+            gated_count = self.gated[head_idx] + coverage_misses[head_idx] + hrdcr_gated[head_idx]
             total_gated += gated_count
             buckets = {}
             for name, raw in self.depth_buckets[head_idx].items():
@@ -2965,12 +3017,14 @@ class ReflexBatchStats:
                 "accepted": accepted,
                 "acceptance_rate": accepted / max(mature, 1),
                 "rejection_rate": 1.0 - accepted / max(mature, 1) if mature else 0.0,
-                "mature_ce": self.ce_sum[head_idx] / max(mature, 1),
-                "sparse_tv": self.tv_sum[head_idx] / max(mature, 1),
+                "mature_ce": (self.ce_sum[head_idx] + hrdcr_ce_sum[head_idx]) / max(mature, 1),
+                "sparse_tv": (self.tv_sum[head_idx] + hrdcr_tv_sum[head_idx]) / max(mature, 1),
                 "nonzero_gate_fraction": gated_count / max(mature, 1),
                 "depth_buckets": buckets,
             }
-        feedback = torch.tensor(self.feedback_rms, dtype=torch.float32) if self.feedback_rms else None
+        feedback = torch.cat(self.feedback_rms).float().cpu() if self.feedback_rms else None
+        if feedback is not None and feedback.numel() == 0:
+            feedback = None
         feature_agreement = (
             torch.tensor(self.feature_agreements, dtype=torch.float32)
             if self.feature_agreements

@@ -4,6 +4,9 @@
 > documented in [EXPERIMENTS.md](EXPERIMENTS.md). The historical commands below
 > are retained as method background and may refer to the 3090 package.
 
+The current strict per-head HRDCR feedback and sparse-online auxiliary pipeline
+is documented in [README_HRDCR_SPARSE.md](README_HRDCR_SPARSE.md).
+
 FlashGRPO is a GRPO training path that replaces the external FastGRPO draft
 model with MEDUSA-style heads attached to the policy model.
 

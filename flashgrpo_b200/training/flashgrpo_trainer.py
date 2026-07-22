@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from flashgrpo_b200.decoding.flash_medusa_decoder import FlashMedusaConfig, FlashMedusaDecoder
+from flashgrpo_b200.decoding.hrdcr import merge_auxiliary_records as merge_sparse_auxiliary_records
 from flashgrpo_b200.models.medusa_heads import MedusaHeads
 from flashgrpo_b200.models.qwen_flashgrpo_wrapper import autocast_dtype, unwrap_causal_lm
 from flashgrpo_b200.training.online_medusa_trainer import OnlineMedusaConfig, OnlineMedusaTrainer
@@ -527,6 +528,8 @@ def _merge_reflex_aux_records(rows: list[dict]) -> dict:
     rows = [row for row in rows if row and row.get("hidden") is not None and int(row["hidden"].shape[0]) > 0]
     if not rows:
         return {}
+    if "head_indices" in rows[0] and "support_ids" in rows[0]:
+        return merge_sparse_auxiliary_records(rows, 0)
     max_prev = max((int(row.get("prev_tokens", torch.empty(0, 0)).shape[1]) for row in rows), default=0)
     merged = {
         "hidden": torch.cat([row["hidden"] for row in rows], dim=0),
@@ -900,7 +903,14 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_feature_agreement_floor=float(reflex.get("feature_agreement_floor", 0.0)),
         reflex_coverage_feedback_weight=float(reflex.get("coverage_feedback_weight", 0.0)),
         reflex_feedback_objective=str(reflex.get("feedback_objective", "distribution")),
+        reflex_feedback_temperature=float(reflex.get("feedback_temperature", 1.0)),
+        reflex_distribution_weight=float(reflex.get("distribution_weight", 0.25)),
+        reflex_boundary_width=int(reflex.get("boundary_width", 2)),
+        reflex_severity_tv_weight=float(reflex.get("severity_tv_weight", 0.5)),
+        reflex_severity_out_weight=float(reflex.get("severity_out_weight", 0.5)),
+        reflex_severity_min=float(reflex.get("severity_min", 0.02)),
         reflex_horizon_resolved=bool(reflex.get("horizon_resolved", False)),
+        reflex_strict_horizon_pipeline=bool(reflex.get("strict_horizon_pipeline", False)),
         reflex_consensus_strength=float(reflex.get("consensus_strength", 0.25)),
         reflex_consensus_floor=float(reflex.get("consensus_floor", 0.0)),
         reflex_head_shrinkage_updates=float(reflex.get("head_shrinkage_updates", 8.0)),
@@ -909,6 +919,9 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_hint_quality_floor=float(reflex.get("hint_quality_floor", 0.0)),
         reflex_hint_quality_temperature=float(reflex.get("hint_quality_temperature", 0.10)),
         reflex_hint_cold_start=float(reflex.get("hint_cold_start", 0.25)),
+        reflex_trust_n0=float(reflex.get("trust_n0", 4.0)),
+        reflex_sketch_rank=int(reflex.get("sketch_rank", 24)),
+        reflex_sketch_seed=int(reflex.get("sketch_seed", 29)),
         reflex_context_rank=int(reflex.get("context_rank", 0)),
         reflex_context_mix=float(reflex.get("context_mix", 0.5)),
         reflex_context_min_mass=float(reflex.get("context_min_mass", 1e-3)),
@@ -921,6 +934,7 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_horizon_delta_rule=str(reflex.get("horizon_delta_rule", "inverse_sqrt")),
         reflex_warmup_effective_updates=float(reflex.get("warmup_effective_updates", 16.0)),
         reflex_magnitude_gate_floor=float(reflex.get("magnitude_gate_floor", 0.25)),
+        reflex_guard_enabled=bool(reflex.get("guard_enabled", True)),
         reflex_guard_calibration_rollouts=int(reflex.get("guard_calibration_rollouts", 20)),
         reflex_guard_aal_drop_fraction=float(reflex.get("guard_aal_drop_fraction", 0.05)),
         reflex_guard_patience=int(reflex.get("guard_patience", 2)),
@@ -993,6 +1007,19 @@ def _aux_refresh_allowed_for_generation_step(config: dict[str, Any], generation_
 
 def run_training(config: dict[str, Any]) -> None:
     seed_everything(int(config.get("seed", 42)))
+    strict_cfg = config.get("reflex", {})
+    if bool(strict_cfg.get("strict_horizon_pipeline", False)):
+        if str(strict_cfg.get("state_space", "hidden")) != "hidden":
+            raise ValueError("Strict HRDCR requires reflex.state_space=hidden")
+        if not bool(strict_cfg.get("horizon_resolved", False)):
+            raise ValueError("Strict HRDCR requires one fast state per MEDUSA horizon")
+        proposal_topk = int(strict_cfg.get("proposal_topk", 16))
+        target_topk = int(strict_cfg.get("target_topk", 16))
+        support_cap = int(strict_cfg.get("feedback_union_cap", 48))
+        if proposal_topk + target_topk + 1 > support_cap:
+            raise ValueError(
+                "reflex.feedback_union_cap must fit proposal_topk + target_topk + actual token"
+            )
     run_name = str(config.get("run_name", "flashgrpo_run"))
     raw_log_dir = str(config.get("logging", {}).get("log_dir", f"logs/flashgrpo/{run_name}"))
     log_dir = Path(raw_log_dir.format(run_name=run_name))
@@ -1164,6 +1191,13 @@ def run_training(config: dict[str, Any]) -> None:
                 )
             ),
             acceptance_rank_temperature=float(config.get("aux_update", {}).get("rank_temperature", 0.5)),
+            sparse_support_cap=int(config.get("aux_update", {}).get("sparse_support_cap", 48)),
+            sparse_kl_weight=float(config.get("aux_update", {}).get("kl_weight", 0.25)),
+            sparse_coverage_weight=float(config.get("aux_update", {}).get("coverage_weight", 1.0)),
+            sparse_proximal_weight=float(config.get("aux_update", {}).get("proximal_weight", 0.05)),
+            sparse_ranking_margin=float(config.get("aux_update", {}).get("ranking_margin", 0.5)),
+            sparse_min_expected_benefit=float(config.get("aux_update", {}).get("min_expected_benefit", 1e-3)),
+            sparse_relative_rms_delta=float(reflex_cfg.get("relative_rms_delta_base", 0.02)),
         ),
     )
     aux_cfg = config.get("aux_update", {})
@@ -1171,9 +1205,10 @@ def run_training(config: dict[str, Any]) -> None:
     medusa_update_mode = str(fg.get("medusa_update_mode", "reliability_triggered")).lower()
     if not online_medusa_enabled:
         medusa_update_mode = "none"
-    if medusa_update_mode not in {"none", "reliability_triggered", "rollout_ce"}:
+    if medusa_update_mode not in {"none", "reliability_triggered", "rollout_ce", "sparse_online"}:
         raise ValueError(
-            "flashgrpo.medusa_update_mode must be one of: none, reliability_triggered, rollout_ce"
+            "flashgrpo.medusa_update_mode must be one of: none, reliability_triggered, "
+            "rollout_ce, sparse_online"
         )
     configured_aux_mode = str(aux_cfg.get("mode", "")).lower()
     if medusa_update_mode == "rollout_ce" and configured_aux_mode not in {"", "none"}:
@@ -1181,10 +1216,15 @@ def run_training(config: dict[str, Any]) -> None:
             "flashgrpo.medusa_update_mode=rollout_ce bypasses auxiliary refresh; set aux_update.mode=none"
         )
     default_aux_mode = (
-        "reliability_triggered" if medusa_update_mode == "reliability_triggered" else "none"
+        medusa_update_mode
+        if medusa_update_mode in {"reliability_triggered", "sparse_online"}
+        else "none"
+    )
+    tracker_mode = "none" if medusa_update_mode == "sparse_online" else str(
+        aux_cfg.get("mode", default_aux_mode)
     )
     aux_tracker = ReliabilityTracker(
-        mode=str(aux_cfg.get("mode", default_aux_mode)),
+        mode=tracker_mode,
         calibration_iterations=int(aux_cfg.get("calibration_iterations", 20)),
         check_interval=int(aux_cfg.get("check_interval", aux_cfg.get("interval", 20))),
         min_records_per_head=int(aux_cfg.get("min_records_per_head", aux_cfg.get("min_mature_records", 1024))),
@@ -1348,6 +1388,7 @@ def run_training(config: dict[str, Any]) -> None:
         "aux_update_interval": int(aux_cfg.get("check_interval", aux_cfg.get("interval", 20))),
         "aux_update_steps": aux_refresher.config.steps,
         "aux_update_before_policy_step": medusa_update_mode == "reliability_triggered",
+        "aux_update_after_first_new_policy_rollout": medusa_update_mode == "sparse_online",
         "rollout_ce_before_reward": medusa_update_mode == "rollout_ce",
         "aux_update_defer_until_reflex_warmup_complete": bool(aux_cfg.get("defer_until_reflex_warmup_complete", False)),
         "medusa_lr": float(fg.get("medusa_lr", 5e-4)),
@@ -1369,6 +1410,10 @@ def run_training(config: dict[str, Any]) -> None:
     total_generate_time = 0.0
     total_train_time = 0.0
     total_head_update_time = 0.0
+    total_aux_optimizer_steps = 0
+    total_aux_records_used = 0
+    total_sparse_aux_updates = 0
+    max_aux_overhead_fraction = 0.0
     total_online_ce_updates = 0
     total_online_ce_tokens = 0
     total_rollout_tokens = 0
@@ -1380,6 +1425,16 @@ def run_training(config: dict[str, Any]) -> None:
     rollout_count = start_rollout_count
     required_used_items = max(1, batch_size * accumulation_steps)
     pending_aux_record_batches: list[dict] = []
+    sparse_policy_version = max(0, start_used_items // required_used_items)
+    sparse_pending_policy_version: int | None = None
+    sparse_last_updated_policy_version = -1
+    sparse_record_budget = max(1, int(aux_cfg.get("records_per_update", 512)))
+    sparse_min_records = max(1, int(aux_cfg.get("min_records_per_update", 64)))
+    sparse_head_budget = max(1, int(aux_cfg.get("max_heads_per_update", 2)))
+    sparse_policy_interval = 1
+    sparse_next_allowed_policy_version = sparse_policy_version + 1
+    sparse_rollout_time_ema = 0.0
+    sparse_aux_record_batches: list[dict] = []
     start_time = time.time()
 
     epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Epoch", dynamic_ncols=True)
@@ -1408,6 +1463,11 @@ def run_training(config: dict[str, Any]) -> None:
             online_aux_enabled = bool(
                 online_medusa_enabled and medusa_update_mode == "reliability_triggered"
             )
+            sparse_aux_enabled = bool(
+                online_medusa_enabled
+                and medusa_update_mode == "sparse_online"
+                and bool(aux_cfg.get("enabled", True))
+            )
             generation_step_for_batch = int(rollout_count)
             rollout_ce_interval = max(1, int(fg.get("medusa_train_every", 1)))
             rollout_ce_due = bool(
@@ -1420,10 +1480,18 @@ def run_training(config: dict[str, Any]) -> None:
             next_grpo_step = acc.used_items // required_used_items + 1
             aux_refresh_allowed, aux_refresh_skip_reason = _aux_refresh_allowed_for_generation_step(config, generation_step_for_batch)
             collect_reflex_aux_cache = bool(
-                online_aux_enabled
-                and aux_refresher.config.reflex_cache_enabled
-                and aux_refresh_allowed
-                and aux_tracker.should_evaluate(next_grpo_step)
+                (
+                    online_aux_enabled
+                    and aux_refresher.config.reflex_cache_enabled
+                    and aux_refresh_allowed
+                    and aux_tracker.should_evaluate(next_grpo_step)
+                )
+                or (
+                    sparse_aux_enabled
+                    and sparse_pending_policy_version is not None
+                    and sparse_pending_policy_version > sparse_last_updated_policy_version
+                    and sparse_pending_policy_version >= sparse_next_allowed_policy_version
+                )
             )
 
             target_model.eval()
@@ -1511,6 +1579,91 @@ def run_training(config: dict[str, Any]) -> None:
                 total_head_update_time += update_wall_time
                 del head_ids, head_mask, head_loss_mask, update_rows
                 maybe_empty_cuda_cache(config)
+            sparse_rollout_time_ema = (
+                float(outputs["total_time_cost"])
+                if sparse_rollout_time_ema <= 0.0
+                else 0.9 * sparse_rollout_time_ema + 0.1 * float(outputs["total_time_cost"])
+            )
+            if sparse_aux_enabled and collect_reflex_aux_cache:
+                sparse_records = outputs.get("reflex_aux_records", {})
+                if torch.is_tensor(sparse_records.get("hidden")):
+                    sparse_aux_record_batches.append(sparse_records)
+                full_every = max(0, int(aux_cfg.get("full_refresh_every", 100)))
+                slow_refresh_due = bool(
+                    full_every > 0
+                    and sparse_pending_policy_version is not None
+                    and sparse_pending_policy_version % full_every == 0
+                )
+                merge_limit = (
+                    max(sparse_record_budget, int(aux_cfg.get("full_refresh_max_tokens", 2048)))
+                    if slow_refresh_due
+                    else sparse_record_budget
+                )
+                merged_sparse_records = merge_sparse_auxiliary_records(
+                    sparse_aux_record_batches,
+                    merge_limit,
+                )
+                sparse_count = int(
+                    merged_sparse_records.get("hidden", torch.empty(0)).shape[0]
+                )
+                head_stats["aux_records_cached"] = sparse_count
+                if sparse_count >= sparse_min_records:
+                    slow_refresh = slow_refresh_due
+                    update_records = (
+                        max(sparse_record_budget, int(aux_cfg.get("full_refresh_max_tokens", 2048)))
+                        if slow_refresh
+                        else sparse_record_budget
+                    )
+                    sparse_stats = medusa_trainer.update_sparse_online(
+                        merged_sparse_records,
+                        records_per_update=update_records,
+                        max_heads_per_update=sparse_head_budget,
+                        optimizer_steps=max(1, int(aux_cfg.get("optimizer_steps", 1))),
+                        all_heads=slow_refresh,
+                    )
+                    head_stats.update(sparse_stats)
+                    update_time = float(sparse_stats.get("head_update_time", 0.0) or 0.0)
+                    overhead_fraction = update_time / max(sparse_rollout_time_ema, 1e-9)
+                    head_stats["aux_update_time"] = update_time
+                    head_stats["aux_overhead_fraction"] = overhead_fraction
+                    head_stats["aux_policy_version"] = sparse_pending_policy_version
+                    head_stats["aux_slow_full_refresh"] = slow_refresh
+                    head_stats["aux_update_performed"] = bool(
+                        int(sparse_stats.get("aux_optimizer_steps", 0) or 0) > 0
+                    )
+                    total_aux_optimizer_steps += int(
+                        sparse_stats.get("aux_optimizer_steps", 0) or 0
+                    )
+                    total_aux_records_used += int(sparse_stats.get("aux_records_used", 0) or 0)
+                    total_sparse_aux_updates += int(head_stats["aux_update_performed"])
+                    max_aux_overhead_fraction = max(
+                        max_aux_overhead_fraction,
+                        float(overhead_fraction),
+                    )
+                    total_head_update_time += update_time
+                    if head_stats["aux_update_performed"]:
+                        sparse_last_updated_policy_version = int(sparse_pending_policy_version)
+                        if inference_medusa_heads is not medusa_heads:
+                            _sync_medusa_inference_mirror(medusa_heads, inference_medusa_heads)
+                            head_stats["inference_mirror_synced"] = True
+                        decoder.reset_verification_utility_scheduler()
+                    max_overhead = max(0.0, float(aux_cfg.get("max_overhead_fraction", 0.01)))
+                    if max_overhead > 0.0 and overhead_fraction > max_overhead:
+                        sparse_record_budget = max(
+                            sparse_min_records,
+                            sparse_record_budget // 2,
+                        )
+                        sparse_head_budget = max(1, sparse_head_budget - 1)
+                        sparse_policy_interval = min(16, sparse_policy_interval * 2)
+                        head_stats["aux_budget_throttled"] = True
+                    else:
+                        head_stats["aux_budget_throttled"] = False
+                    sparse_next_allowed_policy_version = int(sparse_pending_policy_version) + sparse_policy_interval
+                    sparse_pending_policy_version = None
+                    sparse_aux_record_batches.clear()
+                    maybe_empty_cuda_cache(config)
+                else:
+                    head_stats["aux_update_reason"] = "insufficient_sparse_records"
             target_model.train()
             medusa_heads.train()
             total_generate_time += outputs["total_time_cost"]
@@ -1554,7 +1707,11 @@ def run_training(config: dict[str, Any]) -> None:
             if medusa_update_mode == "reliability_triggered":
                 aux_tracker.observe(aux_metrics)
             reflex_records = outputs.get("reflex_aux_records", {})
-            if collect_reflex_aux_cache and reflex_records.get("hidden") is not None:
+            if (
+                medusa_update_mode == "reliability_triggered"
+                and collect_reflex_aux_cache
+                and reflex_records.get("hidden") is not None
+            ):
                 pending_aux_record_batches.append(reflex_records)
             aux_decision = ReliabilityDecision(
                 evaluated=False,
@@ -1636,6 +1793,19 @@ def run_training(config: dict[str, Any]) -> None:
                 "head_update_tokens": head_stats.get("head_update_tokens", 0),
                 "head_update_tokens_per_sec": head_stats.get("head_update_tokens_per_sec", 0.0),
                 "head_update_time_ratio_vs_total": head_stats.get("head_update_time", 0.0) / max(outputs["total_time_cost"] + head_stats.get("head_update_time", 0.0), 1e-9),
+                "aux_update_time": head_stats.get("aux_update_time", 0.0),
+                "aux_optimizer_steps": head_stats.get("aux_optimizer_steps", 0),
+                "aux_records_used": head_stats.get("aux_records_used", 0),
+                "aux_records_cached": head_stats.get("aux_records_cached", 0),
+                "aux_parameter_delta_rms": head_stats.get("aux_parameter_delta_rms", 0.0),
+                "aux_overhead_fraction": head_stats.get("aux_overhead_fraction", 0.0),
+                "aux_selected_heads": head_stats.get("aux_selected_heads", []),
+                "aux_expected_benefit": head_stats.get("aux_expected_benefit", 0.0),
+                "aux_budget_throttled": head_stats.get("aux_budget_throttled", False),
+                "aux_record_budget": sparse_record_budget,
+                "aux_head_budget": sparse_head_budget,
+                "aux_policy_interval": sparse_policy_interval,
+                "aux_policy_version": head_stats.get("aux_policy_version", sparse_policy_version),
                 "medusa_update_mode": medusa_update_mode,
                 "online_ce_update_due": head_stats.get("online_ce_update_due", False),
                 "online_ce_update_performed": head_stats.get("online_ce_update_performed", False),
@@ -1860,6 +2030,11 @@ def run_training(config: dict[str, Any]) -> None:
                 logger.log(grpo_log)
                 grpo_bar.set_postfix(step=step, train=format_duration(train_elapsed), reward=f"{grpo_log['mean_reward']:.3f}", refresh=False)
 
+            if sparse_aux_enabled:
+                sparse_policy_version += max(1, grpo_iteration_num)
+                sparse_pending_policy_version = sparse_policy_version
+                sparse_aux_record_batches.clear()
+
             aux_periodic_path = aux_refresher.maybe_save_periodic(
                 grpo_step=step,
                 rollout_count=rollout_count,
@@ -1917,6 +2092,10 @@ def run_training(config: dict[str, Any]) -> None:
         "total_generate_time_s": total_generate_time,
         "total_train_time_s": total_train_time,
         "total_head_update_time_s": total_head_update_time,
+        "total_sparse_aux_updates": int(total_sparse_aux_updates),
+        "total_aux_optimizer_steps": int(total_aux_optimizer_steps),
+        "total_aux_records_used": int(total_aux_records_used),
+        "max_aux_overhead_fraction": float(max_aux_overhead_fraction),
         "medusa_update_mode": medusa_update_mode,
         "total_online_ce_updates": int(total_online_ce_updates),
         "total_online_ce_tokens": int(total_online_ce_tokens),

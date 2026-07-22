@@ -40,6 +40,13 @@ class OnlineMedusaConfig:
     acceptance_coverage_weight: float = 0.0
     acceptance_candidate_topk_by_head: tuple[int, ...] = (4, 3, 2)
     acceptance_rank_temperature: float = 0.5
+    sparse_support_cap: int = 48
+    sparse_kl_weight: float = 0.25
+    sparse_coverage_weight: float = 1.0
+    sparse_proximal_weight: float = 0.05
+    sparse_ranking_margin: float = 0.5
+    sparse_min_expected_benefit: float = 1e-3
+    sparse_relative_rms_delta: float = 0.02
 
 
 class OnlineMedusaTrainer:
@@ -363,6 +370,215 @@ class OnlineMedusaTrainer:
 
     def _chain_logits_from_state(self, state: torch.Tensor, lm_head) -> torch.Tensor:
         return self._lm_head_logits(state, lm_head)
+
+    def update_sparse_online(
+        self,
+        records: dict[str, torch.Tensor],
+        *,
+        records_per_update: int = 512,
+        max_heads_per_update: int = 2,
+        optimizer_steps: int = 1,
+        all_heads: bool = False,
+    ) -> dict:
+        """Update only MEDUSA heads from cached sparse verifier supports."""
+
+        hidden = records.get("hidden") if records else None
+        if hidden is None or int(hidden.shape[0]) == 0:
+            return {
+                "medusa_loss": 0.0,
+                "head_update_time": 0.0,
+                "head_update_steps": 0,
+                "aux_records_used": 0,
+                "aux_selected_heads": [],
+                "aux_expected_benefit": 0.0,
+            }
+        start_time = time.time()
+        device = next(self.medusa_heads.parameters()).device
+        head_indices = records["head_indices"].to(device=device, dtype=torch.long)
+        candidate_mass = records["candidate_mass"].to(device=device, dtype=torch.float32)
+        available: list[tuple[float, int]] = []
+        for head_idx in range(len(self.medusa_heads.heads)):
+            mask = head_indices.eq(head_idx)
+            if bool(mask.any().item()):
+                benefit = float((1.0 - candidate_mass[mask].mean()).detach().cpu())
+                available.append((benefit, head_idx))
+        available.sort(reverse=True)
+        if all_heads:
+            selected_heads = [head for _, head in available]
+        else:
+            selected_heads = [
+                head
+                for benefit, head in available
+                if benefit > float(self.config.sparse_min_expected_benefit)
+            ][: max(1, int(max_heads_per_update))]
+        expected_benefit = max((benefit for benefit, head in available if head in selected_heads), default=0.0)
+        if not selected_heads:
+            return {
+                "medusa_loss": 0.0,
+                "head_update_time": time.time() - start_time,
+                "head_update_steps": 0,
+                "aux_records_used": 0,
+                "aux_selected_heads": [],
+                "aux_expected_benefit": float(expected_benefit),
+                "aux_update_reason": "zero_expected_benefit",
+            }
+
+        selected_mask = torch.zeros_like(head_indices, dtype=torch.bool)
+        for head_idx in selected_heads:
+            selected_mask |= head_indices.eq(head_idx)
+        selected_rows = selected_mask.nonzero(as_tuple=False).flatten()
+        limit = max(1, int(records_per_update))
+        if int(selected_rows.numel()) > limit:
+            # Favor records with the largest missing target mass.
+            priority = 1.0 - candidate_mass.index_select(0, selected_rows)
+            selected_rows = selected_rows.index_select(
+                0, torch.topk(priority, k=limit, sorted=False).indices
+            )
+        selected_rows = selected_rows.sort().values
+        selected = {
+            key: value.index_select(0, selected_rows.to(device=value.device))
+            for key, value in records.items()
+        }
+        total_records = int(selected_rows.numel())
+        if total_records == 0:
+            return {
+                "medusa_loss": 0.0,
+                "head_update_time": time.time() - start_time,
+                "head_update_steps": 0,
+                "aux_records_used": 0,
+                "aux_selected_heads": selected_heads,
+                "aux_expected_benefit": float(expected_benefit),
+            }
+
+        base = unwrap_causal_lm(self.target_model)
+        lm_weight = base.lm_head.weight.detach()
+        trainable: list[torch.nn.Parameter] = []
+        for head_idx in selected_heads:
+            trainable.extend(
+                parameter
+                for parameter in self.medusa_heads.heads[head_idx].parameters()
+                if parameter.requires_grad
+            )
+        before = [(parameter, parameter.detach().clone()) for parameter in trainable]
+        self.medusa_heads.train()
+        total_loss = 0.0
+        total_microbatches = 0
+        performed_steps = 0
+        micro = max(1, int(self.config.reflex_record_microbatch_size))
+
+        for _ in range(max(1, int(optimizer_steps))):
+            self.optimizer.zero_grad(set_to_none=True)
+            step_microbatches = 0
+            for head_idx in selected_heads:
+                rows = selected["head_indices"].to(device=device, dtype=torch.long).eq(head_idx).nonzero(
+                    as_tuple=False
+                ).flatten()
+                for offset in range(0, int(rows.numel()), micro):
+                    index = rows[offset : offset + micro]
+                    if index.numel() == 0:
+                        continue
+                    anchor = selected["hidden"].index_select(
+                        0, index.to(device=selected["hidden"].device)
+                    ).to(device=device, dtype=next(self.medusa_heads.parameters()).dtype)
+                    projected = self.medusa_heads.heads[head_idx].project_hidden(anchor)
+                    fast = selected["fast_state"].index_select(
+                        0, index.to(device=selected["fast_state"].device)
+                    ).to(device=device, dtype=torch.float32)
+                    trust = selected["trust"].index_select(
+                        0, index.to(device=selected["trust"].device)
+                    ).to(device=device, dtype=torch.float32)
+                    base_rms = projected.float().square().mean(dim=-1, keepdim=True).sqrt()
+                    correction = (
+                        float(self.config.sparse_relative_rms_delta)
+                        * trust.unsqueeze(-1)
+                        * base_rms
+                        * fast
+                    )
+                    corrected = projected + correction.to(dtype=projected.dtype)
+
+                    support_ids = selected["support_ids"].index_select(
+                        0, index.to(device=selected["support_ids"].device)
+                    ).to(device=device, dtype=torch.long)
+                    support_valid = selected["support_valid"].index_select(
+                        0, index.to(device=selected["support_valid"].device)
+                    ).to(device=device, dtype=torch.bool)
+                    support_weight = lm_weight.index_select(0, support_ids.clamp_min(0).reshape(-1)).view(
+                        int(index.numel()), int(support_ids.shape[1]), int(lm_weight.shape[1])
+                    )
+                    logits = torch.einsum("rsh,rh->rs", support_weight, corrected.to(lm_weight.dtype)).float()
+                    target_logits = selected["target_logits"].index_select(
+                        0, index.to(device=selected["target_logits"].device)
+                    ).to(device=device, dtype=torch.float32)
+                    masked_target = target_logits.masked_fill(~support_valid, -torch.inf)
+                    masked_logits = logits.masked_fill(~support_valid, -torch.inf)
+                    p = torch.softmax(masked_target, dim=-1).masked_fill(~support_valid, 0.0)
+                    log_p = torch.log_softmax(masked_target, dim=-1).masked_fill(~support_valid, 0.0)
+                    log_q = torch.log_softmax(masked_logits, dim=-1).masked_fill(~support_valid, 0.0)
+                    kl = (p * (log_p - log_q)).sum(dim=-1)
+
+                    candidate_ids = selected["candidate_ids"].index_select(
+                        0, index.to(device=selected["candidate_ids"].device)
+                    ).to(device=device, dtype=torch.long)
+                    candidate_valid = selected["candidate_valid"].index_select(
+                        0, index.to(device=selected["candidate_valid"].device)
+                    ).to(device=device, dtype=torch.bool)
+                    in_candidate = (
+                        support_ids.unsqueeze(-1).eq(candidate_ids.unsqueeze(1))
+                        & support_valid.unsqueeze(-1)
+                        & candidate_valid.unsqueeze(1)
+                    ).any(dim=-1)
+                    candidate_weight = lm_weight.index_select(
+                        0, candidate_ids.clamp_min(0).reshape(-1)
+                    ).view(int(index.numel()), int(candidate_ids.shape[1]), int(lm_weight.shape[1]))
+                    candidate_logits = torch.einsum(
+                        "rkh,rh->rk", candidate_weight, corrected.to(lm_weight.dtype)
+                    ).float().masked_fill(~candidate_valid, -torch.inf)
+                    boundary = candidate_logits.masked_fill(~candidate_valid, torch.inf).min(dim=-1).values
+                    ranking = p * (~in_candidate) * F.softplus(
+                        float(self.config.sparse_ranking_margin) + boundary.unsqueeze(-1) - logits
+                    )
+                    coverage = ranking.masked_fill(~support_valid, 0.0).sum(dim=-1)
+                    loss = (
+                        float(self.config.sparse_kl_weight) * kl.mean()
+                        + float(self.config.sparse_coverage_weight) * coverage.mean()
+                    )
+                    if not torch.isfinite(loss) or not loss.requires_grad:
+                        continue
+                    (loss / max(1, len(selected_heads))).backward()
+                    total_loss += float(loss.detach().cpu())
+                    total_microbatches += 1
+                    step_microbatches += 1
+            if step_microbatches:
+                torch.nn.utils.clip_grad_norm_(trainable, self.config.grad_clip_norm)
+                self.optimizer.step()
+                performed_steps += 1
+
+        # One-step updates have zero gradient from an anchor penalty at phi_before.
+        # A proximal post-step projection implements the intended trust region.
+        proximal = max(0.0, float(self.config.sparse_proximal_weight))
+        shrink = 1.0 / (1.0 + proximal)
+        delta_ms = 0.0
+        delta_count = 0
+        with torch.no_grad():
+            for parameter, old in before:
+                delta = parameter - old
+                parameter.copy_(old + shrink * delta)
+                delta_ms += float((parameter - old).float().square().sum().detach().cpu())
+                delta_count += parameter.numel()
+        self.optimizer.zero_grad(set_to_none=True)
+        elapsed = time.time() - start_time
+        return {
+            "medusa_loss": total_loss / max(total_microbatches, 1),
+            "head_update_time": elapsed,
+            "head_update_steps": int(performed_steps),
+            "aux_optimizer_steps": int(performed_steps),
+            "aux_records_used": int(total_records),
+            "aux_selected_heads": [int(head + 1) for head in selected_heads],
+            "aux_expected_benefit": float(expected_benefit),
+            "aux_parameter_delta_rms": (delta_ms / max(delta_count, 1)) ** 0.5,
+            "refresh_committed": bool(performed_steps > 0),
+            "aux_update_reason": "sparse_online" if performed_steps else "no_finite_sparse_loss",
+        }
 
     def update_reflex_records(
         self,

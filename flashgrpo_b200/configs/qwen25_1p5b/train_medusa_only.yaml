@@ -1,20 +1,14 @@
 inherits: train_hrdcr.yaml
 
-method: flashgrpo_b200_medusa_only_qwen25_1p5b
+method: medusa_only
 run_name: qwen25_1p5b_medusa_only
 
-# Fair proposal ablation: exact verification, tree scheduling, pretrained heads
-# and reliability-triggered auxiliary refresh remain identical. Only m_t is off.
+# Fair proposal ablation: feedback, m_t, trust and sparse head updates remain on.
+# Only the proposal-hidden injection is disabled.
 reflex:
-  enabled: false
-  adaptation_mode: disabled
-  feedback_enabled: false
+  enabled: true
+  feedback_enabled: true
   proposal_injection_enabled: false
-  horizon_resolved: false
-  anchor_conditioning_enabled: false
-  utility_scheduler_enabled: false
-  motivation_trace_enabled: false
 
-persistent_memory:
-  enabled: false
-
+aux_update:
+  enabled: true
