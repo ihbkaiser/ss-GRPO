@@ -172,6 +172,9 @@ def test_candidate_regret_uses_same_k_and_counterfactual_probe_matures():
     assert bool(result.probe_changed[0])
     assert bool(result.probe_losses[0])
     assert "candidate_regret" in result.auxiliary_records
+    stored_support = result.auxiliary_records["support_ids"]
+    stored_valid = result.auxiliary_records["support_valid"]
+    assert bool(stored_support.masked_select(~stored_valid).eq(-1).all())
 
 
 def test_reflex_trust_region_is_zero_when_inactive_and_exact_when_active():
@@ -222,14 +225,18 @@ def test_balanced_auxiliary_sampler_does_not_starve_head3():
         torch.optim.AdamW(heads.parameters(), lr=1e-3),
         OnlineMedusaConfig(reflex_record_microbatch_size=4),
     )
-    support = torch.tensor([[0, 1, 2, 3]]).repeat(count, 1)
+    support = torch.tensor([[0, 1, 2, 3, vocab]]).repeat(count, 1)
+    support_valid = torch.ones_like(support, dtype=torch.bool)
+    support_valid[:, -1] = False
     records = {
         "hidden": torch.randn(count, hidden),
         "head_indices": torch.arange(3).repeat_interleave(per_head),
         "support_ids": support.to(torch.int32),
-        "support_valid": torch.ones_like(support, dtype=torch.bool),
-        "target_logits": torch.tensor([[0.0, 0.0, 5.0, 4.0]]).repeat(count, 1).half(),
-        "proposal_logits": torch.zeros(count, 4).half(),
+        "support_valid": support_valid,
+        "target_logits": torch.tensor([[0.0, 0.0, 5.0, 4.0, 0.0]])
+        .repeat(count, 1)
+        .half(),
+        "proposal_logits": torch.zeros(count, 5).half(),
         "candidate_ids": torch.tensor([[0, 1]]).repeat(count, 1).to(torch.int32),
         "candidate_valid": torch.ones(count, 2, dtype=torch.bool),
         "candidate_mass": torch.full((count,), 0.2),
@@ -256,12 +263,16 @@ def test_balanced_auxiliary_sampler_does_not_starve_head3():
 def test_merge_auxiliary_records_pads_variable_sparse_widths():
     def records(count: int, support_width: int, candidate_width: int, head_idx: int):
         support_ids = torch.arange(support_width).repeat(count, 1).to(torch.int32)
+        support_valid = torch.ones_like(support_ids, dtype=torch.bool)
+        if head_idx == 1:
+            support_ids[:, -1] = 1000
+            support_valid[:, -1] = False
         candidate_ids = torch.arange(candidate_width).repeat(count, 1).to(torch.int32)
         return {
             "hidden": torch.randn(count, 8),
             "head_indices": torch.full((count,), head_idx, dtype=torch.long),
             "support_ids": support_ids,
-            "support_valid": torch.ones_like(support_ids, dtype=torch.bool),
+            "support_valid": support_valid,
             "target_logits": torch.randn(count, support_width, dtype=torch.float16),
             "proposal_logits": torch.randn(count, support_width, dtype=torch.float16),
             "candidate_ids": candidate_ids,

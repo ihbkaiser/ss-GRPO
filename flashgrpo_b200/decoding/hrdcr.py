@@ -631,7 +631,9 @@ class HRDCRFeedback:
             auxiliary = {
                 "hidden": records.anchor_hidden.detach(),
                 "head_indices": heads.detach(),
-                "support_ids": support_ids.to(dtype=torch.int32).detach(),
+                "support_ids": support_ids.masked_fill(~support_valid, -1)
+                .to(dtype=torch.int32)
+                .detach(),
                 "support_valid": support_valid.detach(),
                 "target_logits": target_support_logits.to(dtype=torch.float16).detach(),
                 "proposal_logits": proposal_logits.to(dtype=torch.float16).detach(),
@@ -995,6 +997,7 @@ def merge_auxiliary_records(
         row["candidate_valid"] = pad_width(row["candidate_valid"], candidate_width, False)
         row["support_ids"] = pad_width(row["support_ids"], support_width, -1)
         row["support_valid"] = pad_width(row["support_valid"], support_width, False)
+        row["support_ids"] = row["support_ids"].masked_fill(~row["support_valid"], -1)
         row["target_logits"] = pad_width(row["target_logits"], support_width, 0.0)
         row["proposal_logits"] = pad_width(row["proposal_logits"], support_width, 0.0)
         normalized.append(row)

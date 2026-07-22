@@ -575,7 +575,13 @@ class OnlineMedusaTrainer:
                     support_valid = selected["support_valid"].index_select(
                         0, index.to(device=selected["support_valid"].device)
                     ).to(device=device, dtype=torch.bool)
-                    support_weight = lm_weight.index_select(0, support_ids.clamp_min(0).reshape(-1)).view(
+                    support_valid = (
+                        support_valid
+                        & support_ids.ge(0)
+                        & support_ids.lt(int(lm_weight.shape[0]))
+                    )
+                    safe_support_ids = support_ids.masked_fill(~support_valid, 0)
+                    support_weight = lm_weight.index_select(0, safe_support_ids.reshape(-1)).view(
                         int(index.numel()), int(support_ids.shape[1]), int(lm_weight.shape[1])
                     )
                     logits = torch.einsum("rsh,rh->rs", support_weight, corrected.to(lm_weight.dtype)).float()
@@ -595,13 +601,19 @@ class OnlineMedusaTrainer:
                     candidate_valid = selected["candidate_valid"].index_select(
                         0, index.to(device=selected["candidate_valid"].device)
                     ).to(device=device, dtype=torch.bool)
+                    candidate_valid = (
+                        candidate_valid
+                        & candidate_ids.ge(0)
+                        & candidate_ids.lt(int(lm_weight.shape[0]))
+                    )
+                    safe_candidate_ids = candidate_ids.masked_fill(~candidate_valid, 0)
                     in_candidate = (
                         support_ids.unsqueeze(-1).eq(candidate_ids.unsqueeze(1))
                         & support_valid.unsqueeze(-1)
                         & candidate_valid.unsqueeze(1)
                     ).any(dim=-1)
                     candidate_weight = lm_weight.index_select(
-                        0, candidate_ids.clamp_min(0).reshape(-1)
+                        0, safe_candidate_ids.reshape(-1)
                     ).view(int(index.numel()), int(candidate_ids.shape[1]), int(lm_weight.shape[1]))
                     candidate_logits = torch.einsum(
                         "rkh,rh->rk", candidate_weight, corrected.to(lm_weight.dtype)
