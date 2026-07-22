@@ -971,26 +971,32 @@ def merge_auxiliary_records(
     batches = [batch for batch in batches if batch and batch.get("hidden") is not None]
     if not batches:
         return {}
+
+    def pad_width(value: torch.Tensor, width: int, fill_value: int | float | bool) -> torch.Tensor:
+        current = int(value.shape[1])
+        if current == width:
+            return value
+        if current > width:
+            return value[:, :width]
+        padding = torch.full(
+            (int(value.shape[0]), width - current),
+            fill_value,
+            device=value.device,
+            dtype=value.dtype,
+        )
+        return torch.cat((value, padding), dim=1)
+
     candidate_width = max(int(batch["candidate_ids"].shape[1]) for batch in batches)
+    support_width = max(int(batch["support_ids"].shape[1]) for batch in batches)
     normalized: list[dict[str, torch.Tensor]] = []
     for batch in batches:
         row = dict(batch)
-        width = int(row["candidate_ids"].shape[1])
-        if width < candidate_width:
-            count = int(row["candidate_ids"].shape[0])
-            id_pad = torch.full(
-                (count, candidate_width - width),
-                -1,
-                device=row["candidate_ids"].device,
-                dtype=row["candidate_ids"].dtype,
-            )
-            valid_pad = torch.zeros(
-                (count, candidate_width - width),
-                device=row["candidate_valid"].device,
-                dtype=torch.bool,
-            )
-            row["candidate_ids"] = torch.cat((row["candidate_ids"], id_pad), dim=1)
-            row["candidate_valid"] = torch.cat((row["candidate_valid"], valid_pad), dim=1)
+        row["candidate_ids"] = pad_width(row["candidate_ids"], candidate_width, -1)
+        row["candidate_valid"] = pad_width(row["candidate_valid"], candidate_width, False)
+        row["support_ids"] = pad_width(row["support_ids"], support_width, -1)
+        row["support_valid"] = pad_width(row["support_valid"], support_width, False)
+        row["target_logits"] = pad_width(row["target_logits"], support_width, 0.0)
+        row["proposal_logits"] = pad_width(row["proposal_logits"], support_width, 0.0)
         normalized.append(row)
     merged = {
         key: torch.cat([batch[key] for batch in normalized], dim=0)

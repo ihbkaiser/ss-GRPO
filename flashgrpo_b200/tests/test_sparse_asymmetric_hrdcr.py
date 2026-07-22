@@ -1,7 +1,12 @@
 import torch
 
 from flashgrpo_b200.decoding.flash_medusa_decoder import FlashMedusaConfig, FlashMedusaDecoder
-from flashgrpo_b200.decoding.hrdcr import HRDCRFeedback, HRDCRPredictionBuffer, HRDCRStateManager
+from flashgrpo_b200.decoding.hrdcr import (
+    HRDCRFeedback,
+    HRDCRPredictionBuffer,
+    HRDCRStateManager,
+    merge_auxiliary_records,
+)
 from flashgrpo_b200.decoding.medusa_tree import (
     Head3QualityCalibrator,
     build_batch_trees,
@@ -246,3 +251,44 @@ def test_balanced_auxiliary_sampler_does_not_starve_head3():
     assert 3 in stats["aux_selected_heads"]
     assert stats["head3_aux_records_used"] >= per_head
     assert stats["head3_aux_optimizer_steps"] == 1
+
+
+def test_merge_auxiliary_records_pads_variable_sparse_widths():
+    def records(count: int, support_width: int, candidate_width: int, head_idx: int):
+        support_ids = torch.arange(support_width).repeat(count, 1).to(torch.int32)
+        candidate_ids = torch.arange(candidate_width).repeat(count, 1).to(torch.int32)
+        return {
+            "hidden": torch.randn(count, 8),
+            "head_indices": torch.full((count,), head_idx, dtype=torch.long),
+            "support_ids": support_ids,
+            "support_valid": torch.ones_like(support_ids, dtype=torch.bool),
+            "target_logits": torch.randn(count, support_width, dtype=torch.float16),
+            "proposal_logits": torch.randn(count, support_width, dtype=torch.float16),
+            "candidate_ids": candidate_ids,
+            "candidate_valid": torch.ones_like(candidate_ids, dtype=torch.bool),
+            "candidate_mass": torch.rand(count),
+            "candidate_regret": torch.rand(count),
+            "restricted_kl": torch.rand(count),
+            "candidate_hit": torch.zeros(count, dtype=torch.bool),
+            "actual_tokens": torch.zeros(count, dtype=torch.long),
+            "fast_state": torch.randn(count, 8),
+            "trust": torch.rand(count),
+            "quality": torch.rand(count),
+        }
+
+    merged = merge_auxiliary_records(
+        [records(2, 37, 4, 0), records(3, 36, 2, 1)],
+        max_records=0,
+    )
+
+    assert merged["hidden"].shape[0] == 5
+    assert merged["support_ids"].shape == (5, 37)
+    assert merged["target_logits"].shape == (5, 37)
+    assert merged["proposal_logits"].shape == (5, 37)
+    assert merged["candidate_ids"].shape == (5, 4)
+    assert bool(merged["support_ids"][2:, -1].eq(-1).all())
+    assert not bool(merged["support_valid"][2:, -1].any())
+    assert bool(merged["target_logits"][2:, -1].eq(0).all())
+    assert bool(merged["proposal_logits"][2:, -1].eq(0).all())
+    assert bool(merged["candidate_ids"][2:, 2:].eq(-1).all())
+    assert not bool(merged["candidate_valid"][2:, 2:].any())
