@@ -13,12 +13,11 @@ configs/
 
 Each model directory contains:
 
-- `train_hrdcr.yaml`: full HRDCR (`m_t`) plus reliability-triggered auxiliary refresh.
+- `train_hrdcr.yaml`: full HRDCR (`m_t`) plus sparse post-rollout auxiliary refresh.
 - `train_medusa_only.yaml`: fair no-Reflex ablation; exact verification, tree scheduling,
-  pretrained heads and auxiliary refresh are unchanged.
+  pretrained heads, sparse tree and auxiliary refresh are unchanged.
 - `pretrain.yaml`: standard parallel MEDUSA-head pretraining. HRDCR's hidden-space
   fast state is created online and does not require a separately pretrained module.
 
 Files outside these directories are retained for compatibility with previous runs.
 New experiments should use the per-model shell launchers at the package root.
-

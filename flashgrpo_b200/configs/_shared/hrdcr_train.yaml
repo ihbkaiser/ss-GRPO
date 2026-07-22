@@ -50,7 +50,7 @@ flashgrpo:
   chain_loss_max_depth: 0
   acceptance: exact_target
   tree_mode: concurrency_aware
-  tree_layout: dense
+  tree_layout: sparse_asymmetric
   adaptive_tree_enabled: false
   online_medusa: true
   medusa_update_mode: sparse_online
@@ -70,6 +70,27 @@ flashgrpo:
   empty_cache_threshold_mb: 140000
   empty_cache_reserved_ratio: 1.6
   gpu_poll_interval_s: 20.0
+
+tree:
+  mode: sparse_asymmetric
+  max_nodes_per_seq: 10
+  nodes_by_head: [4, 3, 2]
+  min_head3_nodes: 1
+  head3_min_budget: 8
+  head3_exploration_fraction: 0.10
+  head3_min_calibration_records: 1024
+  branch_score_temperature: 1.0
+  diversity_penalty: 0.05
+  head3_quality_bins: 10
+  head3_node_cost: 0.35
+  head3_quality_ema_beta: 0.95
+  head3_quality_weights:
+    top1: 0.30
+    margin: 0.20
+    entropy: 0.15
+    path: 0.10
+    acceptance: 0.20
+    regret: 0.15
 
 reflex:
   enabled: true
@@ -100,6 +121,19 @@ reflex:
   # Relative-RMS proposal trust region. No state renormalization or magnitude gate.
   injection_gate_mode: normalized
   relative_rms_delta_base: 0.02
+  correction_ratio_min: 0.005
+  correction_ratio_max: 0.020
+  min_effective_updates: 4
+  min_alignment_count: 4
+  min_state_rms: 0.005
+  state_reference_rms: 0.03
+  alignment_floor: 0.0
+  alignment_full: 0.10
+  alignment_lcb_z: 1.0
+  safety_min_probe_count: 128
+  safety_bad_probe_patience: 3
+  safety_ratio_decay: 0.5
+  safety_reenable_probe_interval: 256
   horizon_delta_rule: constant
   warmup_effective_updates: 0.0
   magnitude_gate_floor: 0.0
@@ -132,8 +166,10 @@ aux_update:
   mode: sparse_online
   records_per_update: 512
   min_records_per_update: 64
+  min_records_per_selected_head: 64
+  head_sampling_weights: [1.0, 1.0, 1.25]
   optimizer_steps: 1
-  max_heads_per_update: 2
+  max_heads_per_update: 3
   max_cached_records: 2048
   reflex_cache_enabled: true
   cache_stride: 1
@@ -166,3 +202,8 @@ checkpoint:
 logging:
   append: false
   statistical_time: false
+
+metrics:
+  counterfactual_probe_interval: 64
+  counterfactual_max_sequences: 8
+  timing_sample_interval: 32

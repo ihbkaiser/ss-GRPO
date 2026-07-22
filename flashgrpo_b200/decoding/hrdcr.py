@@ -29,6 +29,11 @@ class HRDCRPredictionBatch:
     anchor_hidden: torch.Tensor
     fast_state: torch.Tensor
     trust: torch.Tensor
+    quality: torch.Tensor
+    probe_mask: torch.Tensor
+    raw_proposal_hidden: torch.Tensor
+    raw_candidate_ids: torch.Tensor
+    raw_candidate_valid: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -43,6 +48,11 @@ class HRDCRMatureRecords:
     anchor_hidden: torch.Tensor
     fast_state: torch.Tensor
     trust: torch.Tensor
+    quality: torch.Tensor
+    probe_mask: torch.Tensor
+    raw_proposal_hidden: torch.Tensor
+    raw_candidate_ids: torch.Tensor
+    raw_candidate_valid: torch.Tensor
 
     @property
     def count(self) -> int:
@@ -62,6 +72,18 @@ class HRDCRFeedbackBatch:
     record_severity: torch.Tensor
     record_candidate_mass: torch.Tensor
     record_candidate_hit: torch.Tensor
+    record_candidate_regret: torch.Tensor
+    record_restricted_kl: torch.Tensor
+    record_quality: torch.Tensor
+    probe_head_indices: torch.Tensor
+    probe_quality: torch.Tensor
+    probe_changed: torch.Tensor
+    probe_raw_mass: torch.Tensor
+    probe_effective_mass: torch.Tensor
+    probe_raw_kl: torch.Tensor
+    probe_effective_kl: torch.Tensor
+    probe_wins: torch.Tensor
+    probe_losses: torch.Tensor
     auxiliary_records: dict[str, torch.Tensor]
 
 
@@ -87,6 +109,13 @@ class HRDCRPredictionBuffer:
         fast_states: torch.Tensor,
         trust: torch.Tensor,
         state_sketch: torch.Tensor,
+        candidate_ids_by_horizon: list[torch.Tensor] | None = None,
+        candidate_valid_by_horizon: list[torch.Tensor] | None = None,
+        quality_by_horizon: list[torch.Tensor] | None = None,
+        probe_rows: torch.Tensor | None = None,
+        raw_proposal_hidden_by_horizon: list[torch.Tensor] | None = None,
+        raw_candidate_ids_by_horizon: list[torch.Tensor] | None = None,
+        raw_candidate_valid_by_horizon: list[torch.Tensor] | None = None,
     ) -> None:
         if not sequence_ids or not logits_by_horizon:
             return
@@ -108,9 +137,52 @@ class HRDCRPredictionBuffer:
             top_l = min(self.proposal_topk, int(logits.shape[-1]))
             top_ids = torch.topk(logits, k=top_l, dim=-1).indices
             candidate_k = min(max(1, int(candidate_topk_by_horizon[head_idx])), top_l)
-            candidates = top_ids[:, :candidate_k].contiguous()
-            self._batches.append(
-                HRDCRPredictionBatch(
+            if candidate_ids_by_horizon is not None and head_idx < len(candidate_ids_by_horizon):
+                candidates = candidate_ids_by_horizon[head_idx].detach().to(
+                    device=device, dtype=torch.long
+                )
+                candidate_valid = (
+                    candidate_valid_by_horizon[head_idx].detach().to(device=device, dtype=torch.bool)
+                    if candidate_valid_by_horizon is not None
+                    and head_idx < len(candidate_valid_by_horizon)
+                    else candidates.ge(0)
+                )
+            else:
+                candidates = top_ids[:, :candidate_k].contiguous()
+                candidate_valid = torch.ones_like(candidates, dtype=torch.bool)
+            quality = (
+                quality_by_horizon[head_idx].detach().to(device=device, dtype=torch.float32)
+                if quality_by_horizon is not None and head_idx < len(quality_by_horizon)
+                else torch.zeros(batch_size, device=device, dtype=torch.float32)
+            )
+            row_probe = torch.zeros(batch_size, device=device, dtype=torch.bool)
+            raw_hidden = proposal_hidden_by_horizon[head_idx].detach().clone()
+            raw_candidates = candidates.clone()
+            raw_valid = candidate_valid.clone()
+            if probe_rows is not None and probe_rows.numel() > 0:
+                probe = probe_rows.to(device=device, dtype=torch.long)
+                row_probe.index_fill_(0, probe, True)
+                if raw_proposal_hidden_by_horizon is not None and head_idx < len(raw_proposal_hidden_by_horizon):
+                    raw_hidden.index_copy_(
+                        0,
+                        probe,
+                        raw_proposal_hidden_by_horizon[head_idx].detach().to(
+                            device=device, dtype=raw_hidden.dtype
+                        ),
+                    )
+                if raw_candidate_ids_by_horizon is not None and head_idx < len(raw_candidate_ids_by_horizon):
+                    raw_ids = raw_candidate_ids_by_horizon[head_idx].detach().to(device=device, dtype=torch.long)
+                    raw_ids = self._pad(raw_ids, int(candidates.shape[-1]), -1)
+                    raw_candidates.index_copy_(0, probe, raw_ids)
+                    if raw_candidate_valid_by_horizon is not None and head_idx < len(raw_candidate_valid_by_horizon):
+                        raw_mask = raw_candidate_valid_by_horizon[head_idx].detach().to(
+                            device=device, dtype=torch.bool
+                        )
+                        raw_mask = self._pad(raw_mask, int(candidates.shape[-1]), False)
+                    else:
+                        raw_mask = raw_ids.ge(0)
+                    raw_valid.index_copy_(0, probe, raw_mask)
+            item = HRDCRPredictionBatch(
                     sequence_ids=sequence.clone(),
                     target_positions=anchors + head_idx + 2,
                     head_indices=torch.full(
@@ -121,14 +193,27 @@ class HRDCRPredictionBuffer:
                         dtype=torch.bfloat16
                     ),
                     candidate_ids=candidates.to(dtype=torch.int32),
-                    candidate_valid=torch.ones_like(candidates, dtype=torch.bool),
+                    candidate_valid=candidate_valid,
                     state_sketch=state_sketch[:, head_idx].detach().to(dtype=torch.float16),
                     anchor_hidden=anchor_hidden.detach().to(dtype=torch.bfloat16),
                     fast_state=fast_states[:, head_idx].detach().to(dtype=torch.bfloat16),
                     trust=trust[:, head_idx].detach().to(dtype=torch.float16),
+                    quality=quality.to(dtype=torch.float16),
+                    probe_mask=row_probe,
+                    raw_proposal_hidden=raw_hidden.to(dtype=torch.bfloat16),
+                    raw_candidate_ids=raw_candidates.to(dtype=torch.int32),
+                    raw_candidate_valid=raw_valid,
                 )
+            keep = candidate_valid.any(dim=-1).nonzero(as_tuple=False).flatten()
+            item = HRDCRPredictionBatch(
+                **{
+                    field: getattr(item, field).index_select(0, keep)
+                    for field in HRDCRPredictionBatch.__dataclass_fields__
+                }
             )
-            self._record_count += batch_size
+            if keep.numel() > 0:
+                self._batches.append(item)
+                self._record_count += int(keep.numel())
         self._trim_oldest()
 
     def _trim_oldest(self) -> None:
@@ -138,12 +223,15 @@ class HRDCRPredictionBuffer:
 
     @staticmethod
     def _pad(values: torch.Tensor, width: int, fill: int | bool) -> torch.Tensor:
-        if int(values.shape[-1]) == width:
+        current = int(values.shape[-1])
+        if current == width:
             return values
+        if current > width:
+            return values[:, :width]
         output = torch.full(
             (int(values.shape[0]), width), fill, device=values.device, dtype=values.dtype
         )
-        output[:, : int(values.shape[-1])].copy_(values)
+        output[:, :current].copy_(values)
         return output
 
     @torch.no_grad()
@@ -156,7 +244,11 @@ class HRDCRPredictionBuffer:
             raise ValueError("HRDCR sequence IDs and target positions must align")
         device = sequence_ids.device
         max_candidates = max(
-            (int(batch.candidate_ids.shape[-1]) for batch in self._batches), default=0
+            (
+                max(int(batch.candidate_ids.shape[-1]), int(batch.raw_candidate_ids.shape[-1]))
+                for batch in self._batches
+            ),
+            default=0,
         )
         selected: list[tuple[HRDCRPredictionBatch, torch.Tensor, torch.Tensor]] = []
         retained: list[HRDCRPredictionBatch] = []
@@ -186,8 +278,8 @@ class HRDCRPredictionBuffer:
 
         def merge(name: str) -> torch.Tensor:
             rows = [getattr(batch, name)[mask].to(device=device) for batch, mask, _ in selected]
-            if name in {"candidate_ids", "candidate_valid"}:
-                fill = -1 if name == "candidate_ids" else False
+            if name in {"candidate_ids", "candidate_valid", "raw_candidate_ids", "raw_candidate_valid"}:
+                fill = -1 if name.endswith("ids") else False
                 rows = [self._pad(row, max_candidates, fill) for row in rows]
             return torch.cat(rows, dim=0)
 
@@ -202,6 +294,11 @@ class HRDCRPredictionBuffer:
             anchor_hidden=merge("anchor_hidden"),
             fast_state=merge("fast_state"),
             trust=merge("trust"),
+            quality=merge("quality"),
+            probe_mask=merge("probe_mask"),
+            raw_proposal_hidden=merge("raw_proposal_hidden"),
+            raw_candidate_ids=merge("raw_candidate_ids"),
+            raw_candidate_valid=merge("raw_candidate_valid"),
         )
 
     def _empty(self, device: torch.device, candidate_width: int) -> HRDCRMatureRecords:
@@ -218,6 +315,11 @@ class HRDCRPredictionBuffer:
             anchor_hidden=torch.empty((0, 0), device=device, dtype=torch.bfloat16),
             fast_state=torch.empty((0, 0), device=device, dtype=torch.bfloat16),
             trust=torch.empty((0,), device=device, dtype=torch.float16),
+            quality=torch.empty((0,), device=device, dtype=torch.float16),
+            probe_mask=torch.empty((0,), device=device, dtype=torch.bool),
+            raw_proposal_hidden=torch.empty((0, 0), device=device, dtype=torch.bfloat16),
+            raw_candidate_ids=torch.empty((0, candidate_width), device=device, dtype=torch.int32),
+            raw_candidate_valid=torch.empty((0, candidate_width), device=device, dtype=torch.bool),
         )
 
     def clear_sequences(self, sequence_ids: list[int]) -> None:
@@ -315,6 +417,18 @@ class HRDCRFeedback:
                 record_severity=empty,
                 record_candidate_mass=empty,
                 record_candidate_hit=torch.empty((0,), device=device, dtype=torch.bool),
+                record_candidate_regret=empty,
+                record_restricted_kl=empty,
+                record_quality=empty,
+                probe_head_indices=torch.empty((0,), device=device, dtype=torch.long),
+                probe_quality=empty,
+                probe_changed=torch.empty((0,), device=device, dtype=torch.bool),
+                probe_raw_mass=empty,
+                probe_effective_mass=empty,
+                probe_raw_kl=empty,
+                probe_effective_kl=empty,
+                probe_wins=torch.empty((0,), device=device, dtype=torch.bool),
+                probe_losses=torch.empty((0,), device=device, dtype=torch.bool),
                 auxiliary_records={},
             )
 
@@ -325,12 +439,23 @@ class HRDCRFeedback:
         target_ids = torch.topk(target, k=min(self.target_topk, int(target.shape[-1])), dim=-1).indices
         target_ids = target_ids.index_select(0, groups)
         proposal_ids = records.proposal_top_ids.to(device=device, dtype=torch.long)
-        support_raw = torch.cat((proposal_ids, target_ids, actual.unsqueeze(-1)), dim=-1)
-        support_ids = support_raw.sort(dim=-1).values
-        support_valid = torch.ones_like(support_ids, dtype=torch.bool)
-        support_valid[:, 1:] = support_ids[:, 1:] != support_ids[:, :-1]
-        support_ids = support_ids[:, : self.support_cap]
-        support_valid = support_valid[:, : self.support_cap]
+        raw_candidate_ids = records.raw_candidate_ids.to(device=device, dtype=torch.long)
+        raw_candidate_valid = records.raw_candidate_valid.to(device=device, dtype=torch.bool)
+        sentinel = int(weight.shape[0])
+        raw_candidate_support = torch.where(
+            raw_candidate_valid, raw_candidate_ids, torch.full_like(raw_candidate_ids, sentinel)
+        )
+        support_raw = torch.cat(
+            (proposal_ids, target_ids, actual.unsqueeze(-1), raw_candidate_support), dim=-1
+        )
+        support_sorted = support_raw.sort(dim=-1).values
+        support_unique = support_sorted.lt(sentinel)
+        support_unique[:, 1:] &= support_sorted[:, 1:] != support_sorted[:, :-1]
+        support_dedup = torch.where(
+            support_unique, support_sorted, torch.full_like(support_sorted, sentinel)
+        ).sort(dim=-1).values
+        support_ids = support_dedup[:, : self.support_cap]
+        support_valid = support_ids.lt(sentinel)
         safe_support = support_ids.clamp(0, int(weight.shape[0]) - 1)
 
         selected_weight = weight.index_select(0, safe_support.reshape(-1)).view(
@@ -344,6 +469,13 @@ class HRDCRFeedback:
         q = _masked_softmax(proposal_logits, support_valid, self.temperature)
 
         residual = (p - q).masked_fill(~support_valid, 0.0)
+        restricted_kl = (
+            p
+            * (
+                torch.log(p.clamp_min(self.eps))
+                - torch.log(q.clamp_min(self.eps))
+            )
+        ).masked_fill(~support_valid, 0.0).sum(dim=-1)
         distribution = torch.einsum("rs,rsh->rh", residual, selected_weight.float())
 
         candidate_ids = records.candidate_ids.to(device=device, dtype=torch.long)
@@ -353,7 +485,31 @@ class HRDCRFeedback:
             & support_valid.unsqueeze(-1)
             & candidate_valid.unsqueeze(1)
         ).any(dim=-1)
-        candidate_mass = (p * in_candidates).sum(dim=-1).clamp(0.0, 1.0)
+        target_rows = target.index_select(0, groups).float() / max(self.temperature, self.eps)
+        target_log_z = torch.logsumexp(target_rows, dim=-1)
+        safe_candidates = candidate_ids.clamp(0, int(weight.shape[0]) - 1)
+        candidate_prob = torch.exp(
+            torch.gather(target_rows, -1, safe_candidates) - target_log_z.unsqueeze(-1)
+        )
+        duplicate = candidate_ids.unsqueeze(2).eq(candidate_ids.unsqueeze(1))
+        prior = torch.tril(
+            torch.ones(
+                (int(candidate_ids.shape[1]), int(candidate_ids.shape[1])),
+                device=device,
+                dtype=torch.bool,
+            ),
+            diagonal=-1,
+        )
+        duplicate = (duplicate & prior.unsqueeze(0)).any(dim=-1)
+        candidate_unique = candidate_valid & ~duplicate
+        candidate_mass = (candidate_prob * candidate_unique).sum(dim=-1).clamp(0.0, 1.0)
+        candidate_k = candidate_unique.sum(dim=-1)
+        max_k = max(1, int(candidate_ids.shape[1]))
+        target_top_values = torch.topk(target_rows, k=max_k, dim=-1).values
+        target_top_prob = torch.exp(target_top_values - target_log_z.unsqueeze(-1))
+        target_k_mask = torch.arange(max_k, device=device).unsqueeze(0).lt(candidate_k.unsqueeze(-1))
+        optimal_mass = (target_top_prob * target_k_mask).sum(dim=-1)
+        candidate_regret = (optimal_mass - candidate_mass).clamp_min(0.0)
         candidate_hit = (
             candidate_ids.eq(actual.unsqueeze(-1)) & candidate_valid
         ).any(dim=-1)
@@ -437,9 +593,39 @@ class HRDCRFeedback:
             )
             head_alignment_observed.copy_(alignment_count.view(group_count, self.num_heads).gt(0.0))
 
-        actual_prob = (
-            p * support_ids.eq(actual.unsqueeze(-1)) * support_valid
-        ).sum(dim=-1).clamp_min(self.eps)
+        actual_prob = torch.exp(
+            torch.gather(target_rows, -1, actual.unsqueeze(-1)).squeeze(-1) - target_log_z
+        ).clamp_min(self.eps)
+
+        probe_mask = records.probe_mask.to(device=device, dtype=torch.bool)
+        raw_hidden = records.raw_proposal_hidden.to(device=device, dtype=weight.dtype)
+        raw_logits = torch.einsum("rsh,rh->rs", selected_weight, raw_hidden)
+        raw_q = _masked_softmax(raw_logits, support_valid, self.temperature)
+        raw_kl = (
+            p
+            * (
+                torch.log(p.clamp_min(self.eps))
+                - torch.log(raw_q.clamp_min(self.eps))
+            )
+        ).masked_fill(~support_valid, 0.0).sum(dim=-1)
+        safe_raw_candidates = raw_candidate_ids.clamp(0, int(weight.shape[0]) - 1)
+        raw_candidate_prob = torch.exp(
+            torch.gather(target_rows, -1, safe_raw_candidates) - target_log_z.unsqueeze(-1)
+        )
+        raw_duplicate = raw_candidate_ids.unsqueeze(2).eq(raw_candidate_ids.unsqueeze(1))
+        raw_duplicate = (raw_duplicate & prior.unsqueeze(0)).any(dim=-1)
+        raw_unique = raw_candidate_valid & ~raw_duplicate
+        raw_mass = (raw_candidate_prob * raw_unique).sum(dim=-1).clamp(0.0, 1.0)
+        raw_hit = (raw_candidate_ids.eq(actual.unsqueeze(-1)) & raw_candidate_valid).any(dim=-1)
+        set_overlap = (
+            candidate_ids.unsqueeze(-1).eq(raw_candidate_ids.unsqueeze(1))
+            & candidate_valid.unsqueeze(-1)
+            & raw_candidate_valid.unsqueeze(1)
+        )
+        effective_subset = (~candidate_valid | set_overlap.any(dim=-1)).all(dim=-1)
+        raw_subset = (~raw_candidate_valid | set_overlap.any(dim=1)).all(dim=-1)
+        changed = ~(effective_subset & raw_subset)
+        probe_rows = probe_mask.nonzero(as_tuple=False).flatten()
         auxiliary: dict[str, torch.Tensor] = {}
         if collect_auxiliary:
             auxiliary = {
@@ -452,9 +638,13 @@ class HRDCRFeedback:
                 "candidate_ids": candidate_ids.to(dtype=torch.int32).detach(),
                 "candidate_valid": candidate_valid.detach(),
                 "candidate_mass": candidate_mass.detach(),
+                "candidate_regret": candidate_regret.detach(),
+                "restricted_kl": restricted_kl.detach(),
+                "candidate_hit": candidate_hit.detach(),
                 "actual_tokens": actual.detach(),
                 "fast_state": records.fast_state.detach(),
                 "trust": records.trust.detach(),
+                "quality": records.quality.detach(),
             }
         return HRDCRFeedbackBatch(
             head_feedback=head_feedback,
@@ -468,6 +658,18 @@ class HRDCRFeedback:
             record_severity=severity,
             record_candidate_mass=candidate_mass,
             record_candidate_hit=candidate_hit,
+            record_candidate_regret=candidate_regret,
+            record_restricted_kl=restricted_kl,
+            record_quality=records.quality.to(device=device, dtype=torch.float32),
+            probe_head_indices=heads.index_select(0, probe_rows),
+            probe_quality=records.quality.to(device=device, dtype=torch.float32).index_select(0, probe_rows),
+            probe_changed=changed.index_select(0, probe_rows),
+            probe_raw_mass=raw_mass.index_select(0, probe_rows),
+            probe_effective_mass=candidate_mass.index_select(0, probe_rows),
+            probe_raw_kl=raw_kl.index_select(0, probe_rows),
+            probe_effective_kl=restricted_kl.index_select(0, probe_rows),
+            probe_wins=(candidate_hit & ~raw_hit).index_select(0, probe_rows),
+            probe_losses=(raw_hit & ~candidate_hit).index_select(0, probe_rows),
             auxiliary_records=auxiliary,
         )
 
@@ -487,6 +689,17 @@ class HRDCRStateManager:
         trust_n0: float = 4.0,
         sketch_rank: int = 24,
         sketch_seed: int = 29,
+        min_effective_updates: float = 4.0,
+        min_alignment_count: float = 4.0,
+        min_state_rms: float = 0.005,
+        state_reference_rms: float = 0.03,
+        alignment_floor: float = 0.0,
+        alignment_full: float = 0.10,
+        alignment_lcb_z: float = 1.0,
+        safety_min_probe_count: int = 128,
+        safety_bad_probe_patience: int = 3,
+        safety_ratio_decay: float = 0.5,
+        safety_reenable_probe_interval: int = 256,
         eps: float = 1e-6,
     ):
         self.num_heads = int(num_heads)
@@ -494,6 +707,17 @@ class HRDCRStateManager:
         self.rho = float(2.0 ** (-1.0 / max(float(half_life_tokens), 1e-6)))
         self.alignment_beta = min(0.9999, max(0.0, float(alignment_beta)))
         self.trust_n0 = max(float(trust_n0), 1e-6)
+        self.min_effective_updates = max(0.0, float(min_effective_updates))
+        self.min_alignment_count = max(0.0, float(min_alignment_count))
+        self.min_state_rms = max(0.0, float(min_state_rms))
+        self.state_reference_rms = max(float(state_reference_rms), eps)
+        self.alignment_floor = float(alignment_floor)
+        self.alignment_full = max(float(alignment_full), self.alignment_floor + eps)
+        self.alignment_lcb_z = max(0.0, float(alignment_lcb_z))
+        self.safety_min_probe_count = max(1, int(safety_min_probe_count))
+        self.safety_bad_probe_patience = max(1, int(safety_bad_probe_patience))
+        self.safety_ratio_decay = min(1.0, max(0.0, float(safety_ratio_decay)))
+        self.safety_reenable_probe_interval = max(1, int(safety_reenable_probe_interval))
         self.eps = float(eps)
         self.states = torch.zeros(
             (int(num_sequences), self.num_heads, self.hidden_size),
@@ -505,6 +729,13 @@ class HRDCRStateManager:
         )
         self.alignment_ema = torch.zeros_like(self.effective_updates)
         self.alignment_count = torch.zeros_like(self.effective_updates)
+        self.alignment_m2 = torch.zeros_like(self.effective_updates)
+        self.safety_ratio = torch.ones((self.num_heads,), device=device, dtype=torch.float32)
+        self.safety_probe_count = torch.zeros((self.num_heads,), device=device, dtype=torch.long)
+        self.safety_mass_gain_ema = torch.zeros((self.num_heads,), device=device, dtype=torch.float32)
+        self.safety_net_win_ema = torch.zeros((self.num_heads,), device=device, dtype=torch.float32)
+        self.safety_bad_windows = torch.zeros((self.num_heads,), device=device, dtype=torch.long)
+        self.safety_query_count = 0
         generator = torch.Generator(device="cpu")
         generator.manual_seed(int(sketch_seed))
         projection = torch.randn(
@@ -519,9 +750,36 @@ class HRDCRStateManager:
 
     def trust(self, sequence_ids: list[int]) -> torch.Tensor:
         ids = self._ids(sequence_ids)
-        quality = torch.relu(self.alignment_ema.index_select(0, ids))
+        state = self.states.index_select(0, ids)
+        state_rms = _rms(state, self.eps).squeeze(-1)
+        quality = self.alignment_ema.index_select(0, ids)
         count = self.alignment_count.index_select(0, ids)
-        return quality * count / (count + self.trust_n0)
+        m2 = self.alignment_m2.index_select(0, ids)
+        variance = m2 / (count - 1.0).clamp_min(1.0)
+        stderr = torch.sqrt(variance.clamp_min(0.0) / count.clamp_min(1.0))
+        lcb = quality - self.alignment_lcb_z * stderr
+        align_gate = ((lcb - self.alignment_floor) / (
+            self.alignment_full - self.alignment_floor
+        )).clamp(0.0, 1.0)
+        state_gate = (state_rms / self.state_reference_rms).clamp(0.0, 1.0)
+        eligible = (
+            self.effective_updates.index_select(0, ids).ge(self.min_effective_updates)
+            & count.ge(self.min_alignment_count)
+            & state_rms.ge(self.min_state_rms)
+            & lcb.gt(0.0)
+            & torch.isfinite(state).all(dim=-1)
+        )
+        confidence = torch.sqrt(align_gate * state_gate).masked_fill(~eligible, 0.0)
+        return confidence
+
+    def ratio_scale(self, sequence_ids: list[int]) -> torch.Tensor:
+        batch = len(sequence_ids)
+        self.safety_query_count += 1
+        recovery_probe = self.safety_query_count % self.safety_reenable_probe_interval == 1
+        ratio = self.safety_ratio
+        if recovery_probe:
+            ratio = torch.where(ratio.eq(0.0), torch.ones_like(ratio), ratio)
+        return ratio.view(1, -1).expand(batch, -1)
 
     def get_state_and_effective_updates(
         self, sequence_ids: list[int]
@@ -574,26 +832,73 @@ class HRDCRStateManager:
         state_rms = _rms(updated, self.eps)
         updated = updated / torch.maximum(torch.ones_like(state_rms), state_rms)
         finite = torch.isfinite(updated).all(dim=-1)
-        if not bool(finite.all().item()):
-            updated = updated.masked_fill(~finite.unsqueeze(-1), 0.0)
-            self.numerical_reset_count.add_((~finite).sum())
+        updated = updated.masked_fill(~finite.unsqueeze(-1), 0.0)
+        self.numerical_reset_count.add_((~finite).sum())
         self.states.index_copy_(0, ids, updated)
         self.effective_updates.index_add_(0, ids, severity * valid)
 
         observed = head_alignment_observed.to(device=self.states.device, dtype=torch.bool)
-        if bool(observed.any().item()):
-            rows, heads = observed.nonzero(as_tuple=True)
-            global_ids = ids.index_select(0, rows)
-            old = self.alignment_ema[global_ids, heads]
-            count = self.alignment_count[global_ids, heads]
-            alignment = head_alignment.to(device=self.states.device, dtype=torch.float32)[rows, heads]
-            self.alignment_ema[global_ids, heads] = torch.where(
-                count.gt(0.0),
-                float(self.alignment_beta) * old + (1.0 - float(self.alignment_beta)) * alignment,
-                alignment,
-            ).clamp(-1.0, 1.0)
-            self.alignment_count[global_ids, heads] = count + 1.0
+        rows, heads = observed.nonzero(as_tuple=True)
+        global_ids = ids.index_select(0, rows)
+        old = self.alignment_ema[global_ids, heads]
+        count = self.alignment_count[global_ids, heads]
+        old_m2 = self.alignment_m2[global_ids, heads]
+        alignment = head_alignment.to(device=self.states.device, dtype=torch.float32)[rows, heads]
+        new_count = count + 1.0
+        exact_mean = old + (alignment - old) / new_count.clamp_min(1.0)
+        new_mean = exact_mean.clamp(-1.0, 1.0)
+        new_m2 = old_m2 + (alignment - old) * (alignment - exact_mean)
+        self.alignment_ema[global_ids, heads] = new_mean
+        self.alignment_m2[global_ids, heads] = new_m2.clamp_min(0.0)
+        self.alignment_count[global_ids, heads] = new_count
         return raw_rms.masked_fill(~valid, 0.0).mean(dim=-1)
+
+    @torch.no_grad()
+    def observe_counterfactual(self, feedback: HRDCRFeedbackBatch) -> None:
+        heads = feedback.probe_head_indices.to(device=self.states.device, dtype=torch.long)
+        valid = heads.ge(0) & heads.lt(self.num_heads)
+        heads = heads[valid]
+        if heads.numel() == 0:
+            return
+        mass_gain = (
+            feedback.probe_effective_mass - feedback.probe_raw_mass
+        ).to(device=self.states.device, dtype=torch.float32)[valid]
+        net_win = (
+            feedback.probe_wins.float() - feedback.probe_losses.float()
+        ).to(device=self.states.device)[valid]
+        counts = torch.bincount(heads, minlength=self.num_heads)[: self.num_heads]
+        gain_sum = torch.zeros((self.num_heads,), device=self.states.device)
+        win_sum = torch.zeros_like(gain_sum)
+        gain_sum.index_add_(0, heads, mass_gain)
+        win_sum.index_add_(0, heads, net_win)
+        observed = counts.gt(0)
+        gain = gain_sum / counts.clamp_min(1)
+        wins = win_sum / counts.clamp_min(1)
+        beta = 0.9
+        self.safety_mass_gain_ema.copy_(
+            torch.where(observed, beta * self.safety_mass_gain_ema + (1.0 - beta) * gain, self.safety_mass_gain_ema)
+        )
+        self.safety_net_win_ema.copy_(
+            torch.where(observed, beta * self.safety_net_win_ema + (1.0 - beta) * wins, self.safety_net_win_ema)
+        )
+        self.safety_probe_count.add_(counts)
+        ready = self.safety_probe_count.ge(self.safety_min_probe_count)
+        bad = ready & observed & (
+            self.safety_mass_gain_ema.lt(0.0) | self.safety_net_win_ema.lt(0.0)
+        )
+        self.safety_bad_windows.copy_(torch.where(bad, self.safety_bad_windows + 1, torch.zeros_like(self.safety_bad_windows)))
+        decay = bad & self.safety_bad_windows.ge(self.safety_bad_probe_patience)
+        self.safety_ratio.copy_(
+            torch.where(decay, self.safety_ratio * self.safety_ratio_decay, self.safety_ratio)
+        )
+        self.safety_ratio.masked_fill_(self.safety_ratio.lt(0.125), 0.0)
+        recovery = ready & observed & self.safety_ratio.eq(0.0) & (
+            self.safety_mass_gain_ema.ge(0.0) & self.safety_net_win_ema.ge(0.0)
+        )
+        self.safety_ratio.copy_(
+            torch.where(recovery, torch.full_like(self.safety_ratio, self.safety_ratio_decay), self.safety_ratio)
+        )
+        self.safety_bad_windows.masked_fill_(decay, 0)
 
     def reset(self, sequence_ids: list[int]) -> None:
         ids = self._ids(sequence_ids)
@@ -603,12 +908,38 @@ class HRDCRStateManager:
         self.effective_updates.index_fill_(0, ids, 0.0)
         self.alignment_ema.index_fill_(0, ids, 0.0)
         self.alignment_count.index_fill_(0, ids, 0.0)
+        self.alignment_m2.index_fill_(0, ids, 0.0)
+
+    def load_safety_state(self, state: dict[str, torch.Tensor | int] | None) -> None:
+        if not state:
+            return
+        for name in (
+            "safety_ratio",
+            "safety_probe_count",
+            "safety_mass_gain_ema",
+            "safety_net_win_ema",
+            "safety_bad_windows",
+        ):
+            value = state.get(name)
+            current = getattr(self, name)
+            if torch.is_tensor(value) and tuple(value.shape) == tuple(current.shape):
+                current.copy_(value.to(device=current.device, dtype=current.dtype))
+        self.safety_query_count = int(state.get("safety_query_count", 0))
+
+    def safety_state(self) -> dict[str, torch.Tensor | int]:
+        return {
+            "safety_ratio": self.safety_ratio.detach().clone(),
+            "safety_probe_count": self.safety_probe_count.detach().clone(),
+            "safety_mass_gain_ema": self.safety_mass_gain_ema.detach().clone(),
+            "safety_net_win_ema": self.safety_net_win_ema.detach().clone(),
+            "safety_bad_windows": self.safety_bad_windows.detach().clone(),
+            "safety_query_count": int(self.safety_query_count),
+        }
 
     def stats(self) -> dict:
         rms = _rms(self.states, self.eps).squeeze(-1)
-        trust = torch.relu(self.alignment_ema) * self.alignment_count / (
-            self.alignment_count + self.trust_n0
-        )
+        all_ids = list(range(int(self.states.shape[0])))
+        trust = self.trust(all_ids)
         return {
             "strict_horizon_pipeline": True,
             "horizon_resolved": True,
@@ -619,6 +950,14 @@ class HRDCRStateManager:
             "hint_trust_mean": float(trust.mean().detach().cpu()),
             "head_fast_state_rms_mean": [float(x) for x in rms.mean(dim=0).detach().cpu()],
             "head_hint_trust_mean": [float(x) for x in trust.mean(dim=0).detach().cpu()],
+            "head_safety_ratio": [float(x) for x in self.safety_ratio.detach().cpu()],
+            "head_probe_count": [int(x) for x in self.safety_probe_count.detach().cpu()],
+            "head_candidate_mass_gain_ema": [
+                float(x) for x in self.safety_mass_gain_ema.detach().cpu()
+            ],
+            "head_reflex_net_wins_ema": [
+                float(x) for x in self.safety_net_win_ema.detach().cpu()
+            ],
             "head_effective_updates_mean": [
                 float(x) for x in self.effective_updates.mean(dim=0).detach().cpu()
             ],
@@ -659,8 +998,26 @@ def merge_auxiliary_records(
     }
     limit = max(0, int(max_records))
     if limit and int(merged["hidden"].shape[0]) > limit:
-        # Keep a deterministic, horizon-balanced recent subset.
         total = int(merged["hidden"].shape[0])
-        keep = torch.arange(total - limit, total, device=merged["hidden"].device)
+        head_indices = merged.get("head_indices")
+        if torch.is_tensor(head_indices) and head_indices.numel() > 0:
+            head_device = head_indices.device
+            available_heads = [int(x) for x in torch.unique(head_indices).detach().cpu().tolist()]
+            quota = max(1, limit // max(len(available_heads), 1))
+            selected_parts: list[torch.Tensor] = []
+            selected_mask = torch.zeros(total, device=head_device, dtype=torch.bool)
+            for head_idx in available_heads:
+                rows = head_indices.eq(head_idx).nonzero(as_tuple=False).flatten()
+                rows = rows[-min(quota, int(rows.numel())) :]
+                selected_parts.append(rows)
+                selected_mask.index_fill_(0, rows, True)
+            selected = torch.cat(selected_parts, dim=0) if selected_parts else torch.empty(0, device=head_device, dtype=torch.long)
+            remaining = max(0, limit - int(selected.numel()))
+            if remaining:
+                recent = (~selected_mask).nonzero(as_tuple=False).flatten()[-remaining:]
+                selected = torch.cat((selected, recent), dim=0)
+            keep = selected.sort().values.to(device=merged["hidden"].device)
+        else:
+            keep = torch.arange(total - limit, total, device=merged["hidden"].device)
         merged = {key: value.index_select(0, keep) for key, value in merged.items()}
     return merged

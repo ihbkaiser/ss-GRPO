@@ -2846,6 +2846,16 @@ class ReflexBatchStats:
         self._hrdcr_ce_sum: torch.Tensor | None = None
         self._hrdcr_tv_sum: torch.Tensor | None = None
         self._hrdcr_gated: torch.Tensor | None = None
+        self._hrdcr_regret_sum: torch.Tensor | None = None
+        self._hrdcr_kl_sum: torch.Tensor | None = None
+        self._probe_count_by_head: torch.Tensor | None = None
+        self._probe_changed_by_head: torch.Tensor | None = None
+        self._probe_raw_mass_sum: torch.Tensor | None = None
+        self._probe_effective_mass_sum: torch.Tensor | None = None
+        self._probe_raw_kl_sum: torch.Tensor | None = None
+        self._probe_effective_kl_sum: torch.Tensor | None = None
+        self._probe_wins_by_head: torch.Tensor | None = None
+        self._probe_losses_by_head: torch.Tensor | None = None
 
     @staticmethod
     def _depth_bucket(depth: int) -> str:
@@ -2919,6 +2929,8 @@ class ReflexBatchStats:
                 (self.num_heads,), device=heads.device, dtype=torch.float32
             )
             self._hrdcr_tv_sum = torch.zeros_like(self._hrdcr_ce_sum)
+            self._hrdcr_regret_sum = torch.zeros_like(self._hrdcr_ce_sum)
+            self._hrdcr_kl_sum = torch.zeros_like(self._hrdcr_ce_sum)
         self._hrdcr_mature.add_(torch.bincount(heads, minlength=self.num_heads)[: self.num_heads])
         hits = batch.record_candidate_hit.detach().bool()[valid]
         self._hrdcr_hits.add_(
@@ -2934,6 +2946,56 @@ class ReflexBatchStats:
             -torch.log(batch.record_true_probs.detach().float()[valid].clamp_min(1e-8)),
         )
         self._hrdcr_tv_sum.index_add_(0, heads, batch.record_tv.detach().float()[valid])
+        self._hrdcr_regret_sum.index_add_(
+            0, heads, batch.record_candidate_regret.detach().float()[valid]
+        )
+        self._hrdcr_kl_sum.index_add_(
+            0, heads, batch.record_restricted_kl.detach().float()[valid]
+        )
+        probe_heads = batch.probe_head_indices.detach().long()
+        probe_valid = probe_heads.ge(0) & probe_heads.lt(self.num_heads)
+        probe_heads = probe_heads[probe_valid]
+        if probe_heads.numel() > 0:
+            if self._probe_count_by_head is None:
+                self._probe_count_by_head = torch.zeros(
+                    (self.num_heads,), device=probe_heads.device, dtype=torch.long
+                )
+                self._probe_changed_by_head = torch.zeros_like(self._probe_count_by_head)
+                self._probe_wins_by_head = torch.zeros_like(self._probe_count_by_head)
+                self._probe_losses_by_head = torch.zeros_like(self._probe_count_by_head)
+                self._probe_raw_mass_sum = torch.zeros(
+                    (self.num_heads,), device=probe_heads.device, dtype=torch.float32
+                )
+                self._probe_effective_mass_sum = torch.zeros_like(self._probe_raw_mass_sum)
+                self._probe_raw_kl_sum = torch.zeros_like(self._probe_raw_mass_sum)
+                self._probe_effective_kl_sum = torch.zeros_like(self._probe_raw_mass_sum)
+            self._probe_count_by_head.add_(
+                torch.bincount(probe_heads, minlength=self.num_heads)[: self.num_heads]
+            )
+            changed = batch.probe_changed.detach().bool()[probe_valid]
+            wins = batch.probe_wins.detach().bool()[probe_valid]
+            losses = batch.probe_losses.detach().bool()[probe_valid]
+            self._probe_changed_by_head.add_(
+                torch.bincount(probe_heads[changed], minlength=self.num_heads)[: self.num_heads]
+            )
+            self._probe_wins_by_head.add_(
+                torch.bincount(probe_heads[wins], minlength=self.num_heads)[: self.num_heads]
+            )
+            self._probe_losses_by_head.add_(
+                torch.bincount(probe_heads[losses], minlength=self.num_heads)[: self.num_heads]
+            )
+            self._probe_raw_mass_sum.index_add_(
+                0, probe_heads, batch.probe_raw_mass.detach().float()[probe_valid]
+            )
+            self._probe_effective_mass_sum.index_add_(
+                0, probe_heads, batch.probe_effective_mass.detach().float()[probe_valid]
+            )
+            self._probe_raw_kl_sum.index_add_(
+                0, probe_heads, batch.probe_raw_kl.detach().float()[probe_valid]
+            )
+            self._probe_effective_kl_sum.index_add_(
+                0, probe_heads, batch.probe_effective_kl.detach().float()[probe_valid]
+            )
 
     def add_feature_alignment(self, agreement: torch.Tensor, gate: torch.Tensor) -> None:
         if agreement.numel() == 0 or gate.numel() == 0:
@@ -2989,12 +3051,33 @@ class ReflexBatchStats:
         hrdcr_gated = [0 for _ in range(self.num_heads)]
         hrdcr_ce_sum = [0.0 for _ in range(self.num_heads)]
         hrdcr_tv_sum = [0.0 for _ in range(self.num_heads)]
+        hrdcr_regret_sum = [0.0 for _ in range(self.num_heads)]
+        hrdcr_kl_sum = [0.0 for _ in range(self.num_heads)]
         if self._hrdcr_mature is not None:
             hrdcr_mature = [int(value) for value in self._hrdcr_mature.cpu().tolist()]
             hrdcr_hits = [int(value) for value in self._hrdcr_hits.cpu().tolist()]
             hrdcr_gated = [int(value) for value in self._hrdcr_gated.cpu().tolist()]
             hrdcr_ce_sum = [float(value) for value in self._hrdcr_ce_sum.cpu().tolist()]
             hrdcr_tv_sum = [float(value) for value in self._hrdcr_tv_sum.cpu().tolist()]
+            hrdcr_regret_sum = [float(value) for value in self._hrdcr_regret_sum.cpu().tolist()]
+            hrdcr_kl_sum = [float(value) for value in self._hrdcr_kl_sum.cpu().tolist()]
+        probe_count = [0 for _ in range(self.num_heads)]
+        probe_changed_by_head = [0 for _ in range(self.num_heads)]
+        probe_wins_by_head = [0 for _ in range(self.num_heads)]
+        probe_losses_by_head = [0 for _ in range(self.num_heads)]
+        probe_raw_mass = [0.0 for _ in range(self.num_heads)]
+        probe_effective_mass = [0.0 for _ in range(self.num_heads)]
+        probe_raw_kl = [0.0 for _ in range(self.num_heads)]
+        probe_effective_kl = [0.0 for _ in range(self.num_heads)]
+        if self._probe_count_by_head is not None:
+            probe_count = [int(value) for value in self._probe_count_by_head.cpu().tolist()]
+            probe_changed_by_head = [int(value) for value in self._probe_changed_by_head.cpu().tolist()]
+            probe_wins_by_head = [int(value) for value in self._probe_wins_by_head.cpu().tolist()]
+            probe_losses_by_head = [int(value) for value in self._probe_losses_by_head.cpu().tolist()]
+            probe_raw_mass = [float(value) for value in self._probe_raw_mass_sum.cpu().tolist()]
+            probe_effective_mass = [float(value) for value in self._probe_effective_mass_sum.cpu().tolist()]
+            probe_raw_kl = [float(value) for value in self._probe_raw_kl_sum.cpu().tolist()]
+            probe_effective_kl = [float(value) for value in self._probe_effective_kl_sum.cpu().tolist()]
         per_head: dict[str, dict] = {}
         total_mature = 0
         total_gated = 0
@@ -3019,6 +3102,26 @@ class ReflexBatchStats:
                 "rejection_rate": 1.0 - accepted / max(mature, 1) if mature else 0.0,
                 "mature_ce": (self.ce_sum[head_idx] + hrdcr_ce_sum[head_idx]) / max(mature, 1),
                 "sparse_tv": (self.tv_sum[head_idx] + hrdcr_tv_sum[head_idx]) / max(mature, 1),
+                "candidate_regret": hrdcr_regret_sum[head_idx] / max(hrdcr_mature[head_idx], 1),
+                "restricted_kl": hrdcr_kl_sum[head_idx] / max(hrdcr_mature[head_idx], 1),
+                "candidate_set_probe_count": probe_count[head_idx],
+                "candidate_set_changed_fraction": probe_changed_by_head[head_idx]
+                / max(probe_count[head_idx], 1),
+                "raw_candidate_mass": probe_raw_mass[head_idx] / max(probe_count[head_idx], 1),
+                "effective_candidate_mass": probe_effective_mass[head_idx]
+                / max(probe_count[head_idx], 1),
+                "candidate_mass_gain": (
+                    probe_effective_mass[head_idx] - probe_raw_mass[head_idx]
+                ) / max(probe_count[head_idx], 1),
+                "raw_restricted_kl": probe_raw_kl[head_idx] / max(probe_count[head_idx], 1),
+                "effective_restricted_kl": probe_effective_kl[head_idx]
+                / max(probe_count[head_idx], 1),
+                "restricted_kl_gain": (
+                    probe_raw_kl[head_idx] - probe_effective_kl[head_idx]
+                ) / max(probe_count[head_idx], 1),
+                "reflex_win_count": probe_wins_by_head[head_idx],
+                "reflex_loss_count": probe_losses_by_head[head_idx],
+                "reflex_net_wins": probe_wins_by_head[head_idx] - probe_losses_by_head[head_idx],
                 "nonzero_gate_fraction": gated_count / max(mature, 1),
                 "depth_buckets": buckets,
             }
@@ -3031,10 +3134,14 @@ class ReflexBatchStats:
             else None
         )
         feature_gate = torch.tensor(self.feature_gates, dtype=torch.float32) if self.feature_gates else None
-        candidate_changed = int(self._candidate_changed.cpu()) if self._candidate_changed is not None else 0
-        candidate_probes = int(self._candidate_probes.cpu()) if self._candidate_probes is not None else 0
-        reflex_wins = int(self._reflex_wins.cpu()) if self._reflex_wins is not None else 0
-        reflex_losses = int(self._reflex_losses.cpu()) if self._reflex_losses is not None else 0
+        candidate_probes = int(self._candidate_probes.cpu()) if self._candidate_probes is not None else sum(probe_count)
+        candidate_changed = (
+            int(self._candidate_changed.cpu())
+            if self._candidate_changed is not None
+            else sum(probe_changed_by_head)
+        )
+        reflex_wins = int(self._reflex_wins.cpu()) if self._reflex_wins is not None else sum(probe_wins_by_head)
+        reflex_losses = int(self._reflex_losses.cpu()) if self._reflex_losses is not None else sum(probe_losses_by_head)
         return {
             "num_reflex_updates": int(total_gated),
             "feedback_rms_mean": float(feedback.mean()) if feedback is not None else 0.0,
@@ -3051,5 +3158,16 @@ class ReflexBatchStats:
             "candidate_set_probe_count": candidate_probes,
             "reflex_win_count": reflex_wins,
             "reflex_loss_count": reflex_losses,
+            "reflex_net_wins": reflex_wins - reflex_losses,
+            "raw_candidate_mass": sum(probe_raw_mass) / max(sum(probe_count), 1),
+            "effective_candidate_mass": sum(probe_effective_mass) / max(sum(probe_count), 1),
+            "candidate_mass_gain": (
+                sum(probe_effective_mass) - sum(probe_raw_mass)
+            ) / max(sum(probe_count), 1),
+            "raw_restricted_kl": sum(probe_raw_kl) / max(sum(probe_count), 1),
+            "effective_restricted_kl": sum(probe_effective_kl) / max(sum(probe_count), 1),
+            "restricted_kl_gain": (
+                sum(probe_raw_kl) - sum(probe_effective_kl)
+            ) / max(sum(probe_count), 1),
             "per_head": per_head,
         }

@@ -497,6 +497,12 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "tree_query_rows": int(tree_query_rows),
         "tree_lm_head_rows": int(tree_lm_head_rows),
         "tree_lm_head_row_ratio": tree_lm_head_rows / max(tree_query_rows, 1),
+        "tree_active_heads": max(int(row.get("tree_active_heads", 0) or 0) for row in rows),
+        "tree_nodes_head1": sum(int(row.get("tree_nodes_head1", 0) or 0) for row in rows),
+        "tree_nodes_head2": sum(int(row.get("tree_nodes_head2", 0) or 0) for row in rows),
+        "tree_nodes_head3": sum(int(row.get("tree_nodes_head3", 0) or 0) for row in rows),
+        "tree_total_nodes": sum(int(row.get("tree_total_nodes", 0) or 0) for row in rows),
+        "tree_budget_unused": sum(int(row.get("tree_budget_unused", 0) or 0) for row in rows),
         "accept_length_histogram": _merge_int_dicts(rows, "accept_length_histogram"),
         "medusa_accept_by_depth": _merge_int_dicts(rows, "medusa_accept_by_depth"),
         "medusa_proposed_by_depth": _merge_int_dicts(rows, "medusa_proposed_by_depth"),
@@ -514,6 +520,13 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "tree_verify_time_cost": sum(float(row.get("tree_verify_time_cost", 0.0) or 0.0) for row in rows),
         "cache_update_time_cost": sum(float(row.get("cache_update_time_cost", 0.0) or 0.0) for row in rows),
         "medusa_head_time_cost": sum(float(row.get("medusa_head_time_cost", 0.0) or 0.0) for row in rows),
+        "sampled_medusa_head_cuda_time_s": sum(
+            float(row.get("sampled_medusa_head_cuda_time_s", 0.0) or 0.0) for row in rows
+        ),
+        "sampled_tree_verify_cuda_time_s": sum(
+            float(row.get("sampled_tree_verify_cuda_time_s", 0.0) or 0.0) for row in rows
+        ),
+        "timing_sample_count": sum(int(row.get("timing_sample_count", 0) or 0) for row in rows),
         "draft_time_cost": sum(float(row.get("draft_time_cost", 0.0) or 0.0) for row in rows),
         "check_time_cost": sum(float(row.get("check_time_cost", 0.0) or 0.0) for row in rows),
         "reflex_metrics": reflex_metrics,
@@ -618,14 +631,42 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         for head, metrics in (row.get("per_head") or {}).items():
             out = per_head.setdefault(
                 str(head),
-                {"mature": 0, "accepted": 0, "ce_sum": 0.0, "tv_sum": 0.0, "gated": 0.0, "depth_buckets": {}},
+                {
+                    "mature": 0,
+                    "accepted": 0,
+                    "ce_sum": 0.0,
+                    "tv_sum": 0.0,
+                    "regret_sum": 0.0,
+                    "kl_sum": 0.0,
+                    "gated": 0.0,
+                    "probe_count": 0,
+                    "probe_changed": 0.0,
+                    "raw_mass_sum": 0.0,
+                    "effective_mass_sum": 0.0,
+                    "raw_kl_sum": 0.0,
+                    "effective_kl_sum": 0.0,
+                    "wins": 0,
+                    "losses": 0,
+                    "depth_buckets": {},
+                },
             )
             mature = int(metrics.get("mature", 0) or 0)
             out["mature"] += mature
             out["accepted"] += int(metrics.get("accepted", 0) or 0)
             out["ce_sum"] += float(metrics.get("mature_ce", 0.0) or 0.0) * mature
             out["tv_sum"] += float(metrics.get("sparse_tv", 0.0) or 0.0) * mature
+            out["regret_sum"] += float(metrics.get("candidate_regret", 0.0) or 0.0) * mature
+            out["kl_sum"] += float(metrics.get("restricted_kl", 0.0) or 0.0) * mature
             out["gated"] += float(metrics.get("nonzero_gate_fraction", 0.0) or 0.0) * mature
+            probes = int(metrics.get("candidate_set_probe_count", 0) or 0)
+            out["probe_count"] += probes
+            out["probe_changed"] += float(metrics.get("candidate_set_changed_fraction", 0.0) or 0.0) * probes
+            out["raw_mass_sum"] += float(metrics.get("raw_candidate_mass", 0.0) or 0.0) * probes
+            out["effective_mass_sum"] += float(metrics.get("effective_candidate_mass", 0.0) or 0.0) * probes
+            out["raw_kl_sum"] += float(metrics.get("raw_restricted_kl", 0.0) or 0.0) * probes
+            out["effective_kl_sum"] += float(metrics.get("effective_restricted_kl", 0.0) or 0.0) * probes
+            out["wins"] += int(metrics.get("reflex_win_count", 0) or 0)
+            out["losses"] += int(metrics.get("reflex_loss_count", 0) or 0)
             for bucket, values in (metrics.get("depth_buckets") or {}).items():
                 count = int(values.get("mature", 0) or 0)
                 bucket_out = out["depth_buckets"].setdefault(
@@ -640,7 +681,17 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         accepted = int(metrics.pop("accepted", 0))
         ce_sum = float(metrics.pop("ce_sum", 0.0))
         tv_sum = float(metrics.pop("tv_sum", 0.0))
+        regret_sum = float(metrics.pop("regret_sum", 0.0))
+        kl_sum = float(metrics.pop("kl_sum", 0.0))
         gated = float(metrics.pop("gated", 0.0))
+        probes = int(metrics.pop("probe_count", 0))
+        probe_changed = float(metrics.pop("probe_changed", 0.0))
+        raw_mass_sum = float(metrics.pop("raw_mass_sum", 0.0))
+        effective_mass_sum = float(metrics.pop("effective_mass_sum", 0.0))
+        raw_kl_sum = float(metrics.pop("raw_kl_sum", 0.0))
+        effective_kl_sum = float(metrics.pop("effective_kl_sum", 0.0))
+        wins = int(metrics.pop("wins", 0))
+        losses = int(metrics.pop("losses", 0))
         raw_buckets = metrics.pop("depth_buckets", {})
         acc = accepted / max(mature, 1)
         buckets = {
@@ -658,6 +709,19 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
             "rejection_rate": 1.0 - acc if mature else 0.0,
             "mature_ce": ce_sum / max(mature, 1),
             "sparse_tv": tv_sum / max(mature, 1),
+            "candidate_regret": regret_sum / max(mature, 1),
+            "restricted_kl": kl_sum / max(mature, 1),
+            "candidate_set_probe_count": probes,
+            "candidate_set_changed_fraction": probe_changed / max(probes, 1),
+            "raw_candidate_mass": raw_mass_sum / max(probes, 1),
+            "effective_candidate_mass": effective_mass_sum / max(probes, 1),
+            "candidate_mass_gain": (effective_mass_sum - raw_mass_sum) / max(probes, 1),
+            "raw_restricted_kl": raw_kl_sum / max(probes, 1),
+            "effective_restricted_kl": effective_kl_sum / max(probes, 1),
+            "restricted_kl_gain": (raw_kl_sum - effective_kl_sum) / max(probes, 1),
+            "reflex_win_count": wins,
+            "reflex_loss_count": losses,
+            "reflex_net_wins": wins - losses,
             "nonzero_gate_fraction": gated / max(mature, 1),
             "depth_buckets": buckets,
         }
@@ -736,6 +800,41 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         "candidate_set_probe_count": int(candidate_probe_count),
         "reflex_win_count": sum(int(row.get("reflex_win_count", 0) or 0) for row in rows),
         "reflex_loss_count": sum(int(row.get("reflex_loss_count", 0) or 0) for row in rows),
+        "reflex_net_wins": sum(int(row.get("reflex_net_wins", 0) or 0) for row in rows),
+        "raw_candidate_mass": sum(
+            float(row.get("raw_candidate_mass", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "effective_candidate_mass": sum(
+            float(row.get("effective_candidate_mass", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "candidate_mass_gain": sum(
+            float(row.get("candidate_mass_gain", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "raw_restricted_kl": sum(
+            float(row.get("raw_restricted_kl", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "effective_restricted_kl": sum(
+            float(row.get("effective_restricted_kl", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "restricted_kl_gain": sum(
+            float(row.get("restricted_kl_gain", 0.0) or 0.0)
+            * int(row.get("candidate_set_probe_count", 0) or 0)
+            for row in rows
+        ) / max(candidate_probe_count, 1),
+        "head3_eligible_count": sum(int(row.get("head3_eligible_count", 0) or 0) for row in rows),
+        "head3_quality_gate_pass_count": sum(int(row.get("head3_quality_gate_pass_count", 0) or 0) for row in rows),
+        "head3_quality_gate_reject_count": sum(int(row.get("head3_quality_gate_reject_count", 0) or 0) for row in rows),
+        "head3_exploration_count": sum(int(row.get("head3_exploration_count", 0) or 0) for row in rows),
         "reflex_total_time": sum(float(row.get("reflex_total_time", 0.0) or 0.0) for row in rows),
         "nonzero_gate_fraction": sum(float(row.get("nonzero_gate_fraction", 0.0) or 0.0) for row in rows) / max(len(rows), 1),
         "feedback_collection_rounds": feedback_collection_rounds,
@@ -852,18 +951,40 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
     gen = config.get("generation", {})
     reflex = config.get("reflex", {})
     aux = config.get("aux_update", {})
+    tree = config.get("tree", {})
+    metrics = config.get("metrics", {})
+    quality_weights = tree.get("head3_quality_weights", {})
+    tree_layout = str(tree.get("mode", fg.get("tree_layout", "dense")))
+    if tree_layout == "dense" and str(fg.get("tree_layout", "dense")) == "sparse":
+        tree_layout = "sparse_asymmetric"
     return FlashMedusaConfig(
         num_medusa_heads=int(fg.get("num_medusa_heads", 3)),
         tree_mode=fg.get("tree_mode", "concurrency_aware"),
-        tree_layout=fg.get("tree_layout", "dense"),
+        tree_layout=tree_layout,
         acceptance=fg.get("acceptance", "exact_target"),
         cache_update_mode=fg.get("cache_update_mode", "extract_path"),
         allow_recompute_fallback=bool(fg.get("allow_recompute_fallback", True)),
         cpeak_nodes=int(fg.get("cpeak_nodes", 64)),
         min_tree_nodes_per_seq=int(fg.get("min_tree_nodes_per_seq", 1)),
-        max_tree_nodes_per_seq=int(fg.get("max_tree_nodes_per_seq", 16)),
+        max_tree_nodes_per_seq=int(tree.get("max_nodes_per_seq", fg.get("max_tree_nodes_per_seq", 16))),
         max_tree_depth=int(fg.get("max_tree_depth", int(fg.get("num_medusa_heads", 3)) + 1)),
         fixed_tree_topk_by_depth=tuple(fg.get("fixed_tree_topk_by_depth", [4, 3, 2])),
+        sparse_nodes_by_head=tuple(tree.get("nodes_by_head", [4, 3, 2])),
+        sparse_min_head3_nodes=int(tree.get("min_head3_nodes", 1)),
+        sparse_head3_min_budget=int(tree.get("head3_min_budget", 8)),
+        sparse_head3_exploration_fraction=float(tree.get("head3_exploration_fraction", 0.10)),
+        sparse_head3_min_calibration_records=int(tree.get("head3_min_calibration_records", 1024)),
+        sparse_branch_score_temperature=float(tree.get("branch_score_temperature", 1.0)),
+        sparse_diversity_penalty=float(tree.get("diversity_penalty", 0.05)),
+        sparse_head3_quality_bins=int(tree.get("head3_quality_bins", 10)),
+        sparse_head3_node_cost=float(tree.get("head3_node_cost", 0.35)),
+        sparse_head3_quality_ema_beta=float(tree.get("head3_quality_ema_beta", 0.95)),
+        sparse_head3_top1_weight=float(quality_weights.get("top1", 0.30)),
+        sparse_head3_margin_weight=float(quality_weights.get("margin", 0.20)),
+        sparse_head3_entropy_weight=float(quality_weights.get("entropy", 0.15)),
+        sparse_head3_path_weight=float(quality_weights.get("path", 0.10)),
+        sparse_head3_acceptance_weight=float(quality_weights.get("acceptance", 0.20)),
+        sparse_head3_regret_weight=float(quality_weights.get("regret", 0.15)),
         do_sample=bool(gen.get("do_sample", True)),
         temperature=float(gen.get("temperature", 1.0)),
         top_p=float(gen.get("top_p", 0.95)),
@@ -892,7 +1013,7 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_feedback_stride=int(reflex.get("feedback_stride", 1)),
         reflex_feedback_stride_min=int(reflex.get("feedback_stride_min", 1)),
         reflex_target_topk=int(reflex.get("target_topk", 32)),
-        reflex_feedback_union_cap=int(reflex.get("feedback_union_cap", 96)),
+        reflex_feedback_union_cap=int(reflex.get("feedback_union_cap", 128)),
         reflex_tv_gate_low=float(reflex.get("tv_gate_low", 0.05)),
         reflex_tv_gate_high=float(reflex.get("tv_gate_high", 0.20)),
         reflex_horizon_weight_decay=float(reflex.get("horizon_weight_decay", 0.85)),
@@ -930,6 +1051,19 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_state_rms_clip=float(reflex.get("state_rms_clip", 2.0)),
         reflex_numerical_reset_rms=float(reflex.get("numerical_reset_rms", 2.5)),
         reflex_relative_rms_delta_base=float(reflex.get("relative_rms_delta_base", 0.01)),
+        reflex_correction_ratio_min=float(reflex.get("correction_ratio_min", 0.005)),
+        reflex_correction_ratio_max=float(reflex.get("correction_ratio_max", 0.020)),
+        reflex_min_effective_updates=float(reflex.get("min_effective_updates", 4.0)),
+        reflex_min_alignment_count=float(reflex.get("min_alignment_count", 4.0)),
+        reflex_min_state_rms=float(reflex.get("min_state_rms", 0.005)),
+        reflex_state_reference_rms=float(reflex.get("state_reference_rms", 0.03)),
+        reflex_alignment_floor=float(reflex.get("alignment_floor", 0.0)),
+        reflex_alignment_full=float(reflex.get("alignment_full", 0.10)),
+        reflex_alignment_lcb_z=float(reflex.get("alignment_lcb_z", 1.0)),
+        reflex_safety_min_probe_count=int(reflex.get("safety_min_probe_count", 128)),
+        reflex_safety_bad_probe_patience=int(reflex.get("safety_bad_probe_patience", 3)),
+        reflex_safety_ratio_decay=float(reflex.get("safety_ratio_decay", 0.5)),
+        reflex_safety_reenable_probe_interval=int(reflex.get("safety_reenable_probe_interval", 256)),
         reflex_injection_gate_mode=str(reflex.get("injection_gate_mode", "legacy")),
         reflex_horizon_delta_rule=str(reflex.get("horizon_delta_rule", "inverse_sqrt")),
         reflex_warmup_effective_updates=float(reflex.get("warmup_effective_updates", 16.0)),
@@ -939,7 +1073,11 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_guard_aal_drop_fraction=float(reflex.get("guard_aal_drop_fraction", 0.05)),
         reflex_guard_patience=int(reflex.get("guard_patience", 2)),
         reflex_guard_disable_rollouts=int(reflex.get("guard_disable_rollouts", 50)),
-        reflex_candidate_probe_interval=int(reflex.get("candidate_probe_interval", 32)),
+        reflex_candidate_probe_interval=int(
+            metrics.get("counterfactual_probe_interval", reflex.get("candidate_probe_interval", 32))
+        ),
+        reflex_counterfactual_max_sequences=int(metrics.get("counterfactual_max_sequences", 8)),
+        metrics_timing_sample_interval=int(metrics.get("timing_sample_interval", 32)),
         reflex_feedback_clip_norm=float(reflex.get("feedback_clip_norm", 2.0)),
         reflex_hidden_feedback_clip_norm=float(reflex.get("hidden_feedback_clip_norm", 0.0)),
         reflex_fast_state_clip_norm=float(reflex.get("fast_state_clip_norm", 8.0)),
@@ -1198,6 +1336,8 @@ def run_training(config: dict[str, Any]) -> None:
             sparse_ranking_margin=float(config.get("aux_update", {}).get("ranking_margin", 0.5)),
             sparse_min_expected_benefit=float(config.get("aux_update", {}).get("min_expected_benefit", 1e-3)),
             sparse_relative_rms_delta=float(reflex_cfg.get("relative_rms_delta_base", 0.02)),
+            sparse_correction_ratio_min=float(reflex_cfg.get("correction_ratio_min", 0.005)),
+            sparse_correction_ratio_max=float(reflex_cfg.get("correction_ratio_max", 0.020)),
         ),
     )
     aux_cfg = config.get("aux_update", {})
@@ -1359,7 +1499,9 @@ def run_training(config: dict[str, Any]) -> None:
         "medusa_inference_dtype": str(inference_medusa_dtype).replace("torch.", ""),
         "tree_cpeak_nodes": int(fg.get("cpeak_nodes", 64)),
         "tree_cpeak_autotune": cpeak_tuner.summary(),
-        "tree_max_nodes_per_seq": int(fg.get("max_tree_nodes_per_seq", 16)),
+        "tree_max_nodes_per_seq": int(
+            config.get("tree", {}).get("max_nodes_per_seq", fg.get("max_tree_nodes_per_seq", 16))
+        ),
         "tree_project_internal_logits_only": bool(fg.get("project_internal_tree_logits_only", True)),
         "tree_inplace_kv_compaction": bool(fg.get("inplace_kv_compaction", True)),
         "reflex_enabled": bool(reflex_enabled),
@@ -1413,6 +1555,8 @@ def run_training(config: dict[str, Any]) -> None:
     total_aux_optimizer_steps = 0
     total_aux_records_used = 0
     total_sparse_aux_updates = 0
+    total_head3_aux_records_used = 0
+    total_head3_aux_optimizer_steps = 0
     max_aux_overhead_fraction = 0.0
     total_online_ce_updates = 0
     total_online_ce_tokens = 0
@@ -1431,6 +1575,12 @@ def run_training(config: dict[str, Any]) -> None:
     sparse_record_budget = max(1, int(aux_cfg.get("records_per_update", 512)))
     sparse_min_records = max(1, int(aux_cfg.get("min_records_per_update", 64)))
     sparse_head_budget = max(1, int(aux_cfg.get("max_heads_per_update", 2)))
+    sparse_min_records_per_head = max(
+        1, int(aux_cfg.get("min_records_per_selected_head", sparse_min_records))
+    )
+    sparse_head_sampling_weights = [
+        float(value) for value in aux_cfg.get("head_sampling_weights", [1.0, 1.0, 1.25])
+    ]
     sparse_policy_interval = 1
     sparse_next_allowed_policy_version = sparse_policy_version + 1
     sparse_rollout_time_ema = 0.0
@@ -1620,6 +1770,8 @@ def run_training(config: dict[str, Any]) -> None:
                         max_heads_per_update=sparse_head_budget,
                         optimizer_steps=max(1, int(aux_cfg.get("optimizer_steps", 1))),
                         all_heads=slow_refresh,
+                        min_records_per_selected_head=sparse_min_records_per_head,
+                        head_sampling_weights=sparse_head_sampling_weights,
                     )
                     head_stats.update(sparse_stats)
                     update_time = float(sparse_stats.get("head_update_time", 0.0) or 0.0)
@@ -1635,6 +1787,12 @@ def run_training(config: dict[str, Any]) -> None:
                         sparse_stats.get("aux_optimizer_steps", 0) or 0
                     )
                     total_aux_records_used += int(sparse_stats.get("aux_records_used", 0) or 0)
+                    total_head3_aux_records_used += int(
+                        sparse_stats.get("head3_aux_records_used", 0) or 0
+                    )
+                    total_head3_aux_optimizer_steps += int(
+                        sparse_stats.get("head3_aux_optimizer_steps", 0) or 0
+                    )
                     total_sparse_aux_updates += int(head_stats["aux_update_performed"])
                     max_aux_overhead_fraction = max(
                         max_aux_overhead_fraction,
@@ -1768,6 +1926,13 @@ def run_training(config: dict[str, Any]) -> None:
                 "tree_verify_time": outputs.get("tree_verify_time_cost", 0.0),
                 "cache_update_time": outputs.get("cache_update_time_cost", 0.0),
                 "medusa_head_time": outputs.get("medusa_head_time_cost", 0.0),
+                "sampled_medusa_head_cuda_time_s": outputs.get(
+                    "sampled_medusa_head_cuda_time_s", 0.0
+                ),
+                "sampled_tree_verify_cuda_time_s": outputs.get(
+                    "sampled_tree_verify_cuda_time_s", 0.0
+                ),
+                "timing_sample_count": outputs.get("timing_sample_count", 0),
                 "draft_time": outputs.get("draft_time_cost", 0.0),
                 "tokens_per_sec_generation": sum(token_lengths) / max(outputs["total_time_cost"], 1e-9),
                 "average_accept_length": outputs["average_accept_length"],
@@ -1780,6 +1945,12 @@ def run_training(config: dict[str, Any]) -> None:
                 "correction_tokens": outputs.get("total_correction_tokens", 0),
                 "correction_token_rate": outputs.get("correction_token_rate", 0.0),
                 "tree_nodes_per_seq": outputs["average_tree_nodes_per_seq"],
+                "tree_active_heads": outputs.get("tree_active_heads", 0),
+                "tree_nodes_head1": outputs.get("tree_nodes_head1", 0),
+                "tree_nodes_head2": outputs.get("tree_nodes_head2", 0),
+                "tree_nodes_head3": outputs.get("tree_nodes_head3", 0),
+                "tree_total_nodes": outputs.get("tree_total_nodes", 0),
+                "tree_budget_unused": outputs.get("tree_budget_unused", 0),
                 "cpeak_nodes": int(cpeak_for_batch),
                 "cpeak_tuning": bool(cpeak_tuning),
                 "cpeak_selected": cpeak_tuner.selected,
@@ -1800,6 +1971,9 @@ def run_training(config: dict[str, Any]) -> None:
                 "aux_parameter_delta_rms": head_stats.get("aux_parameter_delta_rms", 0.0),
                 "aux_overhead_fraction": head_stats.get("aux_overhead_fraction", 0.0),
                 "aux_selected_heads": head_stats.get("aux_selected_heads", []),
+                "aux_records_used_by_head": head_stats.get("aux_records_used_by_head", {}),
+                "head3_aux_records_used": head_stats.get("head3_aux_records_used", 0),
+                "head3_aux_optimizer_steps": head_stats.get("head3_aux_optimizer_steps", 0),
                 "aux_expected_benefit": head_stats.get("aux_expected_benefit", 0.0),
                 "aux_budget_throttled": head_stats.get("aux_budget_throttled", False),
                 "aux_record_budget": sparse_record_budget,
@@ -2095,6 +2269,8 @@ def run_training(config: dict[str, Any]) -> None:
         "total_sparse_aux_updates": int(total_sparse_aux_updates),
         "total_aux_optimizer_steps": int(total_aux_optimizer_steps),
         "total_aux_records_used": int(total_aux_records_used),
+        "total_head3_aux_records_used": int(total_head3_aux_records_used),
+        "total_head3_aux_optimizer_steps": int(total_head3_aux_optimizer_steps),
         "max_aux_overhead_fraction": float(max_aux_overhead_fraction),
         "medusa_update_mode": medusa_update_mode,
         "total_online_ce_updates": int(total_online_ce_updates),

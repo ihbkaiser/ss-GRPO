@@ -10,6 +10,15 @@ The two resolved configs differ only in `method`, `run_name`, and
 exact-target verification, sparse verifier feedback, per-head fast-state update,
 predictive-trust update, and sparse auxiliary-head scheduler.
 
+## Sparse asymmetric tree
+
+The canonical budget-10 tree allocates one target root plus `[4, 3, 2]` nodes
+to MEDUSA Heads 1-3. Head-2 and Head-3 paths are selected globally by cumulative
+path score instead of densely expanding every parent. A calibrated Head-3 gate
+uses confidence, margin, entropy, path score, acceptance history, and candidate
+regret. Rejected Head-3 slots are returned to Head 2; deterministic exploration
+continues to collect Head-3 calibration data.
+
 ## Rollout feedback
 
 Each MEDUSA horizon owns a state `m[t, k]`. Proposal records remain on GPU and
@@ -26,21 +35,26 @@ candidate-coverage correction. Error TV and missing target mass determine the
 EMA update severity. Every update is RMS-normalized, then the resulting state
 is projected to `RMS(m) <= 1`.
 
-Predictive trust is the positive alignment EMA between the saved state sketch
-and the matured verifier innovation sketch, multiplied by
-`n / (n + trust_n0)`. The proposal correction is capped by
-`relative_rms_delta_base`, so it cannot alter target sampling or exact
-verification.
+Injection is eligible only after enough effective updates and proposal-time
+alignment observations, with a positive alignment lower confidence bound. The
+state supplies direction only. A calibrated confidence chooses a target
+correction ratio in `[0.5%, 2%]` of hidden RMS, and the correction is projected
+to that exact ratio. Sampled raw/effective counterfactual probes drive a
+per-head safety controller; target sampling and exact verification are never
+changed.
 
 ## Auxiliary update order
 
 The target policy is updated first. The first rollout under that new policy
-caches at most 512 sparse records, then performs one optimizer step on at most
-two MEDUSA heads with the worst target-candidate coverage. This update never
+caches at most 512 sparse records, then performs one optimizer step on selected
+MEDUSA heads using candidate regret, restricted KL, and acceptance degradation.
+Each selected head receives a minimum quota, and Head 3 is force-included when
+it has enough records. This update never
 forwards the target backbone and never builds full-vocabulary auxiliary logits.
 
 The logged fields include `aux_update_time`, `aux_optimizer_steps`,
-`aux_records_used`, `aux_parameter_delta_rms`, and `aux_overhead_fraction`. If
+`aux_records_used_by_head`, `head3_aux_records_used`,
+`aux_parameter_delta_rms`, and `aux_overhead_fraction`. If
 the update exceeds one percent of rolling rollout time, the scheduler reduces
 the record/head budget and increases the policy-version interval.
 

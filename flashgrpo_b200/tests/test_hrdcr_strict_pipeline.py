@@ -62,6 +62,8 @@ def test_fast_state_projection_and_predictive_trust_are_exact():
         half_life_tokens=8,
         alignment_beta=0.9,
         trust_n0=4.0,
+        min_effective_updates=0,
+        min_alignment_count=1,
     )
     feedback = torch.full((1, 1, 4), 100.0)
     manager.advance_token(
@@ -74,7 +76,7 @@ def test_fast_state_projection_and_predictive_trust_are_exact():
     )
     state_rms = manager.states.square().mean(dim=-1).sqrt()
     assert float(state_rms.max()) <= 1.0 + 1e-6
-    assert torch.allclose(manager.trust([0]), torch.tensor([[0.2]]), atol=1e-6)
+    assert torch.allclose(manager.trust([0]), torch.tensor([[1.0]]), atol=1e-6)
 
 
 def test_strict_injection_preserves_state_magnitude_and_relative_rms_cap():
@@ -92,6 +94,9 @@ def test_strict_injection_preserves_state_magnitude_and_relative_rms_cap():
             reflex_proposal_injection_enabled=True,
             reflex_proposal_injection_scale=1.0,
             reflex_relative_rms_delta_base=0.02,
+            reflex_min_effective_updates=0,
+            reflex_correction_ratio_min=0.005,
+            reflex_correction_ratio_max=0.02,
         ),
     )
     base = torch.randn(2, hidden)
@@ -100,7 +105,7 @@ def test_strict_injection_preserves_state_magnitude_and_relative_rms_cap():
         base, state, torch.ones(2), 0, 0, torch.ones(2)
     )
     ratio = (corrected - base).square().mean(dim=-1).sqrt() / base.square().mean(dim=-1).sqrt()
-    assert torch.allclose(ratio, torch.full_like(ratio, 0.01), atol=2e-6)
+    assert torch.allclose(ratio, torch.full_like(ratio, 0.02), atol=2e-6)
     assert bool((ratio <= 0.02 + 1e-6).all())
 
 
@@ -139,7 +144,11 @@ def test_sparse_auxiliary_update_never_backprops_into_target():
     before_head_0 = [parameter.detach().clone() for parameter in heads.heads[0].parameters()]
     before_head_1 = [parameter.detach().clone() for parameter in heads.heads[1].parameters()]
     stats = trainer.update_sparse_online(
-        records, records_per_update=8, max_heads_per_update=1, optimizer_steps=1
+        records,
+        records_per_update=8,
+        max_heads_per_update=1,
+        optimizer_steps=1,
+        min_records_per_selected_head=1,
     )
     assert stats["aux_selected_heads"] == [1]
     assert stats["aux_optimizer_steps"] == 1
