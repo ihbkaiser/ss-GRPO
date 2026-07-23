@@ -13,11 +13,110 @@ model:
 training:
   batch_size: 8
   accumulation_steps: 4
+  max_training_token: 4096
+  max_training_padding_gap: 4096
+  logps_chunk_size: 512
   saved_model_dir: outputs/train/qwen25_3b/{run_name}/target_lora
   saved_medusa_dir: outputs/train/qwen25_3b/{run_name}/medusa_heads
 
 flashgrpo:
   medusa_heads_checkpoint: outputs/pretrain/qwen25_3b
+  require_pretrained_heads: true
+  allow_random_init: false
+  cpeak_nodes: 512
+  max_tree_nodes_per_seq: 10
+  auto_tune_cpeak_enabled: false
+
+tree:
+  nodes_by_head: [5, 4, 0]
+  max_nodes_per_seq: 10
+  head3_exploration_fraction: 0.005
+  head3_warmup_exploration_fraction: 0.02
+  head3_warmup_records: 2048
+  head3_min_calibration_records: 2048
+  head3_node_cost: 0.50
+
+reflex:
+  proposal_injection_scale: 1.10
+  min_state_rms: 0.003
+  state_reference_rms: 0.025
+  alignment_floor: 0.0
+  alignment_full: 0.06
+  alignment_lcb_z: 0.60
+  half_life_tokens: 48
+
+  distribution_weight: 0.15
+  coverage_feedback_weight: 1.25
+  boundary_width: 4
+  severity_tv_weight: 0.30
+  severity_out_weight: 0.70
+  severity_min: 0.03
+  sparse_boundary_margin: 0.15
+  feedback_stride: 4
+
+  head1:
+    enabled_at_start: true
+    min_effective_updates: 1
+    min_alignment_count: 4
+    correction_ratio_min: 0.011
+    correction_ratio_max: 0.028
+    state_ema_decay: 0.83
+
+  head2:
+    enabled_at_start: true
+    collect_feedback_when_disabled: true
+    min_effective_updates: 2
+    min_alignment_count: 12
+    correction_ratio_min: 0.004
+    correction_ratio_max: 0.011
+    state_ema_decay: 0.89
+
+  head3:
+    enabled_at_start: false
+    collect_feedback_when_disabled: true
+    min_effective_updates: 4
+    min_alignment_count: 32
+    correction_ratio_min: 0.003
+    correction_ratio_max: 0.006
+    state_ema_decay: 0.95
+
+reflex_safety:
+  min_probe_count: 128
+  candidate_mass_deadband: 0.0005
+  net_win_rate_deadband: 0.002
+  bad_windows_before_decay: 1
+  good_windows_before_recovery: 2
+  decay_factor: 0.50
+  recovery_factor: 1.25
+  minimum_active_ratio: 0.05
+  disabled_head_recovery_probe_interval: 128
+
+aux_update:
+  learning_rate: 7.0e-5
+  records_per_update: 256
+  min_records_per_update: 128
+  min_records_per_selected_head: 64
+  max_heads_per_update: 1
+  min_rollouts_between_updates: 8
+  max_overhead_fraction: 0.020
+  head_sampling_weights: [2.0, 1.0, 0.10]
+  optimizer_steps: 1
+  max_cached_records: 4096
+  cache_stride: 4
+  reflex_record_microbatch_size: 128
+
+aux_loss:
+  raw_kl_weight: 1.0
+  effective_kl_weight: 0.10
+  coverage_weight: 1.50
+  proximal_weight: 0.02
+  ranking_margin: 0.20
+  temperature: 1.0
+
+metrics:
+  counterfactual_probe_interval: 128
+  counterfactual_max_sequences: 8
+  timing_sample_interval: 32
 
 logging:
   log_dir: logs/flashgrpo_b200/qwen25_3b/train/{run_name}
