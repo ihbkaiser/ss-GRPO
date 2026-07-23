@@ -23,7 +23,7 @@ for mode in disabled delayed immediate; do
   ACCUMULATION_STEPS=1000000 \
   DO_SAMPLE=false \
   REPEATED_GENERATE_NUMS=1 \
-  CPEAK_NODES="${CPEAK_NODES:-128}" \
+  CPEAK_NODES="${CPEAK_NODES:-512}" \
   TRACE_WINDOW_TOKENS="${TRACE_WINDOW_TOKENS:-32}" \
   RUN_ID="$mode" \
   RUN_ROOT="$experiment_root/$mode" \

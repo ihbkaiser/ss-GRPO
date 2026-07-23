@@ -51,7 +51,7 @@ python flashgrpo_b200/scripts/train_flashgrpo_b200.py \
   --set "generation.do_sample=${DO_SAMPLE:-true}" \
   --set "generation.repeated_generate_nums=${REPEATED_GENERATE_NUMS:-8}" \
   --set "flashgrpo.auto_tune_cpeak_enabled=false" \
-  --set "flashgrpo.cpeak_nodes=${CPEAK_NODES:-128}" \
+  --set "flashgrpo.cpeak_nodes=${CPEAK_NODES:-512}" \
   --set "reflex.adaptation_mode=$adaptation_mode" \
   --set "reflex.feedback_stride=1" \
   --set "reflex.feedback_stride_min=1" \

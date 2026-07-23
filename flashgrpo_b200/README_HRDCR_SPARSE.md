@@ -1,65 +1,76 @@
 # Strict HRDCR on B200
 
-The canonical training path is defined by:
+Canonical configs:
 
 - `configs/<model>/train_hrdcr.yaml`
 - `configs/<model>/train_medusa_only.yaml`
 
-The two resolved configs differ only in `method`, `run_name`, and
-`reflex.proposal_injection_enabled`. Both variants execute the same MEDUSA tree,
-exact-target verification, sparse verifier feedback, per-head fast-state update,
-predictive-trust update, and sparse auxiliary-head scheduler.
+Both modes use the same prompts, seed, sampling parameters, target verifier,
+maximum 10-node tree, `cpeak_nodes=512`, and GRPO workload. `medusa_only` is a
+lean static-head baseline: HRDCR feedback/injection and sparse auxiliary
+training are disabled rather than left running as hidden baseline overhead.
 
-## Sparse asymmetric tree
+## Head-specific HRDCR
 
-The canonical budget-10 tree allocates one target root plus `[4, 3, 2]` nodes
-to MEDUSA Heads 1-3. Head-2 and Head-3 paths are selected globally by cumulative
-path score instead of densely expanding every parent. A calibrated Head-3 gate
-uses confidence, margin, entropy, path score, acceptance history, and candidate
-regret. Rejected Head-3 slots are returned to Head 2; deterministic exploration
-continues to collect Head-3 calibration data.
+Each MEDUSA horizon owns a delayed-credit state `m[t,k]`. Head 1 starts enabled
+with a 1-3% hidden-RMS trust region. Heads 2 and 3 collect verifier feedback
+while injection remains disabled. They are enabled only after counterfactual
+candidate-mass gain, net wins, alignment confidence, and (for Head 3)
+conditional path acceptance provide enough positive evidence.
 
-## Rollout feedback
+The proposal-time record stores the state direction and the exact applied
+correction/safety ratios. A cheap sparse boundary check compares one important
+omitted target token with the current candidate boundary. It cancels a harmful
+correction or rescales a helpful one once, without a second full-vocabulary
+projection. Target sampling and exact-target verification are unchanged.
 
-Each MEDUSA horizon owns a state `m[t, k]`. Proposal records remain on GPU and
-contain proposal top-L IDs, the actual tree candidates, corrected proposal
-hidden, anchor hidden, and a rank-24 sketch of the proposal-time state.
+## Dynamic 10-node tree
 
-At maturity, the support is:
+The root counts toward the budget. Layouts are:
 
-`TopL(proposal) union TopM(target) union {actual target token}`.
+- default: `[5,4,0]`
+- Head 2 unreliable: `[6,3,0]`
+- Head 3 useful: `[4,4,1]`
+- Head 3 strongly useful: `[4,3,2]`
 
-Target and proposal probabilities are normalized on this same support. The
-state innovation combines the negative restricted-KL gradient with a soft
-candidate-coverage correction. Error TV and missing target mass determine the
-EMA update severity. Every update is RMS-normalized, then the resulting state
-is projected to `RMS(m) <= 1`.
+Head-3 exploration reallocates the same ten nodes. It runs for 10% of eligible
+warmup rounds and 3% after 1024 mature Head-3 path records. Head-3 utility is
+measured as acceptance conditioned on its Head-1/2 parent path being accepted.
 
-Injection is eligible only after enough effective updates and proposal-time
-alignment observations, with a positive alignment lower confidence bound. The
-state supplies direction only. A calibrated confidence chooses a target
-correction ratio in `[0.5%, 2%]` of hidden RMS, and the correction is projected
-to that exact ratio. Sampled raw/effective counterfactual probes drive a
-per-head safety controller; target sampling and exact verification are never
-changed.
+## Sparse auxiliary learner
 
-## Auxiliary update order
+Verifier records are retained independently of GRPO reward variance and policy
+optimizer steps. An update requires at least 256 cached mature records, eight
+rollouts since the previous update, and one head with at least 64 records.
+Records are ranked before truncation; the default 256-record budget is focused
+on the highest-utility eligible head.
 
-The target policy is updated first. The first rollout under that new policy
-caches at most 512 sparse records, then performs one optimizer step on selected
-MEDUSA heads using candidate regret, restricted KL, and acceptance degradation.
-Each selected head receives a minimum quota, and Head 3 is force-included when
-it has enough records. This update never
-forwards the target backbone and never builds full-vocabulary auxiliary logits.
+The persistent objective is:
 
-The logged fields include `aux_update_time`, `aux_optimizer_steps`,
-`aux_records_used_by_head`, `head3_aux_records_used`,
-`aux_parameter_delta_rms`, and `aux_overhead_fraction`. If
-the update exceeds one percent of rolling rollout time, the scheduler reduces
-the record/head budget and increases the policy-version interval.
+```text
+1.00 * raw restricted KL
++ 0.25 * effective restricted KL
++ 1.00 * omitted-token boundary ranking
++ 0.01 * proximal penalty
+```
 
-## Fair ablation
+The effective proposal is reconstructed from proposal-time correction
+metadata, never from current trust. No target-backbone forward or
+full-vocabulary auxiliary distribution is added.
 
-`medusa_only` disables only proposal injection. It deliberately keeps all
-feedback and auxiliary work enabled, so its runtime is a valid control for the
-benefit of the HRDCR correction itself.
+Auxiliary overhead uses recent successful-update history. It needs two
+consecutive expensive updates before throttling and four inexpensive updates
+before recovering. Insufficient records postpone the update and remain in the
+bounded reservoir.
+
+## Metrics
+
+Rollout logs include active and conditional correction ratios, candidate-set
+change and mass gain, counterfactual net wins, conditional Head-3 acceptance,
+actual tree layouts, per-head cached/used records, auxiliary loss components,
+successful optimizer steps, zero-variance reward groups, and auxiliary updates
+that happened without a target-policy update.
+
+The requested 15% throughput gain is an experimental target. It must be
+measured with paired runs on the same B200; metrics and verifier work are not
+altered to manufacture that result.

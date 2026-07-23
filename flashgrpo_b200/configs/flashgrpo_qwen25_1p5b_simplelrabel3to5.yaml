@@ -90,7 +90,7 @@ flashgrpo:
   cache_update_mode: extract_path
   allow_recompute_fallback: true
   clone_tree_cache: true
-  cpeak_nodes: 128
+  cpeak_nodes: 512
   min_tree_nodes_per_seq: 1
   max_tree_nodes_per_seq: 24
   max_tree_depth: 4

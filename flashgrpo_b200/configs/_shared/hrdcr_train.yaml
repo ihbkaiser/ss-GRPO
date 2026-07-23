@@ -32,8 +32,8 @@ training:
   target_lr: 1.0e-6
   beta: 0.04
   epsilon: 0.1
-  max_training_padding_gap: 1024
-  max_training_token: 8192
+  max_training_padding_gap: 4096
+  max_training_token: 4096
   logps_chunk_size: 512
   load_lora_path: ""
   save_steps: 10
@@ -54,8 +54,8 @@ flashgrpo:
   adaptive_tree_enabled: false
   online_medusa: true
   medusa_update_mode: sparse_online
-  medusa_lr: 1.0e-5
-  cpeak_nodes: 128
+  medusa_lr: 5.0e-5
+  cpeak_nodes: 512
   auto_tune_cpeak_enabled: false
   auto_tune_cpeak_candidates: [128, 192, 256, 384, 512, 768]
   auto_tune_cpeak_trials_per_candidate: 3
@@ -74,10 +74,12 @@ flashgrpo:
 tree:
   mode: sparse_asymmetric
   max_nodes_per_seq: 10
-  nodes_by_head: [4, 3, 2]
-  min_head3_nodes: 1
+  nodes_by_head: [5, 4, 0]
+  min_head3_nodes: 0
   head3_min_budget: 8
-  head3_exploration_fraction: 0.10
+  head3_exploration_fraction: 0.03
+  head3_warmup_exploration_fraction: 0.10
+  head3_warmup_records: 1024
   head3_min_calibration_records: 1024
   branch_score_temperature: 1.0
   diversity_penalty: 0.05
@@ -130,10 +132,9 @@ reflex:
   alignment_floor: 0.0
   alignment_full: 0.10
   alignment_lcb_z: 1.0
-  safety_min_probe_count: 128
-  safety_bad_probe_patience: 3
-  safety_ratio_decay: 0.5
-  safety_reenable_probe_interval: 256
+  dynamic_tree_enabled: true
+  sparse_boundary_check_enabled: true
+  sparse_boundary_margin: 0.20
   horizon_delta_rule: constant
   warmup_effective_updates: 0.0
   magnitude_gate_floor: 0.0
@@ -158,41 +159,90 @@ reflex:
   utility_scheduler_enabled: false
   motivation_trace_enabled: false
 
+  head1:
+    enabled_at_start: true
+    min_effective_updates: 2
+    min_alignment_count: 8
+    correction_ratio_min: 0.010
+    correction_ratio_max: 0.030
+    state_ema_decay: 0.85
+
+  head2:
+    enabled_at_start: false
+    collect_feedback_when_disabled: true
+    min_effective_updates: 4
+    min_alignment_count: 32
+    correction_ratio_min: 0.005
+    correction_ratio_max: 0.015
+    state_ema_decay: 0.90
+
+  head3:
+    enabled_at_start: false
+    collect_feedback_when_disabled: true
+    min_effective_updates: 4
+    min_alignment_count: 64
+    correction_ratio_min: 0.005
+    correction_ratio_max: 0.010
+    state_ema_decay: 0.95
+
+reflex_safety:
+  min_probe_count: 512
+  candidate_mass_deadband: 0.0001
+  net_win_rate_deadband: 0.0005
+  bad_windows_before_decay: 2
+  good_windows_before_recovery: 3
+  decay_factor: 0.50
+  recovery_factor: 1.25
+  minimum_active_ratio: 0.125
+  disabled_head_recovery_probe_interval: 512
+
 persistent_memory:
   enabled: false
 
 aux_update:
   enabled: true
   mode: sparse_online
-  records_per_update: 512
-  min_records_per_update: 64
+  records_per_update: 256
+  min_records_per_update: 128
   min_records_per_selected_head: 64
-  head_sampling_weights: [1.0, 1.0, 1.25]
+  max_heads_per_update: 1
+  learning_rate: 5.0e-5
+  max_grad_norm: 1.0
+  min_rollouts_between_updates: 8
+  max_overhead_fraction: 0.015
+  head_sampling_weights: [1.0, 1.0, 1.0]
   optimizer_steps: 1
-  max_heads_per_update: 3
-  max_cached_records: 2048
+  max_cached_records: 4096
   reflex_cache_enabled: true
   cache_stride: 1
 
   sparse_support_cap: 48
   target_topk: 16
   proposal_topk: 16
-  kl_weight: 0.25
-  coverage_weight: 1.0
-  proximal_weight: 0.05
-  ranking_margin: 0.5
   min_expected_benefit: 0.001
   reflex_record_microbatch_size: 128
 
-  full_refresh_every: 100
-  full_refresh_max_tokens: 2048
-  max_overhead_fraction: 0.01
+  overhead_scheduler:
+    warmup_updates: 3
+    consecutive_bad_updates_before_throttle: 2
+    consecutive_good_updates_before_recovery: 4
+    throttle_factor: 0.75
+    recovery_factor: 1.20
+    minimum_record_budget: 128
 
   update_backbone: false
   update_lm_head: false
   update_fast_state_injections: false
   update_feedback_projection: false
   update_updater: false
+
+aux_loss:
+  raw_kl_weight: 1.0
+  effective_kl_weight: 0.25
+  coverage_weight: 1.0
+  proximal_weight: 0.01
+  ranking_margin: 0.20
+  temperature: 1.0
 
 checkpoint:
   save_aux_every_grpo_iters: 100
@@ -204,6 +254,6 @@ logging:
   statistical_time: false
 
 metrics:
-  counterfactual_probe_interval: 64
+  counterfactual_probe_interval: 256
   counterfactual_max_sequences: 8
   timing_sample_interval: 32

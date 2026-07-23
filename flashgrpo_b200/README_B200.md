@@ -12,7 +12,7 @@ Canonical B200 defaults:
 - effective prompt-group batch is 32 by default (`16x2` for 1.5B and `8x4`
   for 4B-8B models);
 - GRPO training token budget is `max_training_token: 8192`;
-- the throughput-first tree budget is `cpeak_nodes: 128` with at most 10 nodes
+- the throughput-first tree budget is `cpeak_nodes: 512` with at most 10 nodes
   per sequence; the first 18 rollout batches test six hardware budgets and
   lock the one with the best median output-token throughput;
 - tree masks are built in batched operations, target vocabulary projection is

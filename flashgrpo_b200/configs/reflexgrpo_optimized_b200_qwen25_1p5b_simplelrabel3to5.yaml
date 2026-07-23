@@ -25,7 +25,7 @@ flashgrpo:
   medusa_heads_checkpoint: outputs/flashgrpo_b200_medusa_sharegpt_qwen25_1p5b
   # B200 can carry a wider speculative tree. With batch_size=16 and
   # repeated_generate_nums=8, active concurrency starts around 128.
-  cpeak_nodes: 768
+  cpeak_nodes: 512
   max_tree_nodes_per_seq: 32
   fixed_tree_topk_by_depth: [4, 3, 2]
   head_dtype: fp32

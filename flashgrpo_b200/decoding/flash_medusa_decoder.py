@@ -57,15 +57,17 @@ class FlashMedusaConfig:
     acceptance: str = "exact_target"
     cache_update_mode: str = "extract_path"
     allow_recompute_fallback: bool = True
-    cpeak_nodes: int = 64
+    cpeak_nodes: int = 512
     min_tree_nodes_per_seq: int = 1
-    max_tree_nodes_per_seq: int = 16
+    max_tree_nodes_per_seq: int = 10
     max_tree_depth: int = 4
     fixed_tree_topk_by_depth: tuple[int, ...] = (4, 3, 2)
-    sparse_nodes_by_head: tuple[int, ...] = (4, 3, 2)
-    sparse_min_head3_nodes: int = 1
+    sparse_nodes_by_head: tuple[int, ...] = (5, 4, 0)
+    sparse_min_head3_nodes: int = 0
     sparse_head3_min_budget: int = 8
-    sparse_head3_exploration_fraction: float = 0.10
+    sparse_head3_exploration_fraction: float = 0.03
+    sparse_head3_warmup_exploration_fraction: float = 0.10
+    sparse_head3_warmup_records: int = 1024
     sparse_head3_min_calibration_records: int = 1024
     sparse_branch_score_temperature: float = 1.0
     sparse_diversity_penalty: float = 0.05
@@ -154,10 +156,24 @@ class FlashMedusaConfig:
     reflex_alignment_floor: float = 0.0
     reflex_alignment_full: float = 0.10
     reflex_alignment_lcb_z: float = 1.0
-    reflex_safety_min_probe_count: int = 128
-    reflex_safety_bad_probe_patience: int = 3
+    reflex_safety_min_probe_count: int = 512
+    reflex_safety_bad_probe_patience: int = 2
     reflex_safety_ratio_decay: float = 0.5
-    reflex_safety_reenable_probe_interval: int = 256
+    reflex_safety_reenable_probe_interval: int = 512
+    reflex_state_ema_decay_by_head: tuple[float, ...] = (0.85, 0.90, 0.95)
+    reflex_enabled_at_start_by_head: tuple[bool, ...] = (True, False, False)
+    reflex_min_effective_updates_by_head: tuple[float, ...] = (2.0, 4.0, 4.0)
+    reflex_min_alignment_count_by_head: tuple[float, ...] = (8.0, 32.0, 64.0)
+    reflex_correction_ratio_min_by_head: tuple[float, ...] = (0.010, 0.005, 0.005)
+    reflex_correction_ratio_max_by_head: tuple[float, ...] = (0.030, 0.015, 0.010)
+    reflex_safety_candidate_mass_deadband: float = 0.0001
+    reflex_safety_net_win_rate_deadband: float = 0.0005
+    reflex_safety_good_probe_patience: int = 3
+    reflex_safety_recovery_factor: float = 1.25
+    reflex_safety_minimum_active_ratio: float = 0.125
+    reflex_dynamic_tree_enabled: bool = True
+    reflex_sparse_boundary_check_enabled: bool = True
+    reflex_sparse_boundary_margin: float = 0.20
     reflex_injection_gate_mode: str = "legacy"
     reflex_horizon_delta_rule: str = "inverse_sqrt"
     reflex_warmup_effective_updates: float = 16.0
@@ -167,7 +183,7 @@ class FlashMedusaConfig:
     reflex_guard_aal_drop_fraction: float = 0.05
     reflex_guard_patience: int = 2
     reflex_guard_disable_rollouts: int = 50
-    reflex_candidate_probe_interval: int = 32
+    reflex_candidate_probe_interval: int = 256
     reflex_counterfactual_max_sequences: int = 8
     metrics_timing_sample_interval: int = 32
     reflex_feedback_clip_norm: float = 2.0
@@ -240,11 +256,87 @@ class FlashMedusaDecoder:
         self._reflex_guard_bad_windows = 0
         self._reflex_guard_disabled_until = -1
 
-    def reset_verification_utility_scheduler(self) -> None:
-        """Forget proposal utility after auxiliary-head parameters change."""
+    def reset_verification_utility_scheduler(
+        self,
+        selected_heads: list[int] | None = None,
+    ) -> None:
+        """Reset changed proposal utility while preserving unrelated Head-3 evidence.
+
+        ``selected_heads`` uses zero-based MEDUSA head indices.
+        """
 
         self._verification_utility_scheduler = None
-        self._hrdcr_safety_state = None
+        if (
+            self._head3_quality_calibrator is not None
+            and (selected_heads is None or 2 in selected_heads)
+        ):
+            self._head3_quality_calibrator.decay_evidence(0.5)
+
+    @torch.no_grad()
+    def notify_hrdcr_auxiliary_update(
+        self,
+        selected_heads: list[int],
+        *,
+        evidence_decay: float = 0.5,
+    ) -> None:
+        """Down-weight, but never erase, safety evidence for updated heads."""
+
+        state = self._hrdcr_safety_state
+        if not state or not selected_heads:
+            return
+        head_indices = sorted(
+            {
+                int(head) - 1
+                for head in selected_heads
+                if 1 <= int(head) <= int(self.config.num_medusa_heads)
+            }
+        )
+        if not head_indices:
+            return
+        sample = next(
+            (value for value in state.values() if torch.is_tensor(value)),
+            None,
+        )
+        if sample is None:
+            return
+        index = torch.as_tensor(
+            head_indices, device=sample.device, dtype=torch.long
+        )
+        decay = min(1.0, max(0.0, float(evidence_decay)))
+        for name in (
+            "safety_mass_gain_sum",
+            "safety_mass_gain_sq_sum",
+            "safety_net_win_sum",
+            "safety_net_win_sq_sum",
+            "safety_alignment_sum",
+            "safety_alignment_sq_sum",
+        ):
+            value = state.get(name)
+            if torch.is_tensor(value):
+                value.index_copy_(
+                    0,
+                    index.to(value.device),
+                    value.index_select(0, index.to(value.device)) * decay,
+                )
+        for name in (
+            "safety_probe_count",
+            "safety_alignment_count",
+        ):
+            value = state.get(name)
+            if torch.is_tensor(value):
+                scaled = torch.floor(
+                    value.index_select(0, index.to(value.device)).float()
+                    * decay
+                ).to(dtype=value.dtype)
+                value.index_copy_(0, index.to(value.device), scaled)
+        for name in (
+            "safety_fresh_probe_count",
+            "safety_bad_windows",
+            "safety_good_windows",
+        ):
+            value = state.get(name)
+            if torch.is_tensor(value):
+                value.index_fill_(0, index.to(value.device), 0)
 
     def _get_head3_quality_calibrator(self) -> Head3QualityCalibrator | None:
         cfg = self.config
@@ -382,6 +474,10 @@ class FlashMedusaDecoder:
             "warm_gate_sum": torch.zeros((), device=device, dtype=torch.float32),
             "correction_rms_sum": torch.zeros((), device=device, dtype=torch.float32),
             "correction_ratio_sum": torch.zeros((), device=device, dtype=torch.float32),
+            "active_correction_ratio_sum": torch.zeros(
+                (), device=device, dtype=torch.float32
+            ),
+            "active_injections": torch.zeros((), device=device, dtype=torch.long),
             "correction_observations": torch.zeros((), device=device, dtype=torch.long),
             "reflex_total_time": 0.0,
         }
@@ -401,19 +497,30 @@ class FlashMedusaDecoder:
                 "warm_gate": 0.0,
                 "correction_rms": 0.0,
                 "correction_to_hidden_rms_ratio": 0.0,
+                "active_injection_fraction": 0.0,
+                "conditional_correction_to_hidden_rms_ratio": 0.0,
+                "unconditional_correction_to_hidden_rms_ratio": 0.0,
                 "correction_observations": 0.0,
                 "reflex_total_time": 0.0,
             }
         observations = max(int(stats["correction_observations"].detach().cpu()), 1)
+        active = max(int(stats["active_injections"].detach().cpu()), 1)
+        unconditional_ratio = float(stats["correction_ratio_sum"].detach().cpu()) / observations
+        conditional_ratio = (
+            float(stats["active_correction_ratio_sum"].detach().cpu()) / active
+        )
         return {
             "raw_fast_state_rms": float(stats["raw_fast_state_rms_sum"].detach().cpu()) / observations,
             "hint_trust": float(stats["hint_trust_sum"].detach().cpu()) / observations,
             "warm_gate": float(stats["warm_gate_sum"].detach().cpu()) / observations,
             "correction_rms": float(stats["correction_rms_sum"].detach().cpu()) / observations,
-            "correction_to_hidden_rms_ratio": float(
-                stats["correction_ratio_sum"].detach().cpu()
+            "correction_to_hidden_rms_ratio": unconditional_ratio,
+            "active_injection_fraction": float(
+                stats["active_injections"].detach().cpu()
             )
             / observations,
+            "conditional_correction_to_hidden_rms_ratio": conditional_ratio,
+            "unconditional_correction_to_hidden_rms_ratio": unconditional_ratio,
             "correction_observations": float(
                 stats["correction_observations"].detach().cpu()
             ),
@@ -524,6 +631,7 @@ class FlashMedusaDecoder:
             "persistent_memory_gate_mean": float(gate[active.view(-1)].mean().detach().cpu()),
         }
 
+    @torch.no_grad()
     def _apply_reflex_correction(
         self,
         base_hidden: torch.Tensor,
@@ -533,6 +641,9 @@ class FlashMedusaDecoder:
         generation_step: int,
         hint_trust: torch.Tensor | None = None,
         ratio_scale: torch.Tensor | None = None,
+        important_ids: torch.Tensor | None = None,
+        boundary_ids: torch.Tensor | None = None,
+        lm_head=None,
     ) -> torch.Tensor:
         reflex_start = time.perf_counter()
         scale = self._reflex_effective_injection_scale(generation_step)
@@ -602,19 +713,38 @@ class FlashMedusaDecoder:
                 hidden_finite = hidden_finite.all(dim=-1)
             eligible &= hidden_finite.view(-1, 1)
             if effective_updates is not None:
-                eligible &= effective_updates.float().view(-1, 1).ge(
-                    float(cfg.reflex_min_effective_updates)
+                min_updates = float(
+                    cfg.reflex_min_effective_updates_by_head[head_idx]
+                    if head_idx < len(cfg.reflex_min_effective_updates_by_head)
+                    else cfg.reflex_min_effective_updates
                 )
-            ratio_min = max(0.0, float(cfg.reflex_correction_ratio_min))
-            ratio_max = max(ratio_min, float(cfg.reflex_correction_ratio_max))
+                eligible &= effective_updates.float().view(-1, 1).ge(
+                    min_updates
+                )
+            ratio_min = max(
+                0.0,
+                float(
+                    cfg.reflex_correction_ratio_min_by_head[head_idx]
+                    if head_idx < len(cfg.reflex_correction_ratio_min_by_head)
+                    else cfg.reflex_correction_ratio_min
+                ),
+            )
+            ratio_max = max(
+                ratio_min,
+                float(
+                    cfg.reflex_correction_ratio_max_by_head[head_idx]
+                    if head_idx < len(cfg.reflex_correction_ratio_max_by_head)
+                    else cfg.reflex_correction_ratio_max
+                ),
+            )
+            ratio_cap = abs(float(scale)) * safety * ratio_max
             target_ratio = (
                 float(scale)
                 * safety
                 * (ratio_min + (ratio_max - ratio_min) * confidence)
-            )
-            target_ratio = torch.where(
-                safety.gt(0.0), target_ratio.clamp(ratio_min, ratio_max), torch.zeros_like(target_ratio)
-            )
+            ).clamp(min=0.0)
+            target_ratio = torch.minimum(target_ratio, ratio_cap)
+            target_ratio = target_ratio.masked_fill(safety.le(0.0), 0.0)
             target_ratio = target_ratio.masked_fill(~eligible, 0.0)
             state_unit = state / state_rms.clamp_min(1e-6)
             if base_hidden.dim() == 3:
@@ -630,8 +760,58 @@ class FlashMedusaDecoder:
                 target_ratio / actual_ratio.clamp_min(1e-6)
             )
             correction_rms = correction.square().mean(dim=-1, keepdim=True).sqrt()
-            hard_cap = ratio_max * base_rms
+            hard_cap = ratio_cap * base_rms
+            if base_hidden.dim() == 3 and hard_cap.dim() == 2:
+                hard_cap = hard_cap.unsqueeze(1)
             correction = correction * torch.clamp(hard_cap / correction_rms.clamp_min(1e-6), max=1.0)
+            if (
+                bool(cfg.reflex_sparse_boundary_check_enabled)
+                and lm_head is not None
+                and important_ids is not None
+                and boundary_ids is not None
+                and base_hidden.dim() == 2
+            ):
+                important = important_ids.to(device=state.device, dtype=torch.long).view(-1)
+                boundary = boundary_ids.to(device=state.device, dtype=torch.long).view(-1)
+                vocab = int(lm_head.weight.shape[0])
+                valid_pair = (
+                    important.ge(0)
+                    & important.lt(vocab)
+                    & boundary.ge(0)
+                    & boundary.lt(vocab)
+                    & eligible.view(-1)
+                )
+                safe_important = important.masked_fill(~valid_pair, 0)
+                safe_boundary = boundary.masked_fill(~valid_pair, 0)
+                pair_direction = (
+                    lm_head.weight.index_select(0, safe_important)
+                    - lm_head.weight.index_select(0, safe_boundary)
+                ).float()
+                base_gap = torch.einsum("rh,rh->r", pair_direction, base_hidden.float())
+                delta_gap = torch.einsum("rh,rh->r", pair_direction, correction.float())
+                improves = valid_pair & delta_gap.gt(0.0)
+                degrades = valid_pair & ~delta_gap.gt(0.0)
+                needed = (
+                    (float(cfg.reflex_sparse_boundary_margin) - base_gap)
+                    / delta_gap.clamp_min(1e-8)
+                ).clamp_min(1.0)
+                current_ratio = target_ratio.view(-1).clamp_min(1e-8)
+                suggested = torch.minimum(
+                    needed, ratio_cap.view(-1) / current_ratio
+                ).clamp_min(1.0)
+                # Missing/invalid hints are not negative evidence. Preserve the
+                # trust-region correction unless a valid boundary pair shows
+                # that it moves logits in the wrong direction.
+                rescale = torch.ones_like(current_ratio)
+                rescale = torch.where(improves, suggested, rescale)
+                rescale = rescale.masked_fill(degrades, 0.0)
+                correction = correction * rescale.unsqueeze(-1)
+                correction_rms = correction.float().square().mean(
+                    dim=-1, keepdim=True
+                ).sqrt()
+                correction = correction * torch.clamp(
+                    hard_cap / correction_rms.clamp_min(1e-6), max=1.0
+                )
             correction = torch.nan_to_num(correction, nan=0.0, posinf=0.0, neginf=0.0)
             corrected = base_hidden + correction.to(device=base_hidden.device, dtype=base_hidden.dtype)
             if self._reflex_runtime_stats is not None:
@@ -642,7 +822,13 @@ class FlashMedusaDecoder:
                 runtime["hint_trust_sum"].add_(confidence_for_stats.sum())
                 runtime["warm_gate_sum"].add_(eligible.sum())
                 runtime["correction_rms_sum"].add_(final_rms.sum())
-                runtime["correction_ratio_sum"].add_((final_rms / base_flat).sum())
+                ratios = final_rms / base_flat
+                active_mask = ratios.gt(0.0)
+                runtime["correction_ratio_sum"].add_(ratios.sum())
+                runtime["active_correction_ratio_sum"].add_(
+                    ratios.masked_fill(~active_mask, 0.0).sum()
+                )
+                runtime["active_injections"].add_(active_mask.sum())
                 runtime["correction_observations"].add_(state_rms.numel())
             self._add_reflex_time(time.perf_counter() - reflex_start)
             return corrected
@@ -717,6 +903,7 @@ class FlashMedusaDecoder:
         self._add_reflex_time(time.perf_counter() - reflex_start)
         return corrected
 
+    @torch.no_grad()
     def _medusa_logits_for_last_hidden(
         self,
         last_hidden: torch.Tensor,
@@ -728,12 +915,17 @@ class FlashMedusaDecoder:
         generation_step: int,
         hint_trust: torch.Tensor | None = None,
         ratio_scale: torch.Tensor | None = None,
+        important_ids: torch.Tensor | None = None,
+        boundary_ids: torch.Tensor | None = None,
         root_tokens: torch.Tensor | None = None,
         embedding_layer=None,
         return_projected: bool = False,
-    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]:
+        return_raw_projected: bool = False,
+    ):
         max_heads = max(0, min(int(max_heads), self.medusa_heads.num_heads))
         if max_heads == 0:
+            if return_raw_projected:
+                return [], [], []
             return ([], []) if return_projected else []
         device_type = "cuda" if last_hidden.device.type == "cuda" else last_hidden.device.type
         with torch.amp.autocast(
@@ -751,6 +943,7 @@ class FlashMedusaDecoder:
                     raise ValueError("embedding_layer is required for anchor-conditioned Reflex")
                 anchor_embeddings = embedding_layer(root_tokens.to(device=last_hidden.device)).detach()
             projected: list[torch.Tensor] = []
+            raw_projected: list[torch.Tensor] = []
             for head_idx in range(max_heads):
                 medusa_hidden = self.medusa_heads.heads[head_idx].project_hidden(last_hidden)
                 if anchor_embeddings is not None:
@@ -759,6 +952,7 @@ class FlashMedusaDecoder:
                         anchor_embeddings,
                         head_idx,
                     )
+                raw_projected.append(medusa_hidden)
                 medusa_hidden = self._apply_reflex_correction(
                     medusa_hidden,
                     fast_state,
@@ -767,6 +961,21 @@ class FlashMedusaDecoder:
                     generation_step,
                     hint_trust,
                     ratio_scale,
+                    (
+                        important_ids[:, head_idx]
+                        if important_ids is not None
+                        and important_ids.dim() == 2
+                        and head_idx < int(important_ids.shape[1])
+                        else important_ids
+                    ),
+                    (
+                        boundary_ids[:, head_idx]
+                        if boundary_ids is not None
+                        and boundary_ids.dim() == 2
+                        and head_idx < int(boundary_ids.shape[1])
+                        else boundary_ids
+                    ),
+                    lm_head,
                 )
                 projected.append(medusa_hidden)
 
@@ -779,6 +988,8 @@ class FlashMedusaDecoder:
                 lm_dtype = getattr(lm_head.weight, "dtype", flat_hidden.dtype)
                 flat_logits = lm_head(flat_hidden.to(dtype=lm_dtype))
                 logits = list(flat_logits.split(batch, dim=0))
+                if return_raw_projected:
+                    return logits, projected, raw_projected
                 return (logits, projected) if return_projected else logits
 
             logits_by_head: list[torch.Tensor] = []
@@ -789,6 +1000,8 @@ class FlashMedusaDecoder:
                 else:
                     lm_dtype = getattr(lm_head.weight, "dtype", medusa_hidden.dtype)
                     logits_by_head.append(lm_head(medusa_hidden.to(dtype=lm_dtype)))
+            if return_raw_projected:
+                return logits_by_head, projected, raw_projected
             return (logits_by_head, projected) if return_projected else logits_by_head
 
     def _normalize_reflex_feedback(self, feedback: torch.Tensor) -> torch.Tensor:
@@ -1224,6 +1437,30 @@ class FlashMedusaDecoder:
                 safety_bad_probe_patience=int(cfg.reflex_safety_bad_probe_patience),
                 safety_ratio_decay=float(cfg.reflex_safety_ratio_decay),
                 safety_reenable_probe_interval=int(cfg.reflex_safety_reenable_probe_interval),
+                state_ema_decay_by_head=cfg.reflex_state_ema_decay_by_head,
+                enabled_at_start_by_head=cfg.reflex_enabled_at_start_by_head,
+                min_effective_updates_by_head=cfg.reflex_min_effective_updates_by_head,
+                min_alignment_count_by_head=cfg.reflex_min_alignment_count_by_head,
+                safety_candidate_mass_deadband=float(
+                    cfg.reflex_safety_candidate_mass_deadband
+                ),
+                safety_net_win_rate_deadband=float(
+                    cfg.reflex_safety_net_win_rate_deadband
+                ),
+                safety_good_probe_patience=int(
+                    cfg.reflex_safety_good_probe_patience
+                ),
+                safety_recovery_factor=float(cfg.reflex_safety_recovery_factor),
+                safety_minimum_active_ratio=float(
+                    cfg.reflex_safety_minimum_active_ratio
+                ),
+                head3_exploration_fraction=float(
+                    cfg.sparse_head3_exploration_fraction
+                ),
+                head3_warmup_exploration_fraction=float(
+                    cfg.sparse_head3_warmup_exploration_fraction
+                ),
+                head3_warmup_records=int(cfg.sparse_head3_warmup_records),
             )
             if (reflex_state_active and strict_hrdcr)
             else ReflexStateManager(
@@ -1261,6 +1498,36 @@ class FlashMedusaDecoder:
         )
         if isinstance(reflex_manager, HRDCRStateManager):
             reflex_manager.load_safety_state(self._hrdcr_safety_state)
+            if bool(cfg.reflex_dynamic_tree_enabled):
+                hrdcr_base_nodes, hrdcr_base_layout_name, _ = (
+                    reflex_manager.dynamic_tree_layout()
+                )
+            else:
+                hrdcr_base_nodes = list(cfg.sparse_nodes_by_head)
+                hrdcr_base_layout_name = "configured"
+            head3_warm = (
+                reflex_manager.num_heads >= 3
+                and int(reflex_manager.mature_feedback_count[2].detach().cpu())
+                < int(cfg.sparse_head3_warmup_records)
+            )
+            head3_exploration_fraction = (
+                float(cfg.sparse_head3_warmup_exploration_fraction)
+                if head3_warm
+                else float(cfg.sparse_head3_exploration_fraction)
+            )
+            head3_exploration_period = max(
+                1,
+                int(round(1.0 / max(head3_exploration_fraction, 1e-9))),
+            )
+            hrdcr_layout_refresh_interval = 256
+            hrdcr_last_layout_refresh_round = 0
+        else:
+            hrdcr_base_nodes = list(cfg.sparse_nodes_by_head)
+            hrdcr_base_layout_name = "configured"
+            head3_exploration_fraction = 0.0
+            head3_exploration_period = 1
+            hrdcr_layout_refresh_interval = 256
+            hrdcr_last_layout_refresh_round = 0
         collect_sparse_teacher = bool(
             reflex_aux_buffer is not None and cfg.reflex_sparse_teacher_enabled
         )
@@ -1366,6 +1633,9 @@ class FlashMedusaDecoder:
         tree_nodes_by_head = [0 for _ in range(min(cfg.num_medusa_heads, self.medusa_heads.num_heads))]
         tree_budget_unused = 0
         tree_plan_last = {}
+        actual_tree_layout_counts: dict[str, int] = {}
+        head3_conditional_success = 0
+        head3_conditional_opportunities = 0
         adaptive_tree_stats_last = {}
         reflex_feedback_collection_rounds = 0
         persistent_memory_active_sequence_sum = 0
@@ -1389,6 +1659,9 @@ class FlashMedusaDecoder:
                     )
                     active_hint_trust = reflex_manager.trust(active_original_indices)
                     active_ratio_scale = reflex_manager.ratio_scale(active_original_indices)
+                    active_important_ids, active_boundary_ids = (
+                        reflex_manager.boundary_hints(active_original_indices)
+                    )
                     active_state_sketch = reflex_manager.sketch(active_fast_state)
                 else:
                     active_context_keys = (
@@ -1408,6 +1681,8 @@ class FlashMedusaDecoder:
                     )
                     active_state_sketch = None
                     active_ratio_scale = None
+                    active_important_ids = None
+                    active_boundary_ids = None
                 active_fast_state, memory_step_stats = self._apply_persistent_memory_prior(
                     active_fast_state,
                     active_effective_updates,
@@ -1436,6 +1711,8 @@ class FlashMedusaDecoder:
                 active_hint_trust = None
                 active_state_sketch = None
                 active_ratio_scale = None
+                active_important_ids = None
+                active_boundary_ids = None
 
             pending_rows = [
                 row
@@ -1465,8 +1742,55 @@ class FlashMedusaDecoder:
                 root_tokens.index_copy_(0, pending_index, pending_values)
                 total_correction_tokens += len(pending_rows)
 
+            if (
+                isinstance(reflex_manager, HRDCRStateManager)
+                and bool(cfg.reflex_dynamic_tree_enabled)
+                and total_verify_rounds - hrdcr_last_layout_refresh_round
+                >= hrdcr_layout_refresh_interval
+            ):
+                hrdcr_base_nodes, hrdcr_base_layout_name, _ = (
+                    reflex_manager.dynamic_tree_layout()
+                )
+                hrdcr_last_layout_refresh_round = total_verify_rounds
+                head3_warm = (
+                    reflex_manager.num_heads >= 3
+                    and int(
+                        reflex_manager.mature_feedback_count[2].detach().cpu()
+                    )
+                    < int(cfg.sparse_head3_warmup_records)
+                )
+                head3_exploration_fraction = (
+                    float(cfg.sparse_head3_warmup_exploration_fraction)
+                    if head3_warm
+                    else float(cfg.sparse_head3_exploration_fraction)
+                )
+                head3_exploration_period = max(
+                    1,
+                    int(
+                        round(
+                            1.0
+                            / max(head3_exploration_fraction, 1e-9)
+                        )
+                    ),
+                )
+
             use_medusa_tree = int(generation_step) >= int(cfg.enable_medusa_spec_after)
             if use_medusa_tree:
+                sparse_nodes = list(hrdcr_base_nodes)
+                layout_name = str(hrdcr_base_layout_name)
+                force_head3_exploration = False
+                if (
+                    isinstance(reflex_manager, HRDCRStateManager)
+                    and len(sparse_nodes) >= 3
+                    and sparse_nodes[2] == 0
+                    and head3_exploration_fraction > 0.0
+                    and total_verify_rounds % head3_exploration_period == 0
+                ):
+                    # Exploration spends the same ten-node budget; it only
+                    # reallocates one shallow node to gather causal Head-3 evidence.
+                    sparse_nodes = [4, 4, 1]
+                    layout_name = "head3_exploration"
+                    force_head3_exploration = True
                 plan = plan_tree(
                     active_batch_size=active_bsz,
                     num_medusa_heads=min(cfg.num_medusa_heads, self.medusa_heads.num_heads),
@@ -1479,7 +1803,7 @@ class FlashMedusaDecoder:
                     fixed_tree_topk_by_depth=list(cfg.fixed_tree_topk_by_depth),
                     adaptive_tree_enabled=bool(cfg.adaptive_tree_enabled),
                     adaptive_min_topk_by_depth=list(cfg.adaptive_min_topk_by_depth),
-                    sparse_nodes_by_head=list(cfg.sparse_nodes_by_head),
+                    sparse_nodes_by_head=sparse_nodes,
                     sparse_min_head3_nodes=int(cfg.sparse_min_head3_nodes),
                     sparse_head3_min_budget=int(cfg.sparse_head3_min_budget),
                     sparse_branch_score_temperature=float(cfg.sparse_branch_score_temperature),
@@ -1523,12 +1847,13 @@ class FlashMedusaDecoder:
                     medusa_logits = []
                     record_logits = adaptive_tree_stats.pop("record_logits", [])
                     record_hidden = []
+                    raw_record_hidden = []
                 else:
                     if statistical_time and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     head_start = time.time()
                     with torch.no_grad():
-                        medusa_logits, record_hidden = self._medusa_logits_for_last_hidden(
+                        proposal_result = self._medusa_logits_for_last_hidden(
                             current_hidden.detach(),
                             lm_head=lm_head,
                             max_heads=plan.active_heads,
@@ -1537,10 +1862,18 @@ class FlashMedusaDecoder:
                             generation_step=generation_step,
                             hint_trust=active_hint_trust,
                             ratio_scale=active_ratio_scale,
+                            important_ids=active_important_ids,
+                            boundary_ids=active_boundary_ids,
                             root_tokens=root_tokens,
                             embedding_layer=base.get_input_embeddings(),
                             return_projected=True,
+                            return_raw_projected=bool(strict_hrdcr),
                         )
+                        if strict_hrdcr:
+                            medusa_logits, record_hidden, raw_record_hidden = proposal_result
+                        else:
+                            medusa_logits, record_hidden = proposal_result
+                            raw_record_hidden = record_hidden
                     if statistical_time and torch.cuda.is_available():
                         torch.cuda.synchronize()
                     medusa_head_time += time.time() - head_start
@@ -1570,6 +1903,9 @@ class FlashMedusaDecoder:
                             cumulative_path_score=first_logp + second_logp,
                             eligible=eligible,
                         )
+                        if force_head3_exploration:
+                            head3_gate_result.gate_mask.fill_(True)
+                            head3_gate_result.exploration_mask.fill_(True)
                     trees = build_batch_trees(
                         root_tokens,
                         medusa_logits,
@@ -1585,6 +1921,9 @@ class FlashMedusaDecoder:
                         ),
                     )
                     record_logits = medusa_logits
+                actual_tree_layout_counts[layout_name] = (
+                    actual_tree_layout_counts.get(layout_name, 0) + active_bsz
+                )
                 if head_cuda_end is not None:
                     head_cuda_end.record()
                     sampled_head_events.append((head_cuda_start, head_cuda_end))
@@ -1596,6 +1935,7 @@ class FlashMedusaDecoder:
                 medusa_logits = []
                 record_logits = []
                 record_hidden = []
+                raw_record_hidden = []
                 proposal_mode_used = "target_only"
                 adaptive_tree_stats_last = {}
                 head3_gate_result = None
@@ -1664,38 +2004,52 @@ class FlashMedusaDecoder:
                     quality_by_horizon[2] = head3_gate_result.quality
 
                 probe_rows = None
-                raw_hidden = None
-                raw_candidate_ids = None
-                raw_candidate_valid = None
+                probe_head_idx = -1
+                raw_candidate_ids: list[torch.Tensor | None] | None = None
+                raw_candidate_valid: list[torch.Tensor | None] | None = None
                 probe_interval = max(1, int(cfg.reflex_candidate_probe_interval))
+                normal_probe_round = bool(
+                    total_verify_rounds > 0
+                    and total_verify_rounds % probe_interval == 0
+                )
+                if isinstance(reflex_manager, HRDCRStateManager):
+                    probe_head_idx = reflex_manager.select_probe_head(
+                        normal_probe_round
+                    )
                 strict_probe_round = bool(
                     reflex_injection_enabled
                     and proposal_mode_used == "medusa"
-                    and total_verify_rounds > 0
-                    and total_verify_rounds % probe_interval == 0
+                    and 0 <= probe_head_idx < plan.active_heads
+                    and probe_head_idx < len(raw_record_hidden)
                 )
                 if strict_probe_round:
-                    probe_count = min(
-                        active_bsz,
-                        max(1, int(cfg.reflex_counterfactual_max_sequences)),
+                    correction_rms = (
+                        record_hidden[probe_head_idx].float()
+                        - raw_record_hidden[probe_head_idx].float()
+                    ).square().mean(dim=-1).sqrt()
+                    probe_rows = correction_rms.gt(0.0).nonzero(
+                        as_tuple=False
+                    ).flatten()[: max(1, int(cfg.reflex_counterfactual_max_sequences))]
+                if strict_probe_round and probe_rows is not None and probe_rows.numel() > 0:
+                    raw_probe_hidden = raw_record_hidden[probe_head_idx].index_select(
+                        0, probe_rows
                     )
-                    probe_rows = torch.arange(probe_count, device=device, dtype=torch.long)
-                    baseline_logits, raw_hidden = self._medusa_logits_for_last_hidden(
-                        current_hidden.index_select(0, probe_rows).detach(),
-                        lm_head=lm_head,
-                        max_heads=plan.active_heads,
-                        fast_state=None,
-                        effective_updates=None,
-                        generation_step=generation_step,
-                        hint_trust=None,
-                        ratio_scale=None,
-                        root_tokens=root_tokens.index_select(0, probe_rows),
-                        embedding_layer=base.get_input_embeddings(),
-                        return_projected=True,
+                    output_layer = self.medusa_heads.heads[probe_head_idx].output
+                    raw_probe_logits = (
+                        output_layer(raw_probe_hidden)
+                        if output_layer is not None
+                        else lm_head(
+                            raw_probe_hidden.to(dtype=lm_head.weight.dtype)
+                        )
                     )
+                    raw_tree_logits = [
+                        logits.index_select(0, probe_rows)
+                        for logits in record_logits[: plan.active_heads]
+                    ]
+                    raw_tree_logits[probe_head_idx] = raw_probe_logits
                     raw_trees = build_batch_trees(
                         root_tokens.index_select(0, probe_rows),
-                        baseline_logits,
+                        raw_tree_logits,
                         plan,
                         head3_gate_mask=(
                             head3_gate_result.gate_mask.index_select(0, probe_rows)
@@ -1713,12 +2067,16 @@ class FlashMedusaDecoder:
                             else None
                         ),
                     )
-                    raw_candidate_ids, raw_candidate_valid = candidate_sets_by_head(
+                    packed_raw_ids, packed_raw_valid = candidate_sets_by_head(
                         raw_trees,
                         plan.active_heads,
                         device=device,
                         widths=list(plan.nodes_by_head or plan.topk_by_depth),
                     )
+                    raw_candidate_ids = [None for _ in range(plan.active_heads)]
+                    raw_candidate_valid = [None for _ in range(plan.active_heads)]
+                    raw_candidate_ids[probe_head_idx] = packed_raw_ids[probe_head_idx]
+                    raw_candidate_valid[probe_head_idx] = packed_raw_valid[probe_head_idx]
                 hrdcr_prediction_buffer.add_from_logits(
                     sequence_ids=active_original_indices,
                     anchor_positions=old_logical_lens,
@@ -1728,12 +2086,14 @@ class FlashMedusaDecoder:
                     anchor_hidden=current_hidden.detach(),
                     fast_states=active_fast_state,
                     trust=active_hint_trust,
+                    ratio_scales=active_ratio_scale,
                     state_sketch=active_state_sketch,
                     candidate_ids_by_horizon=effective_candidate_ids,
                     candidate_valid_by_horizon=effective_candidate_valid,
                     quality_by_horizon=quality_by_horizon,
                     probe_rows=probe_rows,
-                    raw_proposal_hidden_by_horizon=raw_hidden,
+                    probe_head_idx=probe_head_idx,
+                    raw_proposal_hidden_by_horizon=raw_record_hidden,
                     raw_candidate_ids_by_horizon=raw_candidate_ids,
                     raw_candidate_valid_by_horizon=raw_candidate_valid,
                 )
@@ -1984,6 +2344,32 @@ class FlashMedusaDecoder:
 
             if utility_scheduler is not None:
                 utility_scheduler.observe(accepted_per_row, trees)
+            if isinstance(reflex_manager, HRDCRStateManager) and reflex_manager.num_heads >= 3:
+                # Head-3 is useful only after its Head-1/2 parent path survives.
+                # This measures that conditional event from the exact verifier path.
+                round_head3_success = 0
+                round_head3_opportunities = 0
+                for tree, accepted_nodes in zip(trees, accepted_nodes_per_row):
+                    if len(accepted_nodes) < 3:
+                        continue
+                    parent_node = int(accepted_nodes[2])
+                    has_head3_child = any(
+                        int(tree.depths[child]) == 4
+                        for child in tree.children.get(parent_node, [])
+                    )
+                    if not has_head3_child:
+                        continue
+                    round_head3_opportunities += 1
+                    if len(accepted_nodes) >= 4 and int(tree.depths[accepted_nodes[3]]) == 4:
+                        round_head3_success += 1
+                if round_head3_opportunities:
+                    head3_conditional_success += round_head3_success
+                    head3_conditional_opportunities += round_head3_opportunities
+                    reflex_manager.observe_path_acceptance(
+                        2,
+                        accepted=round_head3_success,
+                        opportunities=round_head3_opportunities,
+                    )
             total_verify_rounds += 1
             max_acc = max(len(tokens) for tokens in accepted_per_row)
             accepted_ids_cpu = torch.full((active_bsz, max_acc), int(pad_token_id), dtype=torch.long)
@@ -2039,6 +2425,9 @@ class FlashMedusaDecoder:
                         actual,
                         collect_auxiliary=bool(collect_reflex_aux_cache),
                     )
+                    reflex_manager.observe_mature_feedback(
+                        strict_feedback.record_head_indices
+                    )
                     if head3_calibrator is not None:
                         head3_records = strict_feedback.record_head_indices.eq(2)
                         head3_calibrator.observe(
@@ -2062,9 +2451,20 @@ class FlashMedusaDecoder:
                         strict_feedback.head_severity,
                         strict_feedback.head_alignment,
                         strict_feedback.head_alignment_observed,
+                        strict_feedback.head_important_ids,
+                        strict_feedback.head_boundary_ids,
                     )
                     if strict_feedback.auxiliary_records:
                         hrdcr_aux_batches.append(strict_feedback.auxiliary_records)
+                        if len(hrdcr_aux_batches) >= 8:
+                            # Keep the verifier reservoir bounded without a
+                            # token-level host transfer or unbounded Python list.
+                            hrdcr_aux_batches[:] = [
+                                merge_auxiliary_records(
+                                    hrdcr_aux_batches,
+                                    int(cfg.reflex_aux_cache_max_records),
+                                )
+                            ]
                     reflex_stats.add_hrdcr_feedback(strict_feedback)
                     reflex_stats.add_feedback_rms(
                         feedback_rms,
@@ -2609,6 +3009,19 @@ class FlashMedusaDecoder:
         reflex_metrics["head3_restricted_kl"] = float(
             head3_metrics.get("restricted_kl", 0.0) or 0.0
         )
+        reflex_metrics["head3_conditional_path_acceptance"] = (
+            float(head3_conditional_success)
+            / max(int(head3_conditional_opportunities), 1)
+        )
+        reflex_metrics["head3_conditional_path_success"] = int(
+            head3_conditional_success
+        )
+        reflex_metrics["head3_conditional_path_opportunities"] = int(
+            head3_conditional_opportunities
+        )
+        reflex_metrics["actual_tree_layout_counts"] = dict(
+            actual_tree_layout_counts
+        )
         motivation_trace = []
         if trace_enabled:
             for key in sorted(trace_buckets):
@@ -2657,6 +3070,17 @@ class FlashMedusaDecoder:
             "medusa_accept_by_depth": accept_by_depth,
             "medusa_proposed_by_depth": proposed_by_depth,
             "last_tree_plan": tree_plan_last,
+            "actual_tree_layout_counts": actual_tree_layout_counts,
+            "head3_conditional_path_acceptance": (
+                float(head3_conditional_success)
+                / max(int(head3_conditional_opportunities), 1)
+            ),
+            "head3_conditional_path_success": int(
+                head3_conditional_success
+            ),
+            "head3_conditional_path_opportunities": int(
+                head3_conditional_opportunities
+            ),
             "cache_update_mode": cfg.cache_update_mode,
             "kv_extraction_success_count": int(kv_extraction_success_count),
             "kv_extraction_fallback_count": int(kv_extraction_fallback_count),

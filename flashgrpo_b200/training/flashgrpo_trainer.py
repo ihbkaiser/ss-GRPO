@@ -474,6 +474,22 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
     total_verify = sum(int(row.get("total_verify_rounds", 0)) for row in rows)
     tree_query_rows = sum(int(row.get("tree_query_rows", 0)) for row in rows)
     tree_lm_head_rows = sum(int(row.get("tree_lm_head_rows", 0)) for row in rows)
+    head3_path_success = sum(
+        int(row.get("head3_conditional_path_success", 0) or 0)
+        for row in rows
+    )
+    head3_path_opportunities = sum(
+        int(row.get("head3_conditional_path_opportunities", 0) or 0)
+        for row in rows
+    )
+    actual_tree_layout_counts: dict[str, int] = {}
+    for row in rows:
+        for layout, count in (
+            row.get("actual_tree_layout_counts", {}) or {}
+        ).items():
+            actual_tree_layout_counts[str(layout)] = (
+                actual_tree_layout_counts.get(str(layout), 0) + int(count)
+            )
     total_time = sum(float(row.get("total_time_cost", 0.0) or 0.0) for row in rows)
     reflex_metrics = _merge_reflex_metrics([row.get("reflex_metrics", {}) for row in rows])
     out = {
@@ -507,6 +523,13 @@ def _merge_generation_outputs(rows: list[dict]) -> dict:
         "medusa_accept_by_depth": _merge_int_dicts(rows, "medusa_accept_by_depth"),
         "medusa_proposed_by_depth": _merge_int_dicts(rows, "medusa_proposed_by_depth"),
         "last_tree_plan": rows[-1].get("last_tree_plan", {}),
+        "actual_tree_layout_counts": actual_tree_layout_counts,
+        "head3_conditional_path_success": int(head3_path_success),
+        "head3_conditional_path_opportunities": int(
+            head3_path_opportunities
+        ),
+        "head3_conditional_path_acceptance": float(head3_path_success)
+        / max(head3_path_opportunities, 1),
         "cache_update_mode": rows[-1].get("cache_update_mode", "extract_path"),
         "kv_extraction_success_count": sum(int(row.get("kv_extraction_success_count", 0)) for row in rows),
         "kv_extraction_fallback_count": sum(int(row.get("kv_extraction_fallback_count", 0)) for row in rows),
@@ -728,7 +751,28 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
     feedback_collection_rounds = sum(int(row.get("feedback_collection_rounds", 0) or 0) for row in rows)
     feature_feedback_count = sum(int(row.get("feature_feedback_count", 0) or 0) for row in rows)
     correction_observations = sum(int(row.get("correction_observations", 0) or 0) for row in rows)
+    active_injection_observations = sum(
+        float(row.get("active_injection_fraction", 0.0) or 0.0)
+        * int(row.get("correction_observations", 0) or 0)
+        for row in rows
+    )
     candidate_probe_count = sum(int(row.get("candidate_set_probe_count", 0) or 0) for row in rows)
+    head3_path_success = sum(
+        int(row.get("head3_conditional_path_success", 0) or 0)
+        for row in rows
+    )
+    head3_path_opportunities = sum(
+        int(row.get("head3_conditional_path_opportunities", 0) or 0)
+        for row in rows
+    )
+    actual_layouts: dict[str, int] = {}
+    for row in rows:
+        for layout, count in (
+            row.get("actual_tree_layout_counts", {}) or {}
+        ).items():
+            actual_layouts[str(layout)] = (
+                actual_layouts.get(str(layout), 0) + int(count)
+            )
 
     def correction_mean(key: str) -> float:
         if correction_observations <= 0:
@@ -790,6 +834,33 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         "correction_to_hidden_rms_ratio": correction_mean(
             "correction_to_hidden_rms_ratio"
         ),
+        "active_injection_fraction": active_injection_observations
+        / max(correction_observations, 1),
+        "conditional_correction_to_hidden_rms_ratio": sum(
+            float(
+                row.get(
+                    "conditional_correction_to_hidden_rms_ratio", 0.0
+                )
+                or 0.0
+            )
+            * (
+                float(row.get("active_injection_fraction", 0.0) or 0.0)
+                * int(row.get("correction_observations", 0) or 0)
+            )
+            for row in rows
+        )
+        / max(active_injection_observations, 1.0),
+        "unconditional_correction_to_hidden_rms_ratio": sum(
+            float(
+                row.get(
+                    "unconditional_correction_to_hidden_rms_ratio", 0.0
+                )
+                or 0.0
+            )
+            * int(row.get("correction_observations", 0) or 0)
+            for row in rows
+        )
+        / max(correction_observations, 1),
         "correction_observations": int(correction_observations),
         "candidate_set_changed_fraction": sum(
             float(row.get("candidate_set_changed_fraction", 0.0) or 0.0)
@@ -835,6 +906,13 @@ def _merge_reflex_metrics(rows: list[dict]) -> dict:
         "head3_quality_gate_pass_count": sum(int(row.get("head3_quality_gate_pass_count", 0) or 0) for row in rows),
         "head3_quality_gate_reject_count": sum(int(row.get("head3_quality_gate_reject_count", 0) or 0) for row in rows),
         "head3_exploration_count": sum(int(row.get("head3_exploration_count", 0) or 0) for row in rows),
+        "head3_conditional_path_success": int(head3_path_success),
+        "head3_conditional_path_opportunities": int(
+            head3_path_opportunities
+        ),
+        "head3_conditional_path_acceptance": float(head3_path_success)
+        / max(head3_path_opportunities, 1),
+        "actual_tree_layout_counts": actual_layouts,
         "reflex_total_time": sum(float(row.get("reflex_total_time", 0.0) or 0.0) for row in rows),
         "nonzero_gate_fraction": sum(float(row.get("nonzero_gate_fraction", 0.0) or 0.0) for row in rows) / max(len(rows), 1),
         "feedback_collection_rounds": feedback_collection_rounds,
@@ -954,6 +1032,8 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
     tree = config.get("tree", {})
     metrics = config.get("metrics", {})
     quality_weights = tree.get("head3_quality_weights", {})
+    head_cfg = [reflex.get(f"head{idx}", {}) for idx in range(1, 4)]
+    safety_cfg = config.get("reflex_safety", reflex.get("safety", {}))
     tree_layout = str(tree.get("mode", fg.get("tree_layout", "dense")))
     if tree_layout == "dense" and str(fg.get("tree_layout", "dense")) == "sparse":
         tree_layout = "sparse_asymmetric"
@@ -973,6 +1053,10 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         sparse_min_head3_nodes=int(tree.get("min_head3_nodes", 1)),
         sparse_head3_min_budget=int(tree.get("head3_min_budget", 8)),
         sparse_head3_exploration_fraction=float(tree.get("head3_exploration_fraction", 0.10)),
+        sparse_head3_warmup_exploration_fraction=float(
+            tree.get("head3_warmup_exploration_fraction", 0.10)
+        ),
+        sparse_head3_warmup_records=int(tree.get("head3_warmup_records", 1024)),
         sparse_head3_min_calibration_records=int(tree.get("head3_min_calibration_records", 1024)),
         sparse_branch_score_temperature=float(tree.get("branch_score_temperature", 1.0)),
         sparse_diversity_penalty=float(tree.get("diversity_penalty", 0.05)),
@@ -1060,10 +1144,70 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_alignment_floor=float(reflex.get("alignment_floor", 0.0)),
         reflex_alignment_full=float(reflex.get("alignment_full", 0.10)),
         reflex_alignment_lcb_z=float(reflex.get("alignment_lcb_z", 1.0)),
-        reflex_safety_min_probe_count=int(reflex.get("safety_min_probe_count", 128)),
-        reflex_safety_bad_probe_patience=int(reflex.get("safety_bad_probe_patience", 3)),
-        reflex_safety_ratio_decay=float(reflex.get("safety_ratio_decay", 0.5)),
-        reflex_safety_reenable_probe_interval=int(reflex.get("safety_reenable_probe_interval", 256)),
+        reflex_safety_min_probe_count=int(
+            safety_cfg.get("min_probe_count", reflex.get("safety_min_probe_count", 512))
+        ),
+        reflex_safety_bad_probe_patience=int(
+            safety_cfg.get(
+                "bad_windows_before_decay",
+                reflex.get("safety_bad_probe_patience", 2),
+            )
+        ),
+        reflex_safety_ratio_decay=float(
+            safety_cfg.get(
+                "decay_factor", reflex.get("safety_ratio_decay", 0.5)
+            )
+        ),
+        reflex_safety_reenable_probe_interval=int(
+            safety_cfg.get(
+                "disabled_head_recovery_probe_interval",
+                reflex.get("safety_reenable_probe_interval", 512),
+            )
+        ),
+        reflex_state_ema_decay_by_head=tuple(
+            float(head_cfg[idx].get("state_ema_decay", (0.85, 0.90, 0.95)[idx]))
+            for idx in range(3)
+        ),
+        reflex_enabled_at_start_by_head=tuple(
+            bool(head_cfg[idx].get("enabled_at_start", idx == 0))
+            for idx in range(3)
+        ),
+        reflex_min_effective_updates_by_head=tuple(
+            float(head_cfg[idx].get("min_effective_updates", (2, 4, 4)[idx]))
+            for idx in range(3)
+        ),
+        reflex_min_alignment_count_by_head=tuple(
+            float(head_cfg[idx].get("min_alignment_count", (8, 32, 64)[idx]))
+            for idx in range(3)
+        ),
+        reflex_correction_ratio_min_by_head=tuple(
+            float(head_cfg[idx].get("correction_ratio_min", (0.010, 0.005, 0.005)[idx]))
+            for idx in range(3)
+        ),
+        reflex_correction_ratio_max_by_head=tuple(
+            float(head_cfg[idx].get("correction_ratio_max", (0.030, 0.015, 0.010)[idx]))
+            for idx in range(3)
+        ),
+        reflex_safety_candidate_mass_deadband=float(
+            safety_cfg.get("candidate_mass_deadband", 0.0001)
+        ),
+        reflex_safety_net_win_rate_deadband=float(
+            safety_cfg.get("net_win_rate_deadband", 0.0005)
+        ),
+        reflex_safety_good_probe_patience=int(
+            safety_cfg.get("good_windows_before_recovery", 3)
+        ),
+        reflex_safety_recovery_factor=float(safety_cfg.get("recovery_factor", 1.25)),
+        reflex_safety_minimum_active_ratio=float(
+            safety_cfg.get("minimum_active_ratio", 0.125)
+        ),
+        reflex_dynamic_tree_enabled=bool(reflex.get("dynamic_tree_enabled", True)),
+        reflex_sparse_boundary_check_enabled=bool(
+            reflex.get("sparse_boundary_check_enabled", True)
+        ),
+        reflex_sparse_boundary_margin=float(
+            reflex.get("sparse_boundary_margin", 0.20)
+        ),
         reflex_injection_gate_mode=str(reflex.get("injection_gate_mode", "legacy")),
         reflex_horizon_delta_rule=str(reflex.get("horizon_delta_rule", "inverse_sqrt")),
         reflex_warmup_effective_updates=float(reflex.get("warmup_effective_updates", 16.0)),
@@ -1074,7 +1218,10 @@ def _make_flash_config(config: dict[str, Any]) -> FlashMedusaConfig:
         reflex_guard_patience=int(reflex.get("guard_patience", 2)),
         reflex_guard_disable_rollouts=int(reflex.get("guard_disable_rollouts", 50)),
         reflex_candidate_probe_interval=int(
-            metrics.get("counterfactual_probe_interval", reflex.get("candidate_probe_interval", 32))
+            metrics.get(
+                "counterfactual_probe_interval",
+                reflex.get("candidate_probe_interval", 256),
+            )
         ),
         reflex_counterfactual_max_sequences=int(metrics.get("counterfactual_max_sequences", 8)),
         metrics_timing_sample_interval=int(metrics.get("timing_sample_interval", 32)),
@@ -1284,18 +1431,27 @@ def run_training(config: dict[str, Any]) -> None:
                 )
 
     target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=float(_get(config, "training.target_lr", 1e-6)))
+    medusa_optimizer_lr = float(
+        config.get("aux_update", {}).get(
+            "learning_rate", fg.get("medusa_lr", 5e-4)
+        )
+    )
     medusa_optimizer = torch.optim.AdamW(
         medusa_heads.parameters(),
-        lr=float(fg.get("medusa_lr", 5e-4)),
+        lr=medusa_optimizer_lr,
         weight_decay=float(fg.get("medusa_weight_decay", 0.0)),
         eps=float(fg.get("medusa_adam_eps", 1e-6)),
+    )
+    aux_loss_cfg = config.get(
+        "aux_loss",
+        config.get("aux_update", {}).get("loss", {}),
     )
     medusa_trainer = OnlineMedusaTrainer(
         target_model,
         medusa_heads,
         medusa_optimizer,
         OnlineMedusaConfig(
-            medusa_lr=float(fg.get("medusa_lr", 5e-4)),
+            medusa_lr=medusa_optimizer_lr,
             medusa_weight_decay=float(fg.get("medusa_weight_decay", 0.0)),
             medusa_train_every=int(fg.get("medusa_train_every", 1)),
             medusa_update_steps_per_iter=int(fg.get("medusa_update_steps_per_iter", 1)),
@@ -1306,6 +1462,9 @@ def run_training(config: dict[str, Any]) -> None:
             chain_loss_weight=float(fg.get("chain_loss_weight", 0.0)),
             chain_loss_max_depth=int(fg.get("chain_loss_max_depth", int(fg.get("num_medusa_heads", 3)))),
             chain_bootstrap_from_medusa=bool(fg.get("chain_bootstrap_from_medusa", True)),
+            grad_clip_norm=float(
+                config.get("aux_update", {}).get("max_grad_norm", 1.0)
+            ),
             reflex_record_microbatch_size=int(config.get("aux_update", {}).get("reflex_record_microbatch_size", 256)),
             reflex_correction_clip_norm=float(reflex_cfg.get("correction_clip_norm", 1.0)),
             reflex_normalize_correction=bool(reflex_cfg.get("normalize_correction", True)),
@@ -1330,10 +1489,14 @@ def run_training(config: dict[str, Any]) -> None:
             ),
             acceptance_rank_temperature=float(config.get("aux_update", {}).get("rank_temperature", 0.5)),
             sparse_support_cap=int(config.get("aux_update", {}).get("sparse_support_cap", 48)),
-            sparse_kl_weight=float(config.get("aux_update", {}).get("kl_weight", 0.25)),
-            sparse_coverage_weight=float(config.get("aux_update", {}).get("coverage_weight", 1.0)),
-            sparse_proximal_weight=float(config.get("aux_update", {}).get("proximal_weight", 0.05)),
-            sparse_ranking_margin=float(config.get("aux_update", {}).get("ranking_margin", 0.5)),
+            sparse_raw_kl_weight=float(aux_loss_cfg.get("raw_kl_weight", 1.0)),
+            sparse_effective_kl_weight=float(
+                aux_loss_cfg.get("effective_kl_weight", 0.25)
+            ),
+            sparse_coverage_weight=float(aux_loss_cfg.get("coverage_weight", 1.0)),
+            sparse_proximal_weight=float(aux_loss_cfg.get("proximal_weight", 0.01)),
+            sparse_ranking_margin=float(aux_loss_cfg.get("ranking_margin", 0.20)),
+            sparse_temperature=float(aux_loss_cfg.get("temperature", 1.0)),
             sparse_min_expected_benefit=float(config.get("aux_update", {}).get("min_expected_benefit", 1e-3)),
             sparse_relative_rms_delta=float(reflex_cfg.get("relative_rms_delta_base", 0.02)),
             sparse_correction_ratio_min=float(reflex_cfg.get("correction_ratio_min", 0.005)),
@@ -1533,7 +1696,7 @@ def run_training(config: dict[str, Any]) -> None:
         "aux_update_after_first_new_policy_rollout": medusa_update_mode == "sparse_online",
         "rollout_ce_before_reward": medusa_update_mode == "rollout_ce",
         "aux_update_defer_until_reflex_warmup_complete": bool(aux_cfg.get("defer_until_reflex_warmup_complete", False)),
-        "medusa_lr": float(fg.get("medusa_lr", 5e-4)),
+        "medusa_lr": medusa_optimizer_lr,
         "medusa_adam_eps": float(fg.get("medusa_adam_eps", 1e-6)),
         "save_aux_every_grpo_iters": int(checkpoint_cfg.get("save_aux_every_grpo_iters", 0)),
         "save_aux_on_triggered_update": bool(checkpoint_cfg.get("save_aux_on_triggered_update", False)),
@@ -1558,6 +1721,12 @@ def run_training(config: dict[str, Any]) -> None:
     total_head3_aux_records_used = 0
     total_head3_aux_optimizer_steps = 0
     max_aux_overhead_fraction = 0.0
+    num_groups_total = 0
+    num_groups_zero_reward_variance = 0
+    num_groups_all_correct = 0
+    num_groups_all_incorrect = 0
+    num_aux_updates_triggered_without_policy_update = 0
+    aux_skipped_insufficient_records = 0
     total_online_ce_updates = 0
     total_online_ce_tokens = 0
     total_rollout_tokens = 0
@@ -1570,21 +1739,71 @@ def run_training(config: dict[str, Any]) -> None:
     required_used_items = max(1, batch_size * accumulation_steps)
     pending_aux_record_batches: list[dict] = []
     sparse_policy_version = max(0, start_used_items // required_used_items)
-    sparse_pending_policy_version: int | None = None
     sparse_last_updated_policy_version = -1
-    sparse_record_budget = max(1, int(aux_cfg.get("records_per_update", 512)))
-    sparse_min_records = max(1, int(aux_cfg.get("min_records_per_update", 64)))
-    sparse_head_budget = max(1, int(aux_cfg.get("max_heads_per_update", 2)))
+    sparse_base_record_budget = max(
+        1, int(aux_cfg.get("records_per_update", 256))
+    )
+    sparse_record_budget = sparse_base_record_budget
+    sparse_min_records = max(
+        1, int(aux_cfg.get("min_records_per_update", 128))
+    )
+    sparse_trigger_records = max(
+        sparse_base_record_budget,
+        int(aux_cfg.get("mature_records_trigger", 256)),
+    )
+    sparse_head_budget = max(
+        1, int(aux_cfg.get("max_heads_per_update", 1))
+    )
     sparse_min_records_per_head = max(
         1, int(aux_cfg.get("min_records_per_selected_head", sparse_min_records))
     )
     sparse_head_sampling_weights = [
         float(value) for value in aux_cfg.get("head_sampling_weights", [1.0, 1.0, 1.25])
     ]
-    sparse_policy_interval = 1
-    sparse_next_allowed_policy_version = sparse_policy_version + 1
+    sparse_min_rollouts_between_updates = max(
+        1, int(aux_cfg.get("min_rollouts_between_updates", 8))
+    )
+    sparse_last_update_rollout = int(start_rollout_count)
     sparse_rollout_time_ema = 0.0
     sparse_aux_record_batches: list[dict] = []
+    sparse_max_cached_records = max(
+        sparse_trigger_records,
+        int(aux_cfg.get("max_cached_records", 4096)),
+    )
+    overhead_cfg = aux_cfg.get("overhead_scheduler", {})
+    sparse_overhead_warmup_updates = max(
+        0, int(overhead_cfg.get("warmup_updates", 3))
+    )
+    sparse_bad_before_throttle = max(
+        1,
+        int(
+            overhead_cfg.get(
+                "consecutive_bad_updates_before_throttle", 2
+            )
+        ),
+    )
+    sparse_good_before_recovery = max(
+        1,
+        int(
+            overhead_cfg.get(
+                "consecutive_good_updates_before_recovery", 4
+            )
+        ),
+    )
+    sparse_throttle_factor = min(
+        1.0, max(0.1, float(overhead_cfg.get("throttle_factor", 0.75)))
+    )
+    sparse_recovery_factor = max(
+        1.0, float(overhead_cfg.get("recovery_factor", 1.20))
+    )
+    sparse_minimum_record_budget = max(
+        sparse_min_records_per_head,
+        int(overhead_cfg.get("minimum_record_budget", 128)),
+    )
+    sparse_overhead_history: list[float] = []
+    sparse_successful_aux_update_count = 0
+    sparse_overhead_bad_streak = 0
+    sparse_overhead_good_streak = 0
     start_time = time.time()
 
     epoch_bar = tqdm(range(start_epoch, num_epochs), desc="Epoch", dynamic_ncols=True)
@@ -1638,9 +1857,7 @@ def run_training(config: dict[str, Any]) -> None:
                 )
                 or (
                     sparse_aux_enabled
-                    and sparse_pending_policy_version is not None
-                    and sparse_pending_policy_version > sparse_last_updated_policy_version
-                    and sparse_pending_policy_version >= sparse_next_allowed_policy_version
+                    and aux_refresh_allowed
                 )
             )
 
@@ -1738,48 +1955,86 @@ def run_training(config: dict[str, Any]) -> None:
                 sparse_records = outputs.get("reflex_aux_records", {})
                 if torch.is_tensor(sparse_records.get("hidden")):
                     sparse_aux_record_batches.append(sparse_records)
-                full_every = max(0, int(aux_cfg.get("full_refresh_every", 100)))
-                slow_refresh_due = bool(
-                    full_every > 0
-                    and sparse_pending_policy_version is not None
-                    and sparse_pending_policy_version % full_every == 0
-                )
-                merge_limit = (
-                    max(sparse_record_budget, int(aux_cfg.get("full_refresh_max_tokens", 2048)))
-                    if slow_refresh_due
-                    else sparse_record_budget
-                )
                 merged_sparse_records = merge_sparse_auxiliary_records(
                     sparse_aux_record_batches,
-                    merge_limit,
+                    sparse_max_cached_records,
+                )
+                sparse_aux_record_batches[:] = (
+                    [merged_sparse_records] if merged_sparse_records else []
                 )
                 sparse_count = int(
                     merged_sparse_records.get("hidden", torch.empty(0)).shape[0]
                 )
                 head_stats["aux_records_cached"] = sparse_count
-                if sparse_count >= sparse_min_records:
-                    slow_refresh = slow_refresh_due
-                    update_records = (
-                        max(sparse_record_budget, int(aux_cfg.get("full_refresh_max_tokens", 2048)))
-                        if slow_refresh
-                        else sparse_record_budget
-                    )
+                cached_head_counts: list[int] = []
+                cached_heads = merged_sparse_records.get("head_indices")
+                if torch.is_tensor(cached_heads) and cached_heads.numel() > 0:
+                    cached_head_counts = [
+                        int(value)
+                        for value in torch.bincount(
+                            cached_heads.long(),
+                            minlength=len(medusa_heads.heads),
+                        )[: len(medusa_heads.heads)]
+                        .detach()
+                        .cpu()
+                    ]
+                head_stats["aux_cached_records_by_head"] = {
+                    str(idx + 1): count
+                    for idx, count in enumerate(cached_head_counts)
+                }
+                has_eligible_head = any(
+                    count >= sparse_min_records_per_head
+                    for count in cached_head_counts
+                )
+                rollouts_since_aux = rollout_count - sparse_last_update_rollout
+                max_overhead = max(
+                    0.0, float(aux_cfg.get("max_overhead_fraction", 0.015))
+                )
+                estimated_overhead = (
+                    median(sparse_overhead_history[-7:])
+                    * float(sparse_record_budget)
+                    if sparse_overhead_history
+                    else 0.0
+                )
+                overhead_warmup = (
+                    sparse_successful_aux_update_count
+                    < sparse_overhead_warmup_updates
+                )
+                overhead_allowed = bool(
+                    overhead_warmup
+                    or max_overhead <= 0.0
+                    or estimated_overhead <= max_overhead
+                    or sparse_overhead_bad_streak
+                    < sparse_bad_before_throttle
+                )
+                update_due = bool(
+                    sparse_count >= sparse_trigger_records
+                    and rollouts_since_aux
+                    >= sparse_min_rollouts_between_updates
+                    and has_eligible_head
+                    and overhead_allowed
+                )
+                head_stats["aux_rollouts_since_update"] = rollouts_since_aux
+                head_stats["aux_estimated_overhead_fraction"] = estimated_overhead
+                if update_due:
                     sparse_stats = medusa_trainer.update_sparse_online(
                         merged_sparse_records,
-                        records_per_update=update_records,
+                        records_per_update=sparse_record_budget,
                         max_heads_per_update=sparse_head_budget,
                         optimizer_steps=max(1, int(aux_cfg.get("optimizer_steps", 1))),
-                        all_heads=slow_refresh,
+                        all_heads=False,
                         min_records_per_selected_head=sparse_min_records_per_head,
                         head_sampling_weights=sparse_head_sampling_weights,
+                    )
+                    selected_record_indices = sparse_stats.pop(
+                        "aux_selected_record_indices", None
                     )
                     head_stats.update(sparse_stats)
                     update_time = float(sparse_stats.get("head_update_time", 0.0) or 0.0)
                     overhead_fraction = update_time / max(sparse_rollout_time_ema, 1e-9)
                     head_stats["aux_update_time"] = update_time
                     head_stats["aux_overhead_fraction"] = overhead_fraction
-                    head_stats["aux_policy_version"] = sparse_pending_policy_version
-                    head_stats["aux_slow_full_refresh"] = slow_refresh
+                    head_stats["aux_policy_version"] = sparse_policy_version
                     head_stats["aux_update_performed"] = bool(
                         int(sparse_stats.get("aux_optimizer_steps", 0) or 0) > 0
                     )
@@ -1800,28 +2055,150 @@ def run_training(config: dict[str, Any]) -> None:
                     )
                     total_head_update_time += update_time
                     if head_stats["aux_update_performed"]:
-                        sparse_last_updated_policy_version = int(sparse_pending_policy_version)
+                        selected_heads = [
+                            int(value)
+                            for value in sparse_stats.get(
+                                "aux_selected_heads", []
+                            )
+                        ]
+                        selected_head_indices = [
+                            int(value)
+                            for value in sparse_stats.get(
+                                "aux_selected_head_indices", []
+                            )
+                        ]
+                        policy_changed = (
+                            sparse_policy_version
+                            > sparse_last_updated_policy_version
+                        )
+                        if not policy_changed:
+                            num_aux_updates_triggered_without_policy_update += 1
+                        sparse_last_updated_policy_version = sparse_policy_version
+                        sparse_last_update_rollout = rollout_count
+                        records_used = max(
+                            1, int(sparse_stats.get("aux_records_used", 0) or 0)
+                        )
+                        sparse_overhead_history.append(
+                            overhead_fraction / float(records_used)
+                        )
+                        del sparse_overhead_history[:-16]
+                        sparse_successful_aux_update_count += 1
+                        head_stats["aux_successful_update_count"] = (
+                            sparse_successful_aux_update_count
+                        )
+                        if (
+                            sparse_successful_aux_update_count
+                            <= sparse_overhead_warmup_updates
+                        ):
+                            sparse_overhead_bad_streak = 0
+                            sparse_overhead_good_streak = 0
+                        else:
+                            if (
+                                max_overhead > 0.0
+                                and overhead_fraction > max_overhead
+                            ):
+                                sparse_overhead_bad_streak += 1
+                                sparse_overhead_good_streak = 0
+                            else:
+                                sparse_overhead_good_streak += 1
+                                sparse_overhead_bad_streak = 0
+                        if (
+                            sparse_overhead_bad_streak
+                            >= sparse_bad_before_throttle
+                        ):
+                            selected_record_floor = max(
+                                sparse_minimum_record_budget,
+                                len(selected_heads)
+                                * sparse_min_records_per_head,
+                            )
+                            sparse_record_budget = max(
+                                selected_record_floor,
+                                int(
+                                    sparse_record_budget
+                                    * sparse_throttle_factor
+                                ),
+                            )
+                            sparse_overhead_bad_streak = 0
+                            head_stats["aux_budget_throttled"] = True
+                        elif (
+                            sparse_overhead_good_streak
+                            >= sparse_good_before_recovery
+                            and sparse_record_budget
+                            < sparse_base_record_budget
+                        ):
+                            sparse_record_budget = min(
+                                sparse_base_record_budget,
+                                max(
+                                    sparse_record_budget + 1,
+                                    int(
+                                        sparse_record_budget
+                                        * sparse_recovery_factor
+                                    ),
+                                ),
+                            )
+                            sparse_overhead_good_streak = 0
+                            head_stats["aux_budget_recovered"] = True
+                        decoder.notify_hrdcr_auxiliary_update(
+                            selected_heads,
+                            evidence_decay=0.5,
+                        )
                         if inference_medusa_heads is not medusa_heads:
                             _sync_medusa_inference_mirror(medusa_heads, inference_medusa_heads)
                             head_stats["inference_mirror_synced"] = True
-                        decoder.reset_verification_utility_scheduler()
-                    max_overhead = max(0.0, float(aux_cfg.get("max_overhead_fraction", 0.01)))
-                    if max_overhead > 0.0 and overhead_fraction > max_overhead:
-                        sparse_record_budget = max(
-                            sparse_min_records,
-                            sparse_record_budget // 2,
+                        decoder.reset_verification_utility_scheduler(
+                            selected_head_indices
                         )
-                        sparse_head_budget = max(1, sparse_head_budget - 1)
-                        sparse_policy_interval = min(16, sparse_policy_interval * 2)
-                        head_stats["aux_budget_throttled"] = True
-                    else:
-                        head_stats["aux_budget_throttled"] = False
-                    sparse_next_allowed_policy_version = int(sparse_pending_policy_version) + sparse_policy_interval
-                    sparse_pending_policy_version = None
-                    sparse_aux_record_batches.clear()
+                        if torch.is_tensor(selected_record_indices):
+                            keep = torch.ones(
+                                sparse_count,
+                                device=selected_record_indices.device,
+                                dtype=torch.bool,
+                            )
+                            keep.index_fill_(
+                                0,
+                                selected_record_indices.to(
+                                    device=keep.device, dtype=torch.long
+                                ),
+                                False,
+                            )
+                            remaining_records = {
+                                key: value.index_select(
+                                    0,
+                                    keep.nonzero(
+                                        as_tuple=False
+                                    ).flatten().to(value.device),
+                                )
+                                for key, value in merged_sparse_records.items()
+                            }
+                            sparse_aux_record_batches[:] = (
+                                [remaining_records]
+                                if int(
+                                    remaining_records["hidden"].shape[0]
+                                )
+                                > 0
+                                else []
+                            )
                     maybe_empty_cuda_cache(config)
                 else:
-                    head_stats["aux_update_reason"] = "insufficient_sparse_records"
+                    if sparse_count < sparse_trigger_records:
+                        reason = "insufficient_sparse_records"
+                    elif not has_eligible_head:
+                        reason = "insufficient_head_records"
+                    elif (
+                        rollouts_since_aux
+                        < sparse_min_rollouts_between_updates
+                    ):
+                        reason = "minimum_rollout_interval"
+                    elif not overhead_allowed:
+                        reason = "overhead_budget"
+                    else:
+                        reason = "scheduler_not_due"
+                    head_stats["aux_update_reason"] = reason
+                    if reason in {
+                        "insufficient_sparse_records",
+                        "insufficient_head_records",
+                    }:
+                        aux_skipped_insufficient_records += 1
             target_model.train()
             medusa_heads.train()
             total_generate_time += outputs["total_time_cost"]
@@ -1881,11 +2258,18 @@ def run_training(config: dict[str, Any]) -> None:
                 ),
                 head_metrics=(aux_metrics or {}).get("per_head", {}),
             )
-            head_stats["aux_update_evaluated"] = bool(aux_decision.evaluated)
-            head_stats["aux_update_triggered"] = bool(aux_decision.triggered)
-            head_stats["aux_update_reason"] = aux_decision.reason
-            head_stats["aux_triggered_heads"] = aux_decision.triggered_heads
-            head_stats["aux_drift_scores"] = aux_decision.drift_scores
+            if medusa_update_mode == "reliability_triggered":
+                head_stats["aux_update_evaluated"] = bool(
+                    aux_decision.evaluated
+                )
+                head_stats["aux_update_triggered"] = bool(
+                    aux_decision.triggered
+                )
+                head_stats["aux_update_reason"] = aux_decision.reason
+                head_stats["aux_triggered_heads"] = (
+                    aux_decision.triggered_heads
+                )
+                head_stats["aux_drift_scores"] = aux_decision.drift_scores
 
             for prompt_idx in range(len(answers)):
                 decoded_for_prompt = []
@@ -1897,7 +2281,13 @@ def run_training(config: dict[str, Any]) -> None:
                 format_rewards = format_reward_func(decoded_for_prompt)
                 answer_rewards = accuracy_reward_func(decoded_for_prompt, [ground_truth] * repeated_generate_nums)
                 rewards = np.array([0.2 * f + a for f, a in zip(format_rewards, answer_rewards)])
+                num_groups_total += 1
+                if answer_rewards and all(float(value) >= 1.0 for value in answer_rewards):
+                    num_groups_all_correct += 1
+                if answer_rewards and all(float(value) <= 0.0 for value in answer_rewards):
+                    num_groups_all_incorrect += 1
                 if rewards.std() == 0:
+                    num_groups_zero_reward_variance += 1
                     if rewards[0] >= 1.0:
                         ignored_correct += 1
                     else:
@@ -1951,6 +2341,12 @@ def run_training(config: dict[str, Any]) -> None:
                 "tree_nodes_head3": outputs.get("tree_nodes_head3", 0),
                 "tree_total_nodes": outputs.get("tree_total_nodes", 0),
                 "tree_budget_unused": outputs.get("tree_budget_unused", 0),
+                "actual_tree_layout_counts": outputs.get(
+                    "actual_tree_layout_counts", {}
+                ),
+                "head3_conditional_path_acceptance": outputs.get(
+                    "head3_conditional_path_acceptance", 0.0
+                ),
                 "cpeak_nodes": int(cpeak_for_batch),
                 "cpeak_tuning": bool(cpeak_tuning),
                 "cpeak_selected": cpeak_tuner.selected,
@@ -1966,6 +2362,9 @@ def run_training(config: dict[str, Any]) -> None:
                 "head_update_time_ratio_vs_total": head_stats.get("head_update_time", 0.0) / max(outputs["total_time_cost"] + head_stats.get("head_update_time", 0.0), 1e-9),
                 "aux_update_time": head_stats.get("aux_update_time", 0.0),
                 "aux_optimizer_steps": head_stats.get("aux_optimizer_steps", 0),
+                "aux_successful_optimizer_steps": head_stats.get(
+                    "aux_optimizer_steps", 0
+                ),
                 "aux_records_used": head_stats.get("aux_records_used", 0),
                 "aux_records_cached": head_stats.get("aux_records_cached", 0),
                 "aux_parameter_delta_rms": head_stats.get("aux_parameter_delta_rms", 0.0),
@@ -1975,10 +2374,33 @@ def run_training(config: dict[str, Any]) -> None:
                 "head3_aux_records_used": head_stats.get("head3_aux_records_used", 0),
                 "head3_aux_optimizer_steps": head_stats.get("head3_aux_optimizer_steps", 0),
                 "aux_expected_benefit": head_stats.get("aux_expected_benefit", 0.0),
+                "aux_raw_kl_loss": head_stats.get("aux_raw_kl_loss", 0.0),
+                "aux_effective_kl_loss": head_stats.get(
+                    "aux_effective_kl_loss", 0.0
+                ),
+                "aux_coverage_loss": head_stats.get(
+                    "aux_coverage_loss", 0.0
+                ),
+                "aux_proximal_loss": head_stats.get(
+                    "aux_proximal_loss", 0.0
+                ),
                 "aux_budget_throttled": head_stats.get("aux_budget_throttled", False),
+                "aux_budget_recovered": head_stats.get(
+                    "aux_budget_recovered", False
+                ),
                 "aux_record_budget": sparse_record_budget,
                 "aux_head_budget": sparse_head_budget,
-                "aux_policy_interval": sparse_policy_interval,
+                "aux_min_rollouts_between_updates": sparse_min_rollouts_between_updates,
+                "aux_rollouts_since_update": head_stats.get(
+                    "aux_rollouts_since_update",
+                    rollout_count - sparse_last_update_rollout,
+                ),
+                "aux_estimated_overhead_fraction": head_stats.get(
+                    "aux_estimated_overhead_fraction", 0.0
+                ),
+                "aux_cached_records_by_head": head_stats.get(
+                    "aux_cached_records_by_head", {}
+                ),
                 "aux_policy_version": head_stats.get("aux_policy_version", sparse_policy_version),
                 "medusa_update_mode": medusa_update_mode,
                 "online_ce_update_due": head_stats.get("online_ce_update_due", False),
@@ -1996,6 +2418,40 @@ def run_training(config: dict[str, Any]) -> None:
                 "reflex_aux_cache_collected": bool(collect_reflex_aux_cache),
                 "reflex_aux_cached_records": int((outputs.get("reflex_aux_records", {}).get("hidden").shape[0]) if outputs.get("reflex_aux_records", {}).get("hidden") is not None else 0),
                 "reflex": outputs.get("reflex_metrics", {}),
+                "active_injection_fraction": outputs.get(
+                    "reflex_metrics", {}
+                ).get("active_injection_fraction", 0.0),
+                "conditional_correction_to_hidden_rms_ratio": outputs.get(
+                    "reflex_metrics", {}
+                ).get(
+                    "conditional_correction_to_hidden_rms_ratio", 0.0
+                ),
+                "unconditional_correction_to_hidden_rms_ratio": outputs.get(
+                    "reflex_metrics", {}
+                ).get(
+                    "unconditional_correction_to_hidden_rms_ratio", 0.0
+                ),
+                "candidate_set_changed_fraction": outputs.get(
+                    "reflex_metrics", {}
+                ).get("candidate_set_changed_fraction", 0.0),
+                "candidate_mass_gain": outputs.get(
+                    "reflex_metrics", {}
+                ).get("candidate_mass_gain", 0.0),
+                "net_counterfactual_wins": outputs.get(
+                    "reflex_metrics", {}
+                ).get("reflex_net_wins", 0),
+                "num_groups_total": num_groups_total,
+                "num_groups_zero_reward_variance": (
+                    num_groups_zero_reward_variance
+                ),
+                "num_groups_all_correct": num_groups_all_correct,
+                "num_groups_all_incorrect": num_groups_all_incorrect,
+                "num_aux_updates_triggered_without_policy_update": (
+                    num_aux_updates_triggered_without_policy_update
+                ),
+                "aux_skipped_insufficient_records": (
+                    aux_skipped_insufficient_records
+                ),
                 "motivation_trace": outputs.get("motivation_trace", []),
                 "motivation_adaptation_mode": str(reflex_cfg.get("adaptation_mode", "immediate")),
                 "motivation_generation_hashes": (
@@ -2090,7 +2546,21 @@ def run_training(config: dict[str, Any]) -> None:
                     _sync_medusa_inference_mirror(medusa_heads, inference_medusa_heads)
                     boundary_aux_stats["inference_mirror_synced"] = True
                 if bool(refresh_stats.get("refresh_committed", False)):
-                    decoder.reset_verification_utility_scheduler()
+                    refreshed_heads = refresh_stats.get(
+                        "aux_triggered_heads", []
+                    )
+                    selected_head_indices = (
+                        [
+                            int(head) - 1
+                            for head in refreshed_heads
+                            if int(head) > 0
+                        ]
+                        if refreshed_heads
+                        else None
+                    )
+                    decoder.reset_verification_utility_scheduler(
+                        selected_head_indices
+                    )
                 refresh_wall_time = time.time() - refresh_start
                 boundary_aux_stats["aux_update_wall_time"] = refresh_wall_time
                 total_head_update_time += refresh_wall_time
@@ -2206,8 +2676,6 @@ def run_training(config: dict[str, Any]) -> None:
 
             if sparse_aux_enabled:
                 sparse_policy_version += max(1, grpo_iteration_num)
-                sparse_pending_policy_version = sparse_policy_version
-                sparse_aux_record_batches.clear()
 
             aux_periodic_path = aux_refresher.maybe_save_periodic(
                 grpo_step=step,
@@ -2272,6 +2740,27 @@ def run_training(config: dict[str, Any]) -> None:
         "total_head3_aux_records_used": int(total_head3_aux_records_used),
         "total_head3_aux_optimizer_steps": int(total_head3_aux_optimizer_steps),
         "max_aux_overhead_fraction": float(max_aux_overhead_fraction),
+        "aux_final_record_budget": int(sparse_record_budget),
+        "aux_buffered_records_remaining": int(
+            sparse_aux_record_batches[0]["hidden"].shape[0]
+            if sparse_aux_record_batches
+            and torch.is_tensor(
+                sparse_aux_record_batches[0].get("hidden")
+            )
+            else 0
+        ),
+        "aux_skipped_insufficient_records": int(
+            aux_skipped_insufficient_records
+        ),
+        "num_aux_updates_triggered_without_policy_update": int(
+            num_aux_updates_triggered_without_policy_update
+        ),
+        "num_groups_total": int(num_groups_total),
+        "num_groups_zero_reward_variance": int(
+            num_groups_zero_reward_variance
+        ),
+        "num_groups_all_correct": int(num_groups_all_correct),
+        "num_groups_all_incorrect": int(num_groups_all_incorrect),
         "medusa_update_mode": medusa_update_mode,
         "total_online_ce_updates": int(total_online_ce_updates),
         "total_online_ce_tokens": int(total_online_ce_tokens),

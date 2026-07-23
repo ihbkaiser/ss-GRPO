@@ -23,7 +23,7 @@ flashgrpo:
   # MEDUSA continuation per sequence (128 target query rows total); deeper
   # heads turn on automatically as concurrency falls. A larger fixed budget
   # raised raw AAL but spent more target FLOPs per accepted output token.
-  cpeak_nodes: 128
+  cpeak_nodes: 512
   auto_tune_cpeak_enabled: false
   auto_tune_cpeak_candidates: [128, 192, 256, 384, 512, 768]
   auto_tune_cpeak_trials_per_candidate: 3

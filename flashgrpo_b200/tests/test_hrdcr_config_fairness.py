@@ -18,13 +18,19 @@ def _differences(left, right, prefix=""):
     return [] if left == right else [prefix]
 
 
-def test_head_only_ablation_changes_only_reflex_switches_and_identity():
+def test_medusa_only_ablation_preserves_workload_and_disables_hrdcr_work():
     main = load_config(MAIN_CONFIG)
     ablation = load_config(ABLATION_CONFIG)
     allowed = {
         "method",
         "run_name",
+        "reflex.enabled",
+        "reflex.feedback_enabled",
         "reflex.proposal_injection_enabled",
+        "aux_update.enabled",
+        "aux_update.mode",
+        "flashgrpo.online_medusa",
+        "flashgrpo.medusa_update_mode",
     }
     assert set(_differences(main, ablation)) == allowed
     assert main["training"]["train_data_fraction"] == 0.4

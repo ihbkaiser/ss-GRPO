@@ -3,12 +3,18 @@ inherits: train_hrdcr.yaml
 method: medusa_only
 run_name: qwen25_1p5b_medusa_only
 
-# Fair proposal ablation: feedback, m_t, trust and sparse head updates remain on.
-# Only the proposal-hidden injection is disabled.
+# Static pretrained MEDUSA baseline. Generation and verifier budgets are
+# inherited unchanged; only HRDCR and its auxiliary learner are absent.
 reflex:
   enabled: true
   feedback_enabled: true
   proposal_injection_enabled: false
+  feedback_stride: 2
 
 aux_update:
-  enabled: true
+  enabled: false
+  mode: none
+
+flashgrpo:
+  online_medusa: false
+  medusa_update_mode: none

@@ -7,6 +7,12 @@ reflex:
   enabled: true
   feedback_enabled: true
   proposal_injection_enabled: false
+  feedback_stride: 2
 
 aux_update:
-  enabled: true
+  enabled: false
+  mode: none
+
+flashgrpo:
+  online_medusa: false
+  medusa_update_mode: none

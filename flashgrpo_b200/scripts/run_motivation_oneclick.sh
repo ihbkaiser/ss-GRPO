@@ -103,7 +103,7 @@ for lag in $lags; do
   MODEL_DIR="$model_dir" \
   MOTIVATION_PROMPTS="${MOTIVATION_PROMPTS:-64}" \
   TRACE_WINDOW_TOKENS="${TRACE_WINDOW_TOKENS:-32}" \
-  CPEAK_NODES="${CPEAK_NODES:-128}" \
+  CPEAK_NODES="${CPEAK_NODES:-512}" \
     bash flashgrpo_b200/scripts/run_within_rollout_motivation.sh
   completed_pairs=$((completed_pairs + 1))
 done

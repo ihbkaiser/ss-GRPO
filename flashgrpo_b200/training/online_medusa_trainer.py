@@ -41,10 +41,12 @@ class OnlineMedusaConfig:
     acceptance_candidate_topk_by_head: tuple[int, ...] = (4, 3, 2)
     acceptance_rank_temperature: float = 0.5
     sparse_support_cap: int = 48
-    sparse_kl_weight: float = 0.25
+    sparse_raw_kl_weight: float = 1.0
+    sparse_effective_kl_weight: float = 0.25
     sparse_coverage_weight: float = 1.0
-    sparse_proximal_weight: float = 0.05
-    sparse_ranking_margin: float = 0.5
+    sparse_proximal_weight: float = 0.01
+    sparse_ranking_margin: float = 0.20
+    sparse_temperature: float = 1.0
     sparse_min_expected_benefit: float = 1e-3
     sparse_relative_rms_delta: float = 0.02
     sparse_correction_ratio_min: float = 0.005
@@ -410,6 +412,17 @@ class OnlineMedusaTrainer:
             "candidate_hit", torch.ones_like(candidate_mass, dtype=torch.bool)
         ).to(device=device, dtype=torch.bool)
         min_per_head = max(1, int(min_records_per_selected_head))
+        limit = max(1, int(records_per_update))
+        if limit < min_per_head:
+            return {
+                "medusa_loss": 0.0,
+                "head_update_time": time.time() - start_time,
+                "head_update_steps": 0,
+                "aux_records_used": 0,
+                "aux_selected_heads": [],
+                "aux_expected_benefit": 0.0,
+                "aux_update_reason": "record_budget_below_head_quota",
+            }
         sampling_weights = list(head_sampling_weights or [])
         available: list[tuple[float, int, int]] = []
         for head_idx in range(len(self.medusa_heads.heads)):
@@ -417,28 +430,33 @@ class OnlineMedusaTrainer:
             count = int(mask.sum().detach().cpu())
             if count >= min_per_head:
                 weight = float(sampling_weights[head_idx]) if head_idx < len(sampling_weights) else 1.0
+                candidate_mass_loss = 1.0 - candidate_mass[mask]
+                acceptance_degradation = (~candidate_hit[mask]).float()
+                volume_bonus = 0.05 * torch.log1p(
+                    candidate_mass.new_tensor(float(count))
+                )
                 score = (
                     candidate_regret[mask].mean()
+                    + candidate_mass_loss.mean()
                     + 0.25 * restricted_kl[mask].mean()
-                    + 0.25 * (~candidate_hit[mask]).float().mean()
+                    + 0.50 * acceptance_degradation.mean()
+                    + volume_bonus
                 )
                 benefit = float((weight * score).detach().cpu())
                 available.append((benefit, head_idx, count))
         available.sort(reverse=True)
-        if all_heads:
-            selected_heads = [head for _, head, _ in available]
-        else:
-            selected_heads = [
-                head
-                for benefit, head, _ in available
-                if benefit > float(self.config.sparse_min_expected_benefit)
-            ][: max(1, int(max_heads_per_update))]
-            # The deepest calibrated head gets one slot whenever it has enough
-            # records. This prevents shallow-head volume from starving Head 3.
-            deepest = max((head for _, head, _ in available), default=-1)
-            if deepest >= 2 and deepest not in selected_heads:
-                budget = max(1, int(max_heads_per_update))
-                selected_heads = (selected_heads[: max(0, budget - 1)] + [deepest])[:budget]
+        max_feasible_heads = max(1, limit // min_per_head)
+        configured_max_heads = len(available) if all_heads else max(
+            1, int(max_heads_per_update)
+        )
+        selected_head_count = min(
+            configured_max_heads,
+            max_feasible_heads,
+            len(available),
+        )
+        selected_heads = [
+            head for _, head, _ in available[:selected_head_count]
+        ]
         expected_benefit = max(
             (benefit for benefit, head, _ in available if head in selected_heads), default=0.0
         )
@@ -450,25 +468,19 @@ class OnlineMedusaTrainer:
                 "aux_records_used": 0,
                 "aux_selected_heads": [],
                 "aux_expected_benefit": float(expected_benefit),
-                "aux_update_reason": "zero_expected_benefit",
+                "aux_update_reason": "insufficient_head_records",
             }
 
-        limit = max(1, int(records_per_update))
-        if limit < min_per_head:
-            return {
-                "medusa_loss": 0.0,
-                "head_update_time": time.time() - start_time,
-                "head_update_steps": 0,
-                "aux_records_used": 0,
-                "aux_selected_heads": [],
-                "aux_expected_benefit": float(expected_benefit),
-                "aux_update_reason": "record_budget_below_head_quota",
-            }
-        if limit < min_per_head * len(selected_heads):
-            selected_heads = selected_heads[: max(1, limit // min_per_head)]
+        assert len(selected_heads) <= max_feasible_heads
+        assert limit >= min_per_head * len(selected_heads)
         quota_rows: list[torch.Tensor] = []
         remainder_rows: list[torch.Tensor] = []
-        priority_all = candidate_regret + 0.25 * restricted_kl + 0.25 * (~candidate_hit).float()
+        priority_all = (
+            candidate_regret
+            + (1.0 - candidate_mass)
+            + 0.25 * restricted_kl
+            + 0.50 * (~candidate_hit).float()
+        )
         for head_idx in selected_heads:
             rows = head_indices.eq(head_idx).nonzero(as_tuple=False).flatten()
             weight = float(sampling_weights[head_idx]) if head_idx < len(sampling_weights) else 1.0
@@ -519,8 +531,13 @@ class OnlineMedusaTrainer:
                 if parameter.requires_grad
             )
         before = [(parameter, parameter.detach().clone()) for parameter in trainable]
+        before_by_id = {id(parameter): old for parameter, old in before}
         self.medusa_heads.train()
         total_loss = 0.0
+        total_raw_kl = 0.0
+        total_effective_kl = 0.0
+        total_coverage = 0.0
+        total_proximal = 0.0
         total_microbatches = 0
         performed_steps = 0
         micro = max(1, int(self.config.reflex_record_microbatch_size))
@@ -540,34 +557,58 @@ class OnlineMedusaTrainer:
                         0, index.to(device=selected["hidden"].device)
                     ).to(device=device, dtype=next(self.medusa_heads.parameters()).dtype)
                     projected = self.medusa_heads.heads[head_idx].project_hidden(anchor)
-                    fast = selected["fast_state"].index_select(
-                        0, index.to(device=selected["fast_state"].device)
-                    ).to(device=device, dtype=torch.float32)
-                    trust = selected["trust"].index_select(
-                        0, index.to(device=selected["trust"].device)
-                    ).to(device=device, dtype=torch.float32)
-                    base_rms = projected.float().square().mean(dim=-1, keepdim=True).sqrt()
-                    target_ratio = torch.where(
-                        trust.unsqueeze(-1).gt(0.0),
-                        (
-                            float(self.config.sparse_correction_ratio_min)
-                            + (
-                                float(self.config.sparse_correction_ratio_max)
-                                - float(self.config.sparse_correction_ratio_min)
-                            )
-                            * trust.unsqueeze(-1)
+                    applied_ratio = selected.get(
+                        "applied_correction_ratio",
+                        torch.zeros(
+                            int(selected["hidden"].shape[0]),
+                            device=selected["hidden"].device,
                         ),
-                        torch.zeros_like(trust.unsqueeze(-1)),
+                    ).index_select(
+                        0,
+                        index.to(
+                            device=selected.get(
+                                "applied_correction_ratio",
+                                selected["hidden"],
+                            ).device
+                        ),
+                    ).to(device=device, dtype=torch.float32)
+                    stored_injection_active = selected.get("injection_active")
+                    injection_active = (
+                        stored_injection_active.index_select(
+                            0, index.to(device=stored_injection_active.device)
+                        ).to(device=device, dtype=torch.bool)
+                        if torch.is_tensor(stored_injection_active)
+                        else applied_ratio.gt(0.0)
                     )
-                    correction = (
-                        target_ratio
-                        * base_rms
-                        * (
-                            fast
-                            / fast.float().square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+                    applied_ratio = applied_ratio.masked_fill(~injection_active, 0.0)
+                    stored_delta = selected.get("applied_correction_delta")
+                    if torch.is_tensor(stored_delta):
+                        correction = stored_delta.index_select(
+                            0, index.to(device=stored_delta.device)
+                        ).to(device=device, dtype=projected.dtype)
+                        correction = correction.masked_fill(
+                            ~injection_active.unsqueeze(-1), 0.0
                         )
-                    )
-                    corrected = projected + correction.to(dtype=projected.dtype)
+                    else:
+                        # Backward compatibility for records cached before exact
+                        # proposal-time correction deltas were introduced.
+                        fast = selected["fast_state"].index_select(
+                            0, index.to(device=selected["fast_state"].device)
+                        ).to(device=device, dtype=torch.float32)
+                        base_rms = projected.float().square().mean(
+                            dim=-1, keepdim=True
+                        ).sqrt()
+                        correction = (
+                            applied_ratio.unsqueeze(-1)
+                            * base_rms
+                            * (
+                                fast
+                                / fast.float().square().mean(
+                                    dim=-1, keepdim=True
+                                ).sqrt().clamp_min(1e-6)
+                            )
+                        ).to(dtype=projected.dtype)
+                    corrected = projected + correction
 
                     support_ids = selected["support_ids"].index_select(
                         0, index.to(device=selected["support_ids"].device)
@@ -584,53 +625,124 @@ class OnlineMedusaTrainer:
                     support_weight = lm_weight.index_select(0, safe_support_ids.reshape(-1)).view(
                         int(index.numel()), int(support_ids.shape[1]), int(lm_weight.shape[1])
                     )
-                    logits = torch.einsum("rsh,rh->rs", support_weight, corrected.to(lm_weight.dtype)).float()
+                    raw_logits = torch.einsum(
+                        "rsh,rh->rs",
+                        support_weight,
+                        projected.to(lm_weight.dtype),
+                    ).float()
+                    effective_logits = torch.einsum(
+                        "rsh,rh->rs",
+                        support_weight,
+                        corrected.to(lm_weight.dtype),
+                    ).float()
                     target_logits = selected["target_logits"].index_select(
                         0, index.to(device=selected["target_logits"].device)
                     ).to(device=device, dtype=torch.float32)
-                    masked_target = target_logits.masked_fill(~support_valid, -torch.inf)
-                    masked_logits = logits.masked_fill(~support_valid, -torch.inf)
+                    temperature = max(float(self.config.sparse_temperature), 1e-6)
+                    masked_target = (target_logits / temperature).masked_fill(
+                        ~support_valid, -torch.inf
+                    )
+                    masked_raw = (raw_logits / temperature).masked_fill(
+                        ~support_valid, -torch.inf
+                    )
+                    masked_effective = (effective_logits / temperature).masked_fill(
+                        ~support_valid, -torch.inf
+                    )
                     p = torch.softmax(masked_target, dim=-1).masked_fill(~support_valid, 0.0)
                     log_p = torch.log_softmax(masked_target, dim=-1).masked_fill(~support_valid, 0.0)
-                    log_q = torch.log_softmax(masked_logits, dim=-1).masked_fill(~support_valid, 0.0)
-                    kl = (p * (log_p - log_q)).sum(dim=-1)
+                    raw_log_q = torch.log_softmax(masked_raw, dim=-1).masked_fill(
+                        ~support_valid, 0.0
+                    )
+                    effective_log_q = torch.log_softmax(
+                        masked_effective, dim=-1
+                    ).masked_fill(~support_valid, 0.0)
+                    raw_kl = (p * (log_p - raw_log_q)).sum(dim=-1)
+                    effective_kl = (p * (log_p - effective_log_q)).sum(dim=-1)
 
-                    candidate_ids = selected["candidate_ids"].index_select(
-                        0, index.to(device=selected["candidate_ids"].device)
-                    ).to(device=device, dtype=torch.long)
-                    candidate_valid = selected["candidate_valid"].index_select(
-                        0, index.to(device=selected["candidate_valid"].device)
-                    ).to(device=device, dtype=torch.bool)
-                    candidate_valid = (
-                        candidate_valid
-                        & candidate_ids.ge(0)
-                        & candidate_ids.lt(int(lm_weight.shape[0]))
+                    important_ids = selected.get("important_omitted_ids")
+                    boundary_ids = selected.get("candidate_boundary_ids")
+                    if torch.is_tensor(important_ids) and torch.is_tensor(boundary_ids):
+                        important_ids = important_ids.index_select(
+                            0, index.to(device=important_ids.device)
+                        ).to(device=device, dtype=torch.long)
+                        boundary_ids = boundary_ids.index_select(
+                            0, index.to(device=boundary_ids.device)
+                        ).to(device=device, dtype=torch.long)
+                    else:
+                        important_ids = selected["actual_tokens"].index_select(
+                            0, index.to(device=selected["actual_tokens"].device)
+                        ).to(device=device, dtype=torch.long)
+                        candidate_ids = selected["candidate_ids"].index_select(
+                            0, index.to(device=selected["candidate_ids"].device)
+                        ).to(device=device, dtype=torch.long)
+                        candidate_valid = selected["candidate_valid"].index_select(
+                            0, index.to(device=selected["candidate_valid"].device)
+                        ).to(device=device, dtype=torch.bool)
+                        last_candidate = (
+                            candidate_valid.sum(dim=-1) - 1
+                        ).clamp_min(0)
+                        boundary_ids = torch.gather(
+                            candidate_ids, 1, last_candidate.unsqueeze(-1)
+                        ).squeeze(-1)
+                    valid_boundary = (
+                        important_ids.ge(0)
+                        & important_ids.lt(int(lm_weight.shape[0]))
+                        & boundary_ids.ge(0)
+                        & boundary_ids.lt(int(lm_weight.shape[0]))
                     )
-                    safe_candidate_ids = candidate_ids.masked_fill(~candidate_valid, 0)
-                    in_candidate = (
-                        support_ids.unsqueeze(-1).eq(candidate_ids.unsqueeze(1))
-                        & support_valid.unsqueeze(-1)
-                        & candidate_valid.unsqueeze(1)
-                    ).any(dim=-1)
-                    candidate_weight = lm_weight.index_select(
-                        0, safe_candidate_ids.reshape(-1)
-                    ).view(int(index.numel()), int(candidate_ids.shape[1]), int(lm_weight.shape[1]))
-                    candidate_logits = torch.einsum(
-                        "rkh,rh->rk", candidate_weight, corrected.to(lm_weight.dtype)
-                    ).float().masked_fill(~candidate_valid, -torch.inf)
-                    boundary = candidate_logits.masked_fill(~candidate_valid, torch.inf).min(dim=-1).values
-                    ranking = p * (~in_candidate) * F.softplus(
-                        float(self.config.sparse_ranking_margin) + boundary.unsqueeze(-1) - logits
+                    safe_important = important_ids.masked_fill(~valid_boundary, 0)
+                    safe_boundary = boundary_ids.masked_fill(~valid_boundary, 0)
+                    important_weight = lm_weight.index_select(0, safe_important)
+                    boundary_weight = lm_weight.index_select(0, safe_boundary)
+                    important_logits = torch.einsum(
+                        "rh,rh->r",
+                        important_weight,
+                        projected.to(lm_weight.dtype),
+                    ).float()
+                    boundary_logits = torch.einsum(
+                        "rh,rh->r",
+                        boundary_weight,
+                        projected.to(lm_weight.dtype),
+                    ).float()
+                    coverage_rows = F.softplus(
+                        float(self.config.sparse_ranking_margin)
+                        + boundary_logits
+                        - important_logits
                     )
-                    coverage = ranking.masked_fill(~support_valid, 0.0).sum(dim=-1)
+                    coverage = (
+                        coverage_rows.masked_fill(~valid_boundary, 0.0).sum()
+                        / valid_boundary.sum().clamp_min(1)
+                    )
+                    head_params = [
+                        parameter
+                        for parameter in self.medusa_heads.heads[head_idx].parameters()
+                        if parameter.requires_grad
+                    ]
+                    proximal = torch.stack(
+                        [
+                            (parameter.float() - before_by_id[id(parameter)].float())
+                            .square()
+                            .mean()
+                            for parameter in head_params
+                        ]
+                    ).mean() if head_params else projected.new_zeros(())
                     loss = (
-                        float(self.config.sparse_kl_weight) * kl.mean()
-                        + float(self.config.sparse_coverage_weight) * coverage.mean()
+                        float(self.config.sparse_raw_kl_weight) * raw_kl.mean()
+                        + float(self.config.sparse_effective_kl_weight)
+                        * effective_kl.mean()
+                        + float(self.config.sparse_coverage_weight) * coverage
+                        + float(self.config.sparse_proximal_weight) * proximal
                     )
                     if not torch.isfinite(loss) or not loss.requires_grad:
                         continue
                     (loss / max(1, len(selected_heads))).backward()
                     total_loss += float(loss.detach().cpu())
+                    total_raw_kl += float(raw_kl.mean().detach().cpu())
+                    total_effective_kl += float(
+                        effective_kl.mean().detach().cpu()
+                    )
+                    total_coverage += float(coverage.detach().cpu())
+                    total_proximal += float(proximal.detach().cpu())
                     total_microbatches += 1
                     step_microbatches += 1
             if step_microbatches:
@@ -654,11 +766,19 @@ class OnlineMedusaTrainer:
         elapsed = time.time() - start_time
         return {
             "medusa_loss": total_loss / max(total_microbatches, 1),
+            "aux_raw_kl_loss": total_raw_kl / max(total_microbatches, 1),
+            "aux_effective_kl_loss": total_effective_kl
+            / max(total_microbatches, 1),
+            "aux_coverage_loss": total_coverage / max(total_microbatches, 1),
+            "aux_proximal_loss": total_proximal / max(total_microbatches, 1),
             "head_update_time": elapsed,
             "head_update_steps": int(performed_steps),
             "aux_optimizer_steps": int(performed_steps),
             "aux_records_used": int(total_records),
             "aux_selected_heads": [int(head + 1) for head in selected_heads],
+            "aux_selected_head_indices": [
+                int(head) for head in selected_heads
+            ],
             "aux_records_used_by_head": {
                 str(int(head + 1)): int(
                     selected["head_indices"].to(device=device, dtype=torch.long).eq(head).sum().detach().cpu()
@@ -670,6 +790,7 @@ class OnlineMedusaTrainer:
             ),
             "head3_aux_optimizer_steps": int(performed_steps if 2 in selected_heads else 0),
             "aux_expected_benefit": float(expected_benefit),
+            "aux_selected_record_indices": selected_rows.detach(),
             "aux_parameter_delta_rms": (delta_ms / max(delta_count, 1)) ** 0.5,
             "refresh_committed": bool(performed_steps > 0),
             "aux_update_reason": "sparse_online" if performed_steps else "no_finite_sparse_loss",

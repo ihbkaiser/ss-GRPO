@@ -35,6 +35,7 @@ def test_sparse_support_contains_proposal_target_and_actual_token():
         anchor_hidden=torch.randn(1, hidden),
         fast_states=state,
         trust=manager.trust([0]),
+        ratio_scales=None,
         state_sketch=manager.sketch(state),
     )
     mature = buffer.pop_mature(torch.tensor([0]), torch.tensor([5]))
@@ -97,6 +98,9 @@ def test_strict_injection_preserves_state_magnitude_and_relative_rms_cap():
             reflex_min_effective_updates=0,
             reflex_correction_ratio_min=0.005,
             reflex_correction_ratio_max=0.02,
+            reflex_min_effective_updates_by_head=(0,),
+            reflex_correction_ratio_min_by_head=(0.005,),
+            reflex_correction_ratio_max_by_head=(0.02,),
         ),
     )
     base = torch.randn(2, hidden)
@@ -121,7 +125,7 @@ def test_sparse_auxiliary_update_never_backprops_into_target():
         optimizer,
         OnlineMedusaConfig(
             reflex_record_microbatch_size=4,
-            sparse_kl_weight=0.25,
+            sparse_effective_kl_weight=0.25,
             sparse_coverage_weight=1.0,
         ),
     )
@@ -140,6 +144,11 @@ def test_sparse_auxiliary_update_never_backprops_into_target():
         "actual_tokens": torch.full((count,), 2, dtype=torch.long),
         "fast_state": torch.zeros(count, hidden),
         "trust": torch.zeros(count),
+        "injection_active": torch.ones(count, dtype=torch.bool),
+        "applied_correction_ratio": torch.ones(count),
+        "applied_correction_delta": torch.zeros(
+            count, hidden, dtype=torch.bfloat16
+        ),
     }
     before_head_0 = [parameter.detach().clone() for parameter in heads.heads[0].parameters()]
     before_head_1 = [parameter.detach().clone() for parameter in heads.heads[1].parameters()]
@@ -161,3 +170,6 @@ def test_sparse_auxiliary_update_never_backprops_into_target():
         for before, after in zip(before_head_1, heads.heads[1].parameters())
     )
     assert target.lm_head.weight.grad is None
+    assert abs(
+        stats["aux_raw_kl_loss"] - stats["aux_effective_kl_loss"]
+    ) < 1e-6

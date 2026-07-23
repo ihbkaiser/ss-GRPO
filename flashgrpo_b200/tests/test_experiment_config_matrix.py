@@ -50,13 +50,15 @@ def test_model_config_matrix_and_fair_ablation():
         assert normalized["reflex"]["half_life_tokens"] == 32
         assert normalized["reflex"]["relative_rms_delta_base"] == 0.02
         assert normalized["reflex"]["warmup_effective_updates"] == 0.0
-        assert ablation["reflex"]["enabled"] is True
-        assert ablation["reflex"]["feedback_enabled"] is True
+        assert ablation["reflex"]["enabled"] is False
+        assert ablation["reflex"]["feedback_enabled"] is False
         assert ablation["reflex"]["proposal_injection_enabled"] is False
         assert ablation["reflex"]["strict_horizon_pipeline"] is True
         assert main["flashgrpo"]["medusa_update_mode"] == "sparse_online"
-        assert ablation["flashgrpo"]["medusa_update_mode"] == "sparse_online"
-        assert main["aux_update"] == ablation["aux_update"]
+        assert ablation["flashgrpo"]["medusa_update_mode"] == "none"
+        assert ablation["flashgrpo"]["online_medusa"] is False
+        assert ablation["aux_update"]["enabled"] is False
+        assert ablation["aux_update"]["mode"] == "none"
         assert normalized["aux_update"] == main["aux_update"]
         for section, field in FAIR_FIELDS:
             assert main[section][field] == ablation[section][field]

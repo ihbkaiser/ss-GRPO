@@ -18,9 +18,8 @@ training:
 
 flashgrpo:
   medusa_heads_checkpoint: outputs/pretrain/qwen25_1p5b
-  cpeak_nodes: 256
+  cpeak_nodes: 512
   auto_tune_cpeak_candidates: [256, 384, 512, 768, 1024]
 
 logging:
   log_dir: logs/flashgrpo_b200/qwen25_1p5b/train/{run_name}
-

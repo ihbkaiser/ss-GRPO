@@ -231,6 +231,26 @@ class Head3QualityCalibrator:
     def snapshot(self) -> torch.Tensor | None:
         return self._counters.detach().clone() if self._counters is not None else None
 
+    @torch.no_grad()
+    def decay_evidence(self, factor: float = 0.5) -> None:
+        """Discount stale Head-3 calibration without erasing its history."""
+
+        if self._bin_mature is None:
+            return
+        factor = min(1.0, max(0.0, float(factor)))
+        for value in (
+            self._bin_mature,
+            self._bin_accepted,
+            self._bin_mass_gain,
+            self._bin_probe_count,
+        ):
+            value.mul_(factor)
+        self._acceptance_ema.copy_(
+            self._acceptance_ema.new_tensor(0.5)
+            + factor * (self._acceptance_ema - 0.5)
+        )
+        self._regret_ema.mul_(factor)
+
     def summary(self, since: torch.Tensor | None = None) -> dict[str, float | int]:
         if self._counters is None:
             return {
@@ -399,7 +419,12 @@ def plan_tree(
 
         # A budget that can support the third horizon must not silently starve
         # it because earlier dense branches consumed all slots.
-        if max_heads >= 3 and budget >= int(sparse_head3_min_budget):
+        if (
+            max_heads >= 3
+            and budget >= int(sparse_head3_min_budget)
+            and len(requested) >= 3
+            and int(requested[2]) > 0
+        ):
             required = max(1, int(sparse_min_head3_nodes))
             deficit = max(0, required - allocated[2])
             for donor in (1, 0):
