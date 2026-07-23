@@ -1,0 +1,9 @@
+inherits: ../_shared/pretrain_heads.yaml
+
+model_name_or_path: /workspace/storage-shared/models/Qwen2.5-3B-Instruct
+output_dir: outputs/pretrain/qwen25_3b
+log_dir: logs/flashgrpo_b200/qwen25_3b/pretrain
+attn_implementation: flash_attention_2
+batch_size: 8
+gradient_accumulation_steps: 4
+loss_chunk_size: 64

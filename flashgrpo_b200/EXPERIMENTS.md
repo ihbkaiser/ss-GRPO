@@ -5,9 +5,11 @@
 | Model | Pretrain | Train |
 | --- | --- | --- |
 | Qwen2.5-1.5B | `pretrain_qwen25_1p5b.sh` | `train_qwen25_1p5b.sh` |
+| Qwen2.5-3B | `pretrain_qwen25_3b.sh` | `train_qwen25_3b.sh` |
 | Qwen3-4B | `pretrain_qwen3_4b.sh` | `train_qwen3_4b.sh` |
 | Qwen2.5-7B | `pretrain_qwen25_7b.sh` | `train_qwen25_7b.sh` |
 | Llama-3.1-8B | `pretrain_llama31_8b.sh` | `train_llama31_8b.sh` |
+| Qwen2.5-14B | `pretrain_qwen25_14b.sh` | `train_qwen25_14b.sh` |
 
 Checkpoint and log paths are separated:
 
@@ -43,6 +45,9 @@ are written under the model-specific log tree, not mixed with checkpoint files.
 Qwen2.5 pretraining requests FlashAttention-2 and safely falls back to eager attention
 when `flash_attn` is unavailable. Tree verification during GRPO remains on SDPA because
 it requires an arbitrary 4D ancestor mask.
+
+The 3B defaults use `8x4` for both pretraining and GRPO. The 14B defaults use
+`2x16` for pretraining and `4x8` for GRPO. All retain an effective batch of 32.
 
 ## Train HRDCR
 

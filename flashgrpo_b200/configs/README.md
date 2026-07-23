@@ -6,8 +6,10 @@ The canonical configs are grouped by model:
 configs/
   _shared/             # Common HRDCR workload and MEDUSA pretraining defaults
   qwen25_1p5b/
+  qwen25_3b/
   qwen3_4b/
   qwen25_7b/
+  qwen25_14b/
   llama31_8b/
 ```
 
@@ -21,3 +23,12 @@ Each model directory contains:
 
 Files outside these directories are retained for compatibility with previous runs.
 New experiments should use the per-model shell launchers at the package root.
+
+The Qwen2.5 launchers expect the local instruct checkpoints under:
+
+```text
+/workspace/storage-shared/models/Qwen2.5-1.5B-Instruct
+/workspace/storage-shared/models/Qwen2.5-3B-Instruct
+/workspace/storage-shared/models/Qwen2.5-7B-Instruct
+/workspace/storage-shared/models/Qwen2.5-14B-Instruct
+```

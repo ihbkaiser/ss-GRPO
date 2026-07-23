@@ -10,8 +10,9 @@ reflex:
   feedback_stride: 2
 
 aux_update:
-  enabled: false
-  mode: none
+  enabled: true
+  mode: sparse_online
+  learning_rate: 0.0
 
 flashgrpo:
   online_medusa: false

@@ -1,10 +1,8 @@
 inherits: train_hrdcr.yaml
 
 method: medusa_only
-run_name: qwen25_1p5b_medusa_only
+run_name: qwen25_3b_medusa_only
 
-# Static pretrained MEDUSA baseline. Generation and verifier budgets are
-# inherited unchanged; only HRDCR and its auxiliary learner are absent.
 reflex:
   enabled: true
   feedback_enabled: true

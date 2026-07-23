@@ -1,0 +1,2 @@
+# Backward-compatible alias. The canonical HRDCR config is already normalized.
+inherits: train_hrdcr.yaml

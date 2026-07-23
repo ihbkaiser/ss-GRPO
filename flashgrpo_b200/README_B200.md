@@ -9,8 +9,8 @@ Canonical B200 defaults:
 - target model dtype is loaded from config and defaults to `bf16`;
 - Qwen 7B uses fused PyTorch SDPA because MEDUSA tree verification requires a
   custom 4D ancestor mask;
-- effective prompt-group batch is 32 by default (`16x2` for 1.5B and `8x4`
-  for 4B-8B models);
+- effective prompt-group batch is 32 by default (`16x2` for 1.5B, `8x4`
+  for 3B-8B models, and `4x8` for 14B);
 - GRPO training token budget is `max_training_token: 8192`;
 - the throughput-first tree budget is `cpeak_nodes: 512` with at most 10 nodes
   per sequence; the first 18 rollout batches test six hardware budgets and
@@ -24,9 +24,9 @@ Canonical B200 defaults:
 - `empty_cache_after_target_train` is disabled to avoid unnecessary cache churn
   on high-memory GPUs.
 
-The supported model launchers are Qwen2.5-1.5B, Qwen3-4B, Qwen2.5-7B and
-Llama-3.1-8B. See [EXPERIMENTS.md](EXPERIMENTS.md) for the complete layout and
-override list.
+The supported model launchers are Qwen2.5-1.5B, Qwen2.5-3B, Qwen3-4B,
+Qwen2.5-7B, Llama-3.1-8B and Qwen2.5-14B. See
+[EXPERIMENTS.md](EXPERIMENTS.md) for the complete layout and override list.
 
 Default Qwen2.5-7B commands:
 
