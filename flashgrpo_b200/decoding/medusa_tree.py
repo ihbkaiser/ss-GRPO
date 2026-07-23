@@ -238,18 +238,19 @@ class Head3QualityCalibrator:
         if self._bin_mature is None:
             return
         factor = min(1.0, max(0.0, float(factor)))
-        for value in (
-            self._bin_mature,
-            self._bin_accepted,
-            self._bin_mass_gain,
-            self._bin_probe_count,
-        ):
-            value.mul_(factor)
-        self._acceptance_ema.copy_(
-            self._acceptance_ema.new_tensor(0.5)
-            + factor * (self._acceptance_ema - 0.5)
+        # Rollout may create these buffers under torch.inference_mode().
+        # Such tensors cannot be mutated in-place later by the auxiliary
+        # trainer, which runs under no_grad but outside inference mode.
+        self._bin_mature = self._bin_mature.clone() * factor
+        self._bin_accepted = self._bin_accepted.clone() * factor
+        self._bin_mass_gain = self._bin_mass_gain.clone() * factor
+        self._bin_probe_count = self._bin_probe_count.clone() * factor
+        acceptance = self._acceptance_ema.clone()
+        self._acceptance_ema = (
+            acceptance.new_tensor(0.5)
+            + factor * (acceptance - 0.5)
         )
-        self._regret_ema.mul_(factor)
+        self._regret_ema = self._regret_ema.clone() * factor
 
     def summary(self, since: torch.Tensor | None = None) -> dict[str, float | int]:
         if self._counters is None:

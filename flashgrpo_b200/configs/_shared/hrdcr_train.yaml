@@ -214,7 +214,7 @@ aux_update:
   optimizer_steps: 1
   max_cached_records: 4096
   reflex_cache_enabled: true
-  cache_stride: 1
+  cache_stride: 4
 
   sparse_support_cap: 48
   target_topk: 16

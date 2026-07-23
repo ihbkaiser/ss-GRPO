@@ -104,16 +104,19 @@ def test_head3_calibration_reset_is_selective_and_decays_evidence():
     )
     calibrator = decoder._get_head3_quality_calibrator()
     assert calibrator is not None
-    calibrator.observe(
-        torch.full((8,), 0.6),
-        torch.ones(8),
-        torch.zeros(8),
-    )
+    with torch.inference_mode():
+        calibrator.observe(
+            torch.full((8,), 0.6),
+            torch.ones(8),
+            torch.zeros(8),
+        )
+    assert calibrator._bin_mature.is_inference()
     before = calibrator._bin_mature.clone()
     decoder.reset_verification_utility_scheduler([0, 1])
     assert torch.equal(calibrator._bin_mature, before)
     decoder.reset_verification_utility_scheduler([2])
     assert torch.allclose(calibrator._bin_mature, before * 0.5)
+    assert not calibrator._bin_mature.is_inference()
 
 
 def test_mature_feedback_count_persists_across_sequence_reset_and_reload():

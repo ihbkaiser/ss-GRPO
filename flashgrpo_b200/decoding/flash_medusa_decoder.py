@@ -272,7 +272,7 @@ class FlashMedusaDecoder:
         ):
             self._head3_quality_calibrator.decay_evidence(0.5)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def notify_hrdcr_auxiliary_update(
         self,
         selected_heads: list[int],
