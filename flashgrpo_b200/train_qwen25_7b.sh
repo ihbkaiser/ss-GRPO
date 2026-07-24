@@ -18,7 +18,11 @@ REPEATED_GENERATE_NUMS="${REPEATED_GENERATE_NUMS:-8}"
 LOGPS_CHUNK_SIZE="${LOGPS_CHUNK_SIZE:-512}"
 CPEAK_NODES="${CPEAK_NODES:-512}"
 MAX_TREE_NODES_PER_SEQ="${MAX_TREE_NODES_PER_SEQ:-10}"
-HEADS="${HEADS:-outputs/pretrain/qwen25_7b}"
+if [[ "$METHOD" == "medusa_only" ]]; then
+    HEADS="${HEADS:-outputs/pretrain/qwen25_7b/step500}"
+else
+    HEADS="${HEADS:-outputs/pretrain/qwen25_7b/step2000}"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/scripts/launch/train_model.sh"
